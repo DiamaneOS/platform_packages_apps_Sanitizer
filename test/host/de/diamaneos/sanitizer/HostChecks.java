@@ -326,6 +326,8 @@ public final class HostChecks {
                 meta(GuestLink.FORMAT_JPEG, 1, 0, 4, 3, -1, -1, "", ""), end(0))), GuestLink.OP_METADATA);
         expectRefused("meta animated WebP marker on a PNG", (in, out) -> out.write(cat(reply(R, 0, 2, 4, 3, 0, 1024),
                 meta(GuestLink.FORMAT_PNG, 3, 0, 4, 3, -1, -1, "", ""), end(0))), GuestLink.OP_METADATA);
+        streamChecks();
+        mountChecks();
         // The new formats' answers are accepted: an animated GIF's probe, a GIF's record with its marker.
         Object gif = stub((in, out) -> out.write(cat(reply(R, 0, 3, 5, 4, 1, 0), end(0))), GuestLink.OP_PROBE, 0, 0,
                 2000);
@@ -373,6 +375,109 @@ public final class HostChecks {
         }
         if (bad == 0) pass("VM image labels as the VM manager takes them", cases.length + " labels");
         else fail("VM image labels as the VM manager takes them", bad + " wrong");
+    }
+
+    // A file sent from a source arrives whole, in order, and a source that ends early drops the link.
+    static void streamChecks() throws Exception {
+        int R = GuestLink.REPLY_MAGIC;
+        byte[] big = new byte[3 * 64 * 1024 + 12345];
+        new Random(7).nextBytes(big);
+        try (ServerSocket server = new ServerSocket(0, 1, LOOPBACK)) {
+            byte[][] seen = {null};
+            Thread vm = new Thread(() -> {
+                try (Socket s = server.accept()) {
+                    java.io.DataInputStream in = new java.io.DataInputStream(s.getInputStream());
+                    byte[] h = new byte[GuestLink.HEADER_BYTES];
+                    in.readFully(h);
+                    int len = ByteBuffer.wrap(h).order(ByteOrder.LITTLE_ENDIAN).getInt(16);
+                    byte[] body = new byte[len];
+                    in.readFully(body);
+                    seen[0] = body;
+                    s.getOutputStream().write(cat(reply(R, 0, 1, 2, 1, 0, 8), new byte[] {1, 2, 3, 4, 5, 6, 7, 8},
+                            end(0)));
+                } catch (Exception ignored) {
+                    // the check below reports it
+                }
+            });
+            vm.start();
+            GuestLink link = new GuestLink(new SocketChannel(new Socket(LOOPBACK, server.getLocalPort())));
+            GuestLink.Answer a = link.call(GuestLink.OP_THUMBNAIL, 2, 1, GuestLink.source(big, big.length),
+                    now() + 5000);
+            vm.join(5000);
+            link.close();
+            if (a.status == 0 && java.util.Arrays.equals(seen[0], big)) {
+                pass("streamed source arrives whole", big.length + " bytes in pieces");
+            } else {
+                fail("streamed source arrives whole", show(a));
+            }
+        }
+        GuestLink.Source broken = new GuestLink.Source() {
+            int mCalls;
+
+            @Override public long length() {
+                return 200000;
+            }
+
+            @Override public void readFully(byte[] b, int off, int len, long deadline) throws IOException {
+                if (++mCalls > 1) throw new IOException("file ended early");
+            }
+        };
+        try (ServerSocket server = new ServerSocket(0, 1, LOOPBACK)) {
+            Thread vm = new Thread(() -> {
+                try (Socket s = server.accept()) {
+                    s.getInputStream().readAllBytes();
+                } catch (Exception ignored) {
+                    // the client goes away
+                }
+            });
+            vm.start();
+            GuestLink link = new GuestLink(new SocketChannel(new Socket(LOOPBACK, server.getLocalPort())));
+            Object r;
+            try {
+                r = link.call(GuestLink.OP_THUMBNAIL, 2, 1, broken, now() + 3000);
+            } catch (IOException e) {
+                r = e;
+            }
+            boolean dropped;
+            try {
+                link.ping(now() + 1000);
+                dropped = false;
+            } catch (IOException e) {
+                dropped = true;
+            }
+            link.close();
+            vm.join(5000);
+            if (r instanceof IOException && dropped) {
+                pass("source ending early drops the link", String.valueOf(r));
+            } else {
+                fail("source ending early drops the link", r + " dropped " + dropped);
+            }
+        }
+    }
+
+    // Which files the service may stream: only those off FUSE, by the deepest mount holding them.
+    static void mountChecks() {
+        String mi = String.join("\n",
+                "1 0 254:0 / / ro,relatime - erofs /dev/block/dm-0 ro",
+                "40 1 259:9 / /data rw,nosuid,nodev - f2fs /dev/block/dm-50 rw",
+                "90 40 0:44 / /storage/emulated rw,nosuid,nodev - fuse /dev/fuse rw,user_id=0",
+                "91 90 259:9 /media/0/Android/data /storage/emulated/0/Android/data rw - f2fs /dev/block/dm-50 rw",
+                "92 1 0:45 / /mnt/with\\040space rw - fuse.sshfs x rw");
+        Object[][] cases = {
+            {"/data/media/0/DCIM/a.jpg", false},
+            {"/storage/emulated/0/DCIM/a.jpg", true},
+            {"/storage/emulated/0/Android/data/x/a.jpg", false},
+            {"/storage/emulatedX/a.jpg", false},
+            {"/mnt/with space/a.jpg", true},
+            {"/memfd:vmdecode (deleted)", false},
+            {"pipe:[1234]", false},
+        };
+        int bad = 0;
+        for (Object[] c : cases) {
+            if (Mounts.isFuse((String) c[0], mi) != (Boolean) c[1]) bad++;
+        }
+        if (bad == 0) pass("FUSE check by mount table", cases.length + " paths");
+        else fail("FUSE check by mount table", bad + " wrong");
     }
 
     // The fuzzing server: random replies, then mutations of valid ones.

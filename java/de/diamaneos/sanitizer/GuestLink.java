@@ -66,7 +66,10 @@ final class GuestLink implements Closeable {
     static final int FORMAT_ICO = 9;
     static final int FORMAT_WBMP = 10;
 
-    static final int MAX_INPUT_BYTES = 32 << 20;
+    // vm/proto.h: a JPEG or PNG streams through the VM up to MAX_INPUT_BYTES, any other file is held there while it
+    // is decoded, up to MAX_BUFFERED_BYTES (the VM answers INVALID above that).
+    static final int MAX_INPUT_BYTES = 256 << 20;
+    static final int MAX_BUFFERED_BYTES = 32 << 20;
     static final int MAX_DIMENSION = 65535;
     static final int MAX_PIXELS = 8 << 20;
 
@@ -79,6 +82,29 @@ final class GuestLink implements Closeable {
     static final int END_BYTES = 8;
 
     /** A stream with deadlines: a vsock socket on the phone, a socket pair in the tests. */
+    /** The file to send: in memory, or read in pieces as it is sent (a regular file, which is never held whole). */
+    interface Source {
+        long length();
+
+        /** Fills b[off, off + len) with the next bytes, exactly. Throws if the source ends early or stalls. */
+        void readFully(byte[] b, int off, int len, long deadlineMillis) throws IOException;
+    }
+
+    static Source source(byte[] file, int len) {
+        return new Source() {
+            int mAt = 0;
+
+            @Override public long length() {
+                return len;
+            }
+
+            @Override public void readFully(byte[] b, int off, int n, long deadlineMillis) {
+                System.arraycopy(file, mAt, b, off, n);
+                mAt += n;
+            }
+        };
+    }
+
     interface Channel extends Closeable {
         /** Reads 1 to len bytes, 0 at the end of the stream. Throws on a passed deadline. */
         int read(byte[] b, int off, int len, long deadlineMillis) throws IOException;
@@ -178,6 +204,11 @@ final class GuestLink implements Closeable {
         return call(OP_METADATA, 0, 0, file, len, 0, deadlineMillis);
     }
 
+    /** Any operation, with the file sent from a source in pieces. */
+    Answer call(int op, int arg0, int arg1, Source src, long deadlineMillis) throws IOException {
+        return call(op, arg0, arg1, src, deadlineMillis, true);
+    }
+
     /** Test builds only: the VM's test image answers with a 1x1 or 2x1 thumbnail or fails, see vm/decoder_vm.cpp. */
     Answer hook(int hook, long deadlineMillis) throws IOException {
         return call(OP_HOOK, hook, 0, null, 0, 0, deadlineMillis);
@@ -190,15 +221,30 @@ final class GuestLink implements Closeable {
 
     private Answer call(int op, int arg0, int arg1, byte[] file, int len, int unused, long deadline)
             throws IOException {
-        if (mBroken) throw new ProtocolException("link already broken");
         if (len < 0 || len > MAX_INPUT_BYTES || (file == null && len != 0) || (file != null && len > file.length)) {
             throw new IllegalArgumentException("input length");
         }
+        return call(op, arg0, arg1, file == null ? source(new byte[0], 0) : source(file, len), deadline, true);
+    }
+
+    private static final int PIECE_BYTES = 64 << 10;
+
+    private Answer call(int op, int arg0, int arg1, Source src, long deadline, boolean unused) throws IOException {
+        if (mBroken) throw new ProtocolException("link already broken");
+        long len = src.length();
+        if (len < 0 || len > MAX_INPUT_BYTES) throw new IllegalArgumentException("input length");
         try {
             ByteBuffer rq = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-            rq.putInt(REQUEST_MAGIC).putInt(op).putInt(arg0).putInt(arg1).putInt(len);
+            rq.putInt(REQUEST_MAGIC).putInt(op).putInt(arg0).putInt(arg1).putInt((int) len);
             mChannel.write(rq.array(), 0, HEADER_BYTES, deadline);
-            if (len > 0) mChannel.write(file, 0, len, deadline);
+            // The file in pieces: a regular file is read as it is sent, never held whole.
+            byte[] piece = new byte[(int) Math.min(len, PIECE_BYTES)];
+            for (long sent = 0; sent < len; ) {
+                int n = (int) Math.min(piece.length, len - sent);
+                src.readFully(piece, 0, n, deadline);
+                mChannel.write(piece, 0, n, deadline);
+                sent += n;
+            }
 
             ByteBuffer h = readExact(HEADER_BYTES, deadline);
             Answer a = new Answer();

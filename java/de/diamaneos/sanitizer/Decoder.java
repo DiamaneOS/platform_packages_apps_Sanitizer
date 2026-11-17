@@ -165,6 +165,11 @@ final class Decoder implements GuestLink.Budget {
         final byte[] file;
         final int len;
         final long reserved; // budget held for the file, given back when the request is done
+        // A large regular file streamed to the VM instead of file, and its SHA-256 read beforehand. Closed when the
+        // request is done.
+        FdChannel.FileSource source;
+        byte[] digest;
+        volatile byte[] sentDigest;
         volatile int status = UNAVAILABLE;
         volatile GuestLink.Answer answer;
         volatile boolean died; // a worker died, or the link broke, on this file
@@ -195,7 +200,7 @@ final class Decoder implements GuestLink.Budget {
         String digest = null;
         Object key = null;
         if (r.op != GuestLink.OP_PING && r.op != GuestLink.OP_HOOK) {
-            byte[] d = ResultCache.digest(r.file, r.len);
+            byte[] d = r.source != null ? r.digest : ResultCache.digest(r.file, r.len);
             digest = hex(d);
             key = ResultCache.key(d, r.op, r.a, r.b);
             GuestLink.Answer hit = mCache.get(key);
@@ -208,6 +213,7 @@ final class Decoder implements GuestLink.Budget {
         }
         if (!mScheduler.offer(r)) {
             release(r.lane, r.reserved);
+            closeSource(r);
             return r;
         }
         try {
@@ -216,7 +222,10 @@ final class Decoder implements GuestLink.Budget {
             Thread.currentThread().interrupt();
             return r;
         }
-        if (key != null && r.answer != null && r.status != UNAVAILABLE) {
+        // A streamed file is cached only when what was sent is what was hashed before: a file that changed in
+        // between gets its answer, but never under the old content's key.
+        boolean sameFile = r.source == null || java.util.Arrays.equals(r.digest, r.sentDigest);
+        if (key != null && r.answer != null && r.status != UNAVAILABLE && sameFile) {
             mCache.put(key, r.answer);
         } else if (digest != null && r.died) {
             strike(digest, key, r);
@@ -257,6 +266,8 @@ final class Decoder implements GuestLink.Budget {
                 r.status = UNAVAILABLE;
                 r.answer = null;
             } finally {
+                if (r.source != null) r.sentDigest = r.source.sentDigest();
+                closeSource(r);
                 release(r.lane, r.reserved);
                 GuestLink.Answer a = r.answer;
                 if (a != null && a.reserved > 0) {
@@ -287,8 +298,13 @@ final class Decoder implements GuestLink.Budget {
             switch (r.op) {
                 case GuestLink.OP_PING: a = link.ping(budget); break;
                 case GuestLink.OP_PROBE: a = link.probe(r.file, r.len, budget); break;
-                case GuestLink.OP_THUMBNAIL: a = link.thumbnail(r.file, r.len, r.a, r.b, budget); break;
-                case GuestLink.OP_METADATA: a = link.metadata(r.file, r.len, budget); break;
+                case GuestLink.OP_THUMBNAIL:
+                    a = r.source != null ? link.call(r.op, r.a, r.b, r.source, budget)
+                                         : link.thumbnail(r.file, r.len, r.a, r.b, budget);
+                    break;
+                case GuestLink.OP_METADATA:
+                    a = r.source != null ? link.call(r.op, 0, 0, r.source, budget) : link.metadata(r.file, r.len, budget);
+                    break;
                 case GuestLink.OP_HOOK: a = link.hook(r.a, budget); break;
                 default: throw new IllegalArgumentException("op");
             }
@@ -310,6 +326,15 @@ final class Decoder implements GuestLink.Budget {
             r.died = r.op != GuestLink.OP_PING && r.op != GuestLink.OP_HOOK;
             mVm.stop();
             backOff();
+        }
+    }
+
+    private static void closeSource(Request r) {
+        if (r.source == null) return;
+        try {
+            r.source.close();
+        } catch (IOException ignored) {
+            // closed already
         }
     }
 

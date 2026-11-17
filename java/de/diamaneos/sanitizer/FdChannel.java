@@ -27,6 +27,11 @@ import android.system.StructStat;
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 /**
  * A stream over a file descriptor where every read and write waits with poll first, so no call can block past its
@@ -109,7 +114,135 @@ final class FdChannel implements GuestLink.Channel {
         byte[] data;
         int len;
         long reserved;
+        // A streamed file instead of data: read as it is sent to the VM, and its SHA-256 read beforehand.
+        FileSource source;
+        byte[] digest;
     }
+
+    // What a streamed file holds of the budget while it waits: the piece it is sent in.
+    private static final int STREAM_RESERVE = 64 * 1024;
+    private static final int HASH_CHUNK = 256 * 1024;
+
+    /**
+     * A large regular file not on FUSE, as a source the decoder sends to the VM in pieces, never held whole. Its
+     * SHA-256 is read first (the cache key). Null when the file is not one to stream: not regular, on FUSE (a FUSE
+     * read can stall without end, and the decoder thread must not), within maxBuffered (read into memory as before),
+     * or above maxStreamed (refused as too large by readInput). Runs on a reader thread, like readInput.
+     */
+    Input streamInput(long maxBuffered, long maxStreamed, long deadline, Decoder budget, String lane) {
+        long size;
+        try {
+            StructStat st = Os.fstat(mFd);
+            if (!OsConstants.S_ISREG(st.st_mode)) return null;
+            size = st.st_size;
+        } catch (ErrnoException e) {
+            return null;
+        }
+        if (size <= maxBuffered || size > maxStreamed || onFuse(mPfd.getFd())) return null;
+        Input in = new Input();
+        if (!budget.reserve(lane, STREAM_RESERVE)) {
+            in.status = Input.NO_MEMORY;
+            return in;
+        }
+        boolean done = false;
+        ParcelFileDescriptor dup = null;
+        try {
+            dup = ParcelFileDescriptor.dup(mFd);
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[HASH_CHUNK];
+            for (long at = 0; at < size; ) {
+                if (SystemClock.uptimeMillis() > deadline) throw new InterruptedIOException("deadline");
+                int k = Os.pread(dup.getFileDescriptor(), buf, 0, (int) Math.min(buf.length, size - at), at);
+                if (k <= 0) throw new IOException("file shorter than its size");
+                md.update(buf, 0, k);
+                at += k;
+            }
+            in.status = Input.OK;
+            in.source = new FileSource(dup, size);
+            in.digest = md.digest();
+            in.len = (int) size;
+            in.reserved = STREAM_RESERVE;
+            done = true;
+            return in;
+        } catch (IOException | ErrnoException | NoSuchAlgorithmException e) {
+            in.status = Input.TOO_LARGE;
+            return in;
+        } finally {
+            if (!done) {
+                budget.release(lane, STREAM_RESERVE);
+                if (dup != null) {
+                    try {
+                        dup.close();
+                    } catch (IOException ignored) {
+                        // closed already
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * A regular file sent from its start, read with pread as it goes, hashing what it sends: the decoder caches the
+     * answer only when that hash is the one read beforehand, so a file changed in between never fills the cache.
+     */
+    static final class FileSource implements GuestLink.Source, java.io.Closeable {
+        private final ParcelFileDescriptor mPfd;
+        private final long mSize;
+        private long mAt;
+        private final MessageDigest mSent;
+
+        FileSource(ParcelFileDescriptor pfd, long size) throws NoSuchAlgorithmException {
+            mPfd = pfd;
+            mSize = size;
+            mSent = MessageDigest.getInstance("SHA-256");
+        }
+
+        @Override
+        public long length() {
+            return mSize;
+        }
+
+        @Override
+        public void readFully(byte[] b, int off, int len, long deadline) throws IOException {
+            int got = 0;
+            while (got < len) {
+                if (SystemClock.uptimeMillis() > deadline) throw new InterruptedIOException("deadline");
+                int k;
+                try {
+                    k = Os.pread(mPfd.getFileDescriptor(), b, off + got, len - got, mAt);
+                } catch (ErrnoException e) {
+                    throw new IOException(e);
+                }
+                if (k <= 0) throw new IOException("file ended early");
+                mSent.update(b, off + got, k);
+                got += k;
+                mAt += k;
+            }
+        }
+
+        /** The SHA-256 of what was sent, once all of it was. Null before. */
+        byte[] sentDigest() {
+            return mAt == mSize ? mSent.digest() : null;
+        }
+
+        @Override
+        public void close() throws IOException {
+            mPfd.close();
+        }
+    }
+
+    /** Whether the file lies on a FUSE file system, by its path and the mount table. When unsure, yes. */
+    static boolean onFuse(int fd) {
+        try {
+            String path = Os.readlink("/proc/self/fd/" + fd);
+            String mountinfo = new String(Files.readAllBytes(Paths.get("/proc/self/mountinfo")),
+                    StandardCharsets.UTF_8);
+            return Mounts.isFuse(path, mountinfo);
+        } catch (ErrnoException | IOException | RuntimeException e) {
+            return true;
+        }
+    }
+
 
     /**
      * Reads the stream, at most max bytes, taking every buffer from the lane's budget before it is allocated. With

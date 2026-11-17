@@ -138,8 +138,10 @@ public final class DecodeService extends Service {
                 failed.status = in.status == FdChannel.Input.NO_MEMORY ? Decoder.UNAVAILABLE : GuestLink.INVALID;
                 return failed;
             }
-            return mDecoder.run(new Decoder.Request(op, a, b, in.data, in.len, in.reserved, lane, waiting,
-                    deadline));
+            Decoder.Request r = new Decoder.Request(op, a, b, in.data, in.len, in.reserved, lane, waiting, deadline);
+            r.source = in.source;
+            r.digest = in.digest;
+            return mDecoder.run(r);
         } finally {
             mDecoder.leave(lane);
         }
@@ -148,17 +150,28 @@ public final class DecodeService extends Service {
     // Reads the caller's file on a reader thread, waiting at most READ_MILLIS. Null when it did not end in time: the
     // thread stays stuck in the read, counted against the lane until it ends, and gives back its memory then.
     private FdChannel.Input read(DecodeRequest request, int op, String lane) {
-        int max = op == GuestLink.OP_PROBE ? IDecodeService.MAX_PROBE_BYTES : IDecodeService.MAX_INPUT_BYTES;
+        int max = op == GuestLink.OP_PROBE ? IDecodeService.MAX_PROBE_BYTES : IDecodeService.MAX_BUFFERED_BYTES;
+        boolean stream = op == GuestLink.OP_THUMBNAIL || op == GuestLink.OP_METADATA;
         long deadline = SystemClock.uptimeMillis() + READ_MILLIS;
         FdChannel channel = new FdChannel(request.file);
         Object lock = new Object();
         boolean[] abandoned = {false};
         Future<FdChannel.Input> f = READERS.submit(() -> {
-            FdChannel.Input in = channel.readInput(max, op == GuestLink.OP_PROBE, deadline, mDecoder, lane);
+            // A large regular file (not on FUSE) streams to the VM, anything else is read into memory here.
+            FdChannel.Input in = stream ? channel.streamInput(IDecodeService.MAX_BUFFERED_BYTES,
+                    IDecodeService.MAX_INPUT_BYTES, deadline, mDecoder, lane) : null;
+            if (in == null) in = channel.readInput(max, op == GuestLink.OP_PROBE, deadline, mDecoder, lane);
             synchronized (lock) {
                 if (abandoned[0]) {
                     // Too late: nobody takes this input any more.
                     if (in.status == FdChannel.Input.OK) mDecoder.release(lane, in.reserved);
+                    if (in.source != null) {
+                        try {
+                            in.source.close();
+                        } catch (IOException ignored) {
+                            // closed already
+                        }
+                    }
                     mDecoder.stuck(lane, -1);
                     in = null;
                 }
