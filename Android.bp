@@ -39,8 +39,8 @@ aidl_interface {
 
 // Loaded by Microdroid from the APK. Only libbinder_ndk, libvm_payload, liblog and the C library come from the VM,
 // the decoders are linked in.
-cc_library_shared {
-    name: "libdiamaneos_sanitizer_payload",
+cc_defaults {
+    name: "diamaneos_sanitizer_payload_defaults",
     srcs: ["native/payload.cpp"],
     stl: "libc++_static",
     cflags: [
@@ -60,6 +60,21 @@ cc_library_shared {
     ],
 }
 
+cc_library_shared {
+    name: "libdiamaneos_sanitizer_payload",
+    defaults: ["diamaneos_sanitizer_payload_defaults"],
+}
+
+// Test builds only: the same payload with hooks that break the worker's lockdown on purpose.
+cc_library_shared {
+    name: "libdiamaneos_sanitizer_payload_test",
+    defaults: ["diamaneos_sanitizer_payload_defaults"],
+    stem: "libdiamaneos_sanitizer_payload",
+    cflags: ["-DSANITIZER_TEST_HOOKS"],
+    // Only inside the test APK: an installed copy would clash with the plain payload's.
+    installable: false,
+}
+
 android_app {
     name: "DiamaneOSSanitizer",
     srcs: ["java/**/*.java"],
@@ -67,6 +82,24 @@ android_app {
     static_libs: ["de.diamaneos.sanitizer.aidl-java"],
     sdk_version: "system_current",
     jni_libs: ["libdiamaneos_sanitizer_payload"],
+    jni_uses_platform_apis: true,
+    use_embedded_native_libs: true,
+    system_ext_specific: true,
+}
+
+// Test builds only, installed by hand as an ordinary app: the test payload and a benchmark activity.
+android_app {
+    name: "DiamaneOSSanitizerTest",
+    package_name: "de.diamaneos.sanitizer.test",
+    manifest: "test/AndroidManifest.xml",
+    srcs: [
+        "java/**/*.java",
+        "test/java/**/*.java",
+    ],
+    resource_dirs: ["res"],
+    static_libs: ["de.diamaneos.sanitizer.aidl-java"],
+    sdk_version: "system_current",
+    jni_libs: ["libdiamaneos_sanitizer_payload_test"],
     jni_uses_platform_apis: true,
     use_embedded_native_libs: true,
     system_ext_specific: true,
