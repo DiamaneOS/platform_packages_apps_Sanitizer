@@ -115,7 +115,8 @@ android_app {
     system_ext_specific: true,
 }
 
-// Test builds only, installed by hand as an ordinary app: the service's classes and the self-test activity.
+// Test builds only, installed by hand as an ordinary app: the service's classes and the self-test activity. In no
+// product's packages: a build only puts it into its output folder (an uninstallable app would leave out its code).
 android_app {
     name: "DiamaneOSSanitizerTest",
     package_name: "de.diamaneos.sanitizer.test",
@@ -128,5 +129,4 @@ android_app {
     static_libs: ["de.diamaneos.sanitizer.decode-java"],
     sdk_version: "system_current",
     system_ext_specific: true,
-    installable: false,
 }
