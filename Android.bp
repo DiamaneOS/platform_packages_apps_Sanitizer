@@ -154,6 +154,7 @@ android_app {
     sdk_version: "system_current",
     certificate: "platform",
     privileged: true,
+    privapp_allowlist: "permissions/privapp-permissions-de.diamaneos.sanitizer.xml",
     system_ext_specific: true,
 }
 
