@@ -206,6 +206,7 @@ final class Decoder implements GuestLink.Budget {
             GuestLink.Answer hit = mCache.get(key);
             if (hit != null) {
                 release(r.lane, r.reserved);
+                closeSource(r);
                 r.answer = hit;
                 r.status = hit.status;
                 return r;
