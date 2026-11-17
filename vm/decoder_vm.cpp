@@ -56,6 +56,9 @@
 
 #include <jpeglib.h>
 #include <png.h>
+extern "C" {
+#include <jmemsys.h>  // the memory back end's interface, which this program implements
+}
 
 #include "image.h"
 #include "meta.h"
@@ -112,8 +115,65 @@ constexpr uint32_t kHookBadPixels = 7;
 
 }  // namespace
 
-// libjpeg-turbo's memory back end, in place of its jmemnobs.c: everything comes from the arena and there is no
-// backing store, so an image that needs more than the arena fails cleanly.
+// libjpeg-turbo's memory back end, in place of its jmemnobs.c: everything comes from the arena. There is no backing
+// store for a whole image's coefficients, with one exception: a multi-scan (progressive) JPEG whose coefficients do
+// not fit the arena is decoded at 1/8, where each 8x8 block shows as its DC value alone. Then the store keeps that
+// one value per block (2 bytes instead of 128), in the arena, and gives the other 63 back as zeros. Anything else
+// that would need a backing store fails cleanly.
+namespace {
+
+struct DcStore {
+    int16_t* dc;
+    size_t blocks;
+};
+
+bool gJpegDcOnly = false;  // set by decode_jpeg for the one decode that needs it
+
+DcStore* dc_store(backing_store_ptr info) {
+    DcStore* s;
+    memcpy(&s, info->temp_name, sizeof(s));
+    return s;
+}
+
+// The blocks [offset, offset + count) of the array, in bytes as jmemmgr.c asks for them: whole blocks only.
+bool dc_range(j_common_ptr cinfo, backing_store_ptr info, long offset, long count, size_t* first, size_t* n) {
+    DcStore* s = dc_store(info);
+    if (offset < 0 || count < 0 || offset % sizeof(JBLOCK) != 0 || count % sizeof(JBLOCK) != 0) {
+        (*cinfo->err->error_exit)(cinfo);
+    }
+    *first = static_cast<size_t>(offset) / sizeof(JBLOCK);
+    *n = static_cast<size_t>(count) / sizeof(JBLOCK);
+    if (*first > s->blocks || *n > s->blocks - *first) (*cinfo->err->error_exit)(cinfo);
+    return true;
+}
+
+void dc_read(j_common_ptr cinfo, backing_store_ptr info, void* buffer, long offset, long count) {
+    size_t first, n;
+    dc_range(cinfo, info, offset, count, &first, &n);
+    JBLOCK* b = static_cast<JBLOCK*>(buffer);
+    const int16_t* dc = dc_store(info)->dc + first;
+    for (size_t i = 0; i < n; i++) {
+        memset(b[i], 0, sizeof(JBLOCK));
+        b[i][0] = dc[i];
+    }
+}
+
+void dc_write(j_common_ptr cinfo, backing_store_ptr info, void* buffer, long offset, long count) {
+    size_t first, n;
+    dc_range(cinfo, info, offset, count, &first, &n);
+    const JBLOCK* b = static_cast<const JBLOCK*>(buffer);
+    int16_t* dc = dc_store(info)->dc + first;
+    for (size_t i = 0; i < n; i++) dc[i] = b[i][0];
+}
+
+void dc_close(j_common_ptr, backing_store_ptr info) {
+    DcStore* s = dc_store(info);
+    arena_free(s->dc);
+    arena_free(s);
+}
+
+}  // namespace
+
 extern "C" {
 void* jpeg_get_small(j_common_ptr, size_t n) {
     return arena_alloc(n);
@@ -132,8 +192,23 @@ size_t jpeg_mem_available(j_common_ptr cinfo, size_t, size_t max_bytes_needed, s
     if (limit <= 0) return max_bytes_needed;
     return already_allocated < static_cast<size_t>(limit) ? static_cast<size_t>(limit) - already_allocated : 0;
 }
-void jpeg_open_backing_store(j_common_ptr cinfo, void*, long) {
-    (*cinfo->err->error_exit)(cinfo);
+void jpeg_open_backing_store(j_common_ptr cinfo, backing_store_ptr info, long total_bytes_needed) {
+    if (!gJpegDcOnly || total_bytes_needed <= 0 || total_bytes_needed % sizeof(JBLOCK) != 0) {
+        (*cinfo->err->error_exit)(cinfo);
+    }
+    DcStore* s = static_cast<DcStore*>(arena_alloc(sizeof(DcStore)));
+    size_t blocks = static_cast<size_t>(total_bytes_needed) / sizeof(JBLOCK);
+    int16_t* dc = s != nullptr ? static_cast<int16_t*>(arena_calloc(blocks, sizeof(int16_t))) : nullptr;
+    if (dc == nullptr) {
+        arena_free(s);
+        (*cinfo->err->error_exit)(cinfo);
+    }
+    *s = {dc, blocks};
+    static_assert(sizeof(s) <= sizeof(info->temp_name));
+    memcpy(info->temp_name, &s, sizeof(s));
+    info->read_backing_store = dc_read;
+    info->write_backing_store = dc_write;
+    info->close_backing_store = dc_close;
 }
 long jpeg_mem_init(j_common_ptr) {
     return 0;
@@ -309,20 +384,50 @@ bool start_output(Scaler* s, uint32_t iw, uint32_t ih, uint32_t maxW, uint32_t m
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Input for PNG and JPEG: the file in memory, or (streamed) the start of it in memory and the rest from a pipe the
+// broker fills as the bytes arrive from Android, so the file is never held whole in the VM.
+
+struct Src {
+    const uint8_t* pre;  // the file, or its start
+    size_t preLen;
+    size_t preAt;
+    int fd;              // the rest, or -1
+    uint64_t fdLeft;     // bytes the rest still has, as the request declared
+};
+
+// Up to n bytes from the source, 0 at its end.
+size_t src_read(Src* s, uint8_t* out, size_t n) {
+    if (s->preAt < s->preLen) {
+        size_t k = std::min(n, s->preLen - s->preAt);
+        memcpy(out, s->pre + s->preAt, k);
+        s->preAt += k;
+        return k;
+    }
+    while (s->fd >= 0 && s->fdLeft > 0) {
+        ssize_t k = read(s->fd, out, static_cast<size_t>(std::min<uint64_t>(n, s->fdLeft)));
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) {
+            s->fdLeft = 0;
+            break;
+        }
+        s->fdLeft -= static_cast<uint64_t>(k);
+        return static_cast<size_t>(k);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // PNG through libpng's row API. Every allocation goes through the arena, errors jump back without signal masks
 // (_setjmp, _longjmp), since saving or restoring a mask is a system call.
 
-struct PngInput {
-    const uint8_t* data;
-    size_t size;
-    size_t at;
-};
-
 void png_read_input(png_structp png, png_bytep out, size_t n) {
-    PngInput* in = static_cast<PngInput*>(png_get_io_ptr(png));
-    if (n > in->size - in->at) png_error(png, "truncated");
-    memcpy(out, in->data + in->at, n);
-    in->at += n;
+    Src* in = static_cast<Src*>(png_get_io_ptr(png));
+    while (n > 0) {
+        size_t k = src_read(in, out, n);
+        if (k == 0) png_error(png, "truncated");
+        out += k;
+        n -= k;
+    }
 }
 
 png_voidp png_arena_alloc(png_structp, png_alloc_size_t n) {
@@ -341,8 +446,8 @@ void png_quiet(png_structp, png_const_charp) {}
 
 // headerOnly: stop after the header and report its size in *outW, *outH. Otherwise decode into the sink, fitted into
 // maxW x maxH.
-bool decode_png(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly,
-                uint32_t* outW, uint32_t* outH) {
+bool decode_png_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly, uint32_t* outW,
+                    uint32_t* outH) {
     png_structp png = png_create_read_struct_2(PNG_LIBPNG_VER_STRING, nullptr, png_fail, png_quiet, nullptr,
                                                png_arena_alloc, png_arena_free);
     if (png == nullptr) return false;
@@ -351,14 +456,22 @@ bool decode_png(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, 
         png_destroy_read_struct(&png, nullptr, nullptr);
         return false;
     }
-    PngInput in = {data, size, 0};
-    Scaler scaler = {};
-    uint8_t* volatile pixels = nullptr;
-    if (_setjmp(*png_set_longjmp_fn(png, _longjmp, sizeof(jmp_buf)))) {
+    // Set before the jump point and only pointed into after it, so the error path sees what to free.
+    Scaler* const scalerp = static_cast<Scaler*>(arena_calloc(1, sizeof(Scaler)));
+    if (scalerp == nullptr) {
         png_destroy_read_struct(&png, &info, nullptr);
         return false;
     }
-    png_set_read_fn(png, &in, png_read_input);
+    Scaler& scaler = *scalerp;
+    uint8_t* volatile pixels = nullptr;
+    if (_setjmp(*png_set_longjmp_fn(png, _longjmp, sizeof(jmp_buf)))) {
+        png_free(png, pixels);
+        scaler_free(scalerp);
+        arena_free(scalerp);
+        png_destroy_read_struct(&png, &info, nullptr);
+        return false;
+    }
+    png_set_read_fn(png, in, png_read_input);
     png_set_user_limits(png, kMaxDimension, kMaxDimension);
     png_set_chunk_malloc_max(png, 4u << 20);
     png_set_chunk_cache_max(png, 128);
@@ -370,6 +483,7 @@ bool decode_png(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, 
     if (headerOnly) {
         *outW = w;
         *outH = h;
+        arena_free(scalerp);
         png_destroy_read_struct(&png, &info, nullptr);
         return true;
     }
@@ -408,8 +522,15 @@ bool decode_png(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, 
     bool done = scaler_done(&scaler);
     png_free(png, pixels);
     scaler_free(&scaler);
+    arena_free(scalerp);
     png_destroy_read_struct(&png, &info, nullptr);
     return done && sink_flush(sink);
+}
+
+bool decode_png(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly,
+                uint32_t* outW, uint32_t* outH) {
+    Src in = {data, size, 0, -1, 0};
+    return decode_png_src(&in, maxW, maxH, sink, headerOnly, outW, outH);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -434,16 +555,60 @@ void jpeg_progress(j_common_ptr cinfo) {
     if (reinterpret_cast<j_decompress_ptr>(cinfo)->input_scan_number > 500) (*cinfo->err->error_exit)(cinfo);
 }
 
-bool decode_jpeg(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly,
-                 uint32_t* outW, uint32_t* outH) {
+// A streamed JPEG: libjpeg-turbo pulls 64 KiB at a time. At the end of the input it gets an end-of-image marker, as
+// libjpeg-turbo's own sources do, so a cut-off file decodes as far as it goes (the missing rows grey).
+constexpr size_t kJpegChunk = 64u << 10;
+
+struct JpegStream {
+    jpeg_source_mgr pub;
+    Src* src;
+    JOCTET* buf;
+};
+
+void jstream_init(j_decompress_ptr) {}
+
+boolean jstream_fill(j_decompress_ptr cinfo) {
+    JpegStream* s = reinterpret_cast<JpegStream*>(cinfo->src);
+    size_t n = src_read(s->src, s->buf, kJpegChunk);
+    if (n == 0) {
+        s->buf[0] = 0xff;
+        s->buf[1] = JPEG_EOI;
+        n = 2;
+    }
+    s->pub.next_input_byte = s->buf;
+    s->pub.bytes_in_buffer = n;
+    return TRUE;
+}
+
+void jstream_skip(j_decompress_ptr cinfo, long n) {
+    JpegStream* s = reinterpret_cast<JpegStream*>(cinfo->src);
+    if (n <= 0) return;
+    while (static_cast<size_t>(n) > s->pub.bytes_in_buffer) {
+        n -= static_cast<long>(s->pub.bytes_in_buffer);
+        jstream_fill(cinfo);
+    }
+    s->pub.next_input_byte += n;
+    s->pub.bytes_in_buffer -= static_cast<size_t>(n);
+}
+
+void jstream_term(j_decompress_ptr) {}
+
+// The most a multi-scan JPEG's coefficients may take (full blocks), and the most its DC values may take when they do
+// not fit: then it is decoded at 1/8 from DC values alone.
+constexpr size_t kJpegSlack = 4u << 20;
+
+bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly, uint32_t* outW,
+                     uint32_t* outH) {
     jpeg_decompress_struct cinfo;
     JpegError err;
     jpeg_progress_mgr progress = {};
     Scaler scaler = {};
+    JpegStream stream = {};
     cinfo.err = jpeg_std_error(&err.mgr);
     err.mgr.error_exit = jpeg_fail;
     err.mgr.emit_message = jpeg_quiet;
     err.mgr.output_message = jpeg_quiet_output;
+    gJpegDcOnly = false;
     if (_setjmp(err.jump)) {
         jpeg_destroy_decompress(&cinfo);
         return false;
@@ -451,7 +616,19 @@ bool decode_jpeg(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
     jpeg_create_decompress(&cinfo);
     progress.progress_monitor = jpeg_progress;
     cinfo.progress = &progress;
-    jpeg_mem_src(&cinfo, data, size);
+    if (in->fd < 0) {
+        jpeg_mem_src(&cinfo, in->pre, in->preLen);
+    } else {
+        stream.buf = static_cast<JOCTET*>(
+                (*cinfo.mem->alloc_small)(reinterpret_cast<j_common_ptr>(&cinfo), JPOOL_PERMANENT, kJpegChunk));
+        stream.src = in;
+        stream.pub.init_source = jstream_init;
+        stream.pub.fill_input_buffer = jstream_fill;
+        stream.pub.skip_input_data = jstream_skip;
+        stream.pub.resync_to_restart = jpeg_resync_to_restart;
+        stream.pub.term_source = jstream_term;
+        cinfo.src = &stream.pub;
+    }
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK || cinfo.image_width == 0 || cinfo.image_height == 0 ||
         cinfo.image_width > kMaxDimension || cinfo.image_height > kMaxDimension) {
         jpeg_destroy_decompress(&cinfo);
@@ -478,8 +655,31 @@ bool decode_jpeg(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
             break;
         }
     }
-    // Without a backing store, a progressive image whose coefficients do not fit the arena fails here.
-    cinfo.mem->max_memory_to_use = static_cast<long>(arena_left() - std::min(arena_left(), size_t{1} << 20));
+    // A progressive (multi-scan) image keeps all its coefficients until the last scan. When they fit the arena they
+    // stay there. When not, it is decoded at 1/8 from its DC values, which the backing store keeps 2 bytes a block,
+    // and the thumbnail is at most an eighth of the image on each side.
+    size_t room = arena_left() - std::min(arena_left(), kJpegSlack);
+    if (jpeg_has_multiple_scans(&cinfo)) {
+        uint64_t coef = 0;
+        for (int c = 0; c < cinfo.num_components; c++) {
+            const jpeg_component_info& comp = cinfo.comp_info[c];
+            coef += static_cast<uint64_t>(comp.width_in_blocks + comp.h_samp_factor) *
+                    (comp.height_in_blocks + comp.v_samp_factor) * sizeof(JBLOCK);
+        }
+        if (coef > room) {
+            if (coef / sizeof(JBLOCK) * sizeof(int16_t) > room / 2) {
+                jpeg_destroy_decompress(&cinfo);
+                return false;
+            }
+            gJpegDcOnly = true;
+            cinfo.scale_denom = 8;
+            cinfo.do_block_smoothing = FALSE;
+            jpeg_calc_output_dimensions(&cinfo);
+            fit_box(cinfo.output_width, cinfo.output_height, maxW, maxH, &ow, &oh);
+            room = kJpegSlack;  // the band of full blocks in memory, the rest goes to the DC store
+        }
+    }
+    cinfo.mem->max_memory_to_use = static_cast<long>(room);
     jpeg_start_decompress(&cinfo);
     if (!scaler_init(&scaler, cinfo.output_width, cinfo.output_height, ow, oh, sink) || !sink_header(sink, ow, oh)) {
         jpeg_destroy_decompress(&cinfo);
@@ -498,6 +698,12 @@ bool decode_jpeg(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
     scaler_free(&scaler);
     jpeg_destroy_decompress(&cinfo);
     return done && sink_flush(sink);
+}
+
+bool decode_jpeg(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly,
+                 uint32_t* outW, uint32_t* outH) {
+    Src in = {data, size, 0, -1, 0};
+    return decode_jpeg_src(&in, maxW, maxH, sink, headerOnly, outW, outH);
 }
 
 }  // namespace decoder
@@ -674,8 +880,9 @@ constexpr int kExitUnsupported = 6;  // a valid file of a kind the VM does not d
 
 // The lockdown, in this order: rlimits (no new file descriptors, no new processes, no more address space, capped CPU
 // time, no core or file writes), an unprivileged user, no new privileges, then seccomp strict mode. Everything before
-// seccomp is a second layer only. Returns 0, or the errno of seccomp. Exits for anything else that fails.
-int lockdown(int out) {
+// seccomp is a second layer only. Returns 0, or the errno of seccomp. Exits for anything else that fails. The output
+// pipe becomes fd 0 and a streamed input (in, or -1) fd 1: nothing else stays open.
+int lockdown(int out, int in = -1) {
     int adj = open("/proc/self/oom_score_adj", O_WRONLY | O_CLOEXEC);
     if (adj >= 0) {
         (void)!write(adj, "1000", 4);
@@ -689,15 +896,21 @@ int lockdown(int out) {
         close(statm);
     }
     if (vmBytes == 0) worker_exit(kExitLockdown);
-    // Only the output pipe stays open, as fd 0.
+    // Only the output pipe stays open, as fd 0, and a streamed input as fd 1.
+    if (in == 0) {
+        in = dup(in);  // out's place: move it away first
+        if (in < 0) worker_exit(kExitLockdown);
+    }
     if (out != 0 && dup2(out, 0) != 0) worker_exit(kExitLockdown);
-    if (syscall(__NR_close_range, 1u, ~0u, 0u) != 0) worker_exit(kExitLockdown);
+    if (in >= 0 && in != 1 && dup2(in, 1) != 1) worker_exit(kExitLockdown);
+    unsigned firstClosed = in >= 0 ? 2u : 1u;
+    if (syscall(__NR_close_range, firstClosed, ~0u, 0u) != 0) worker_exit(kExitLockdown);
     struct {
         int resource;
         rlim_t value;
     } limits[] = {
             {RLIMIT_CPU, kWorkerCpuSeconds},
-            {RLIMIT_NOFILE, 1},  // fd 0 is taken, so every new descriptor fails
+            {RLIMIT_NOFILE, in >= 0 ? 2u : 1u},  // the open descriptors take every number allowed
             {RLIMIT_NPROC, 0},
             {RLIMIT_AS, vmBytes + (16u << 20)},
             {RLIMIT_FSIZE, 0},
@@ -723,14 +936,19 @@ int lockdown(int out) {
     return 0;
 }
 
-[[noreturn]] void worker_main(const Request& rq, uint32_t format, const uint8_t* data, size_t size, int out) {
+// The start of a streamed file the worker reads before it decodes: the metadata of a JPEG or PNG comes before its
+// image data, so this covers it, and the decoders continue from here with the rest of the stream.
+constexpr size_t kPrefixBytes = 1u << 20;
+
+[[noreturn]] void worker_main(const Request& rq, uint32_t format, const uint8_t* data, size_t size, int out,
+                              int in) {
 #ifdef DECODER_TEST_HOOKS
     if (rq.op == kOpHook && rq.arg0 == kHookScan) {
         if (out != 0 && dup2(out, 0) != 0) worker_exit(kExitLockdown);
         hook_scan(data, size);
     }
 #endif
-    int seccompError = lockdown(out);
+    int seccompError = lockdown(out, in);
 #ifndef DECODER_TEST_HOOKS
     // Production builds never decode without seccomp.
     if (seccompError != 0) worker_exit(kExitLockdown);
@@ -768,6 +986,29 @@ int lockdown(int out) {
     if (sink.buf == nullptr) worker_exit(kExitDecodeFailed);
     // A decode that failed: UNSUPPORTED when the decoder found a valid file of a kind it does not read.
     auto failed = [] { return gOutcome.unsupported ? kExitUnsupported : kExitDecodeFailed; };
+    // A streamed JPEG or PNG (thumbnail or metadata): its start into the arena, the rest stays in the pipe.
+    Src stream = {nullptr, 0, 0, -1, 0};
+    if (in >= 0) {
+        size_t want = static_cast<size_t>(std::min<uint64_t>(rq.inputLen, kPrefixBytes));
+        uint8_t* pre = static_cast<uint8_t*>(arena_alloc(std::max<size_t>(want, 1)));
+        if (pre == nullptr) worker_exit(kExitDecodeFailed);
+        size_t got = 0;
+        while (got < want) {
+            ssize_t k = read(1, pre + got, want - got);
+            if (k < 0 && errno == EINTR) continue;
+            if (k <= 0) break;
+            got += static_cast<size_t>(k);
+        }
+        stream = {pre, got, 0, 1, rq.inputLen - got};
+        data = pre;
+        size = got;
+    }
+    // Header-only and full decodes: from the stream when there is one, else from memory.
+    auto decode = [&](uint32_t maxW, uint32_t maxH, bool headerOnly, uint32_t* w, uint32_t* h) {
+        if (in < 0) return decode_any(format, data, size, maxW, maxH, &sink, headerOnly, w, h);
+        return format == kFormatPng ? decode_png_src(&stream, maxW, maxH, &sink, headerOnly, w, h)
+                                    : decode_jpeg_src(&stream, maxW, maxH, &sink, headerOnly, w, h);
+    };
     if (rq.op == kOpProbe) {
         uint32_t w = 0, h = 0;
         if (!decode_any(format, data, size, 0, 0, &sink, true, &w, &h)) worker_exit(failed());
@@ -788,8 +1029,8 @@ int lockdown(int out) {
         m->magic = kMetaMagic;
         m->version = 1;
         m->format = format;
-        if (!decode_any(format, data, size, 0, 0, &sink, true, &m->width, &m->height)) worker_exit(failed());
         read_metadata(data, size, format, m);
+        if (!decode(0, 0, true, &m->width, &m->height)) worker_exit(failed());
         worker_exit(write_all(0, m, sizeof(*m)) ? kExitOk : kExitDecodeFailed);
     }
     // Thumbnail: the rotation comes from the file's EXIF orientation, read first.
@@ -798,8 +1039,7 @@ int lockdown(int out) {
     // The box is for the image as shown. Turned by 90 or 270 degrees, the stored image fits it the other way round.
     bool turned = gRotation == 90 || gRotation == 270;
     uint32_t w, h;
-    worker_exit(decode_any(format, data, size, turned ? rq.arg1 : rq.arg0, turned ? rq.arg0 : rq.arg1, &sink, false,
-                           &w, &h) ? kExitOk : failed());
+    worker_exit(decode(turned ? rq.arg1 : rq.arg0, turned ? rq.arg0 : rq.arg1, false, &w, &h) ? kExitOk : failed());
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -811,6 +1051,7 @@ struct ZygoteRequest {
     Request rq;
     uint32_t format;
     uint32_t len;
+    uint32_t streamed;  // the input descriptor is a pipe to read the file from, not a memory file to map
 };
 
 struct ZygoteReply {
@@ -844,13 +1085,14 @@ pid_t gZygotePid = -1;
         if (pid == 0) {
             close(sock);
             const uint8_t* data = nullptr;
+            if (zr.streamed) worker_main(zr.rq, zr.format, nullptr, 0, fds[1], fds[0]);
             if (zr.len > 0) {
                 void* p = mmap(nullptr, zr.len, PROT_READ, MAP_PRIVATE, fds[0], 0);
                 if (p == MAP_FAILED) worker_exit(kExitLockdown);
                 data = static_cast<const uint8_t*>(p);
             }
             close(fds[0]);
-            worker_main(zr.rq, zr.format, data, zr.len, fds[1]);
+            worker_main(zr.rq, zr.format, data, zr.len, fds[1], -1);
         }
         close(fds[0]);
         close(fds[1]);
@@ -925,6 +1167,11 @@ struct Worker {
     pid_t pid = -1;
     int pipe = -1;
     int64_t deadline = 0;
+    // What a streaming worker wrote while the broker was still passing it the file: kept in a memory file, read
+    // before the pipe.
+    int bufFd = -1;
+    uint64_t bufLen = 0;
+    uint64_t bufAt = 0;
 };
 
 // Ends the current worker, at once with kill, else after it exits on its own (a grace period, then killed anyway).
@@ -939,6 +1186,7 @@ Ended end_worker(Worker* w, bool kill) {
         if (n != static_cast<ssize_t>(sizeof(ended))) broker_fail();
     }
     close(w->pipe);
+    if (w->bufFd >= 0) close(w->bufFd);
     *w = Worker();
     if (ended.kind != 2) broker_fail();
     int status = ended.value;
@@ -952,16 +1200,52 @@ int32_t status_of(Ended e) {
     return e == Ended::kDecodeFailed ? kInvalid : e == Ended::kUnsupported ? kUnsupported : kInternal;
 }
 
+// A worker's output, the part kept while the file was streaming first, then the pipe. Like read_full.
+ssize_t worker_read(Worker* w, void* data, size_t n, int64_t deadline, int idleMs) {
+    uint8_t* p = static_cast<uint8_t*>(data);
+    size_t got = 0;
+    if (w->bufFd >= 0 && w->bufAt < w->bufLen) {
+        size_t k = static_cast<size_t>(std::min<uint64_t>(n, w->bufLen - w->bufAt));
+        if (pread(w->bufFd, p, k, static_cast<off_t>(w->bufAt)) != static_cast<ssize_t>(k)) return -1;
+        w->bufAt += k;
+        got = k;
+    }
+    if (got == n) return static_cast<ssize_t>(got);
+    ssize_t r = read_full(w->pipe, p + got, n - got, deadline, idleMs);
+    if (r < 0) return got > 0 ? static_cast<ssize_t>(got) : r;
+    return static_cast<ssize_t>(got) + r;
+}
+
+uint8_t gStripe[kStripeBytes];
+uint8_t gXfer[kStripeBytes];  // the file's bytes on their way from the link to a worker
+
+// Reads n bytes of the request's file from the link and drops them: the stream stays in step when the file is
+// refused before a worker takes it.
+bool discard_input(int c, uint64_t n) {
+    while (n > 0) {
+        size_t k = static_cast<size_t>(std::min<uint64_t>(n, sizeof(gXfer)));
+        if (read_full(c, gXfer, k, now_ms() + kHostReadMs, kHostReadMs) != static_cast<ssize_t>(k)) return false;
+        n -= k;
+    }
+    return true;
+}
+
 // The request's file goes into a memory file the worker maps read-only. The broker reads it straight from the link
-// into that file, so the broker's own memory never holds a caller's file.
-int read_input(int c, uint32_t len) {
+// into that file, so the broker's own memory never holds a caller's file. pre: its first bytes, read already.
+// -1: no memory file, -2: the link broke.
+int read_input(int c, const uint8_t* pre, size_t preLen, uint32_t len) {
     int fd = static_cast<int>(syscall(__NR_memfd_create, "decoder-input", MFD_CLOEXEC));
-    if (fd < 0) return -1;
+    if (fd < 0) return discard_input(c, len - preLen) ? -1 : -2;
     if (len == 0) return fd;
     void* p = MAP_FAILED;
     if (ftruncate(fd, len) == 0) p = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    bool ok = p != MAP_FAILED &&
-              read_full(c, p, len, now_ms() + kHostReadMs, kHostReadMs) == static_cast<ssize_t>(len);
+    bool ok = p != MAP_FAILED;
+    if (ok) {
+        memcpy(p, pre, preLen);
+        size_t rest = len - preLen;
+        ok = read_full(c, static_cast<uint8_t*>(p) + preLen, rest, now_ms() + kHostReadMs, kHostReadMs) ==
+             static_cast<ssize_t>(rest);
+    }
     if (p != MAP_FAILED) munmap(p, len);
     if (!ok) {
         close(fd);
@@ -970,10 +1254,86 @@ int read_input(int c, uint32_t len) {
     return fd;
 }
 
-bool start_worker(const Request& rq, uint32_t format, int input, uint32_t len, Worker* w) {
+// The most a streaming worker may write before the broker has passed it the whole file: a full-size thumbnail.
+constexpr uint64_t kMaxEarlyOutput = 16 + static_cast<uint64_t>(kMaxPixels) * 4 + sizeof(Meta);
+
+// Passes the rest of the request's file from the link to a streaming worker's input pipe, 64 KiB at a time. Android
+// sends the whole file before it reads the answer, so whatever the worker writes meanwhile goes into a memory file
+// (at most kMaxEarlyOutput) and is answered from there afterwards. A worker that ends early, stops reading or passes
+// its deadline gets the rest of the file dropped. False when the link broke.
+bool pump_input(int c, const uint8_t* pre, size_t preLen, uint64_t rest, int in, Worker* w) {
+    const uint8_t* pending = pre;
+    size_t pendingLen = preLen;
+    bool workerGone = false, outputDone = false;
+    fcntl(in, F_SETFL, O_NONBLOCK);
+    for (;;) {
+        if (pendingLen == 0) {
+            if (rest == 0) break;
+            size_t k = static_cast<size_t>(std::min<uint64_t>(rest, sizeof(gXfer)));
+            if (read_full(c, gXfer, k, now_ms() + kHostReadMs, kHostReadMs) != static_cast<ssize_t>(k)) return false;
+            rest -= k;
+            pending = gXfer;
+            pendingLen = k;
+        }
+        if (workerGone) {
+            pendingLen = 0;
+            continue;
+        }
+        int64_t left = w->deadline - now_ms();
+        if (left <= 0) {
+            ::kill(w->pid, SIGKILL);  // the deadline: end_worker reports it as internal
+            workerGone = true;
+            continue;
+        }
+        pollfd pfd[2] = {{in, POLLOUT, 0}, {outputDone ? -1 : w->pipe, POLLIN, 0}};
+        int r = poll(pfd, 2, static_cast<int>(std::min<int64_t>(left, kIdleMs)));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) {
+            ::kill(w->pid, SIGKILL);  // stopped reading and writing alike
+            workerGone = true;
+            continue;
+        }
+        if (pfd[1].revents != 0) {
+            ssize_t k = read(w->pipe, gStripe, sizeof(gStripe));
+            if (k < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            if (k <= 0) {
+                outputDone = true;
+            } else {
+                if (w->bufFd < 0) {
+                    w->bufFd = static_cast<int>(syscall(__NR_memfd_create, "decoder-early", MFD_CLOEXEC));
+                }
+                if (w->bufFd < 0 || w->bufLen + static_cast<uint64_t>(k) > kMaxEarlyOutput ||
+                    pwrite(w->bufFd, gStripe, static_cast<size_t>(k), static_cast<off_t>(w->bufLen)) != k) {
+                    ::kill(w->pid, SIGKILL);
+                    workerGone = true;
+                    continue;
+                }
+                w->bufLen += static_cast<uint64_t>(k);
+            }
+        }
+        if (pfd[0].revents & (POLLERR | POLLHUP)) {
+            workerGone = true;  // the worker closed its input: done with the file, or gone
+            continue;
+        }
+        if (pfd[0].revents & POLLOUT) {
+            ssize_t k = write(in, pending, pendingLen);
+            if (k < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            if (k < 0) {
+                workerGone = true;
+                continue;
+            }
+            pending += k;
+            pendingLen -= static_cast<size_t>(k);
+        }
+    }
+    wipe(gXfer, sizeof(gXfer));
+    return true;
+}
+
+bool start_worker(const Request& rq, uint32_t format, int input, uint32_t len, bool streamed, Worker* w) {
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0) return false;
-    ZygoteRequest zr = {rq, format, len};
+    ZygoteRequest zr = {rq, format, len, streamed ? 1u : 0u};
     int pass[2] = {input, fds[1]};
     char control[CMSG_SPACE(sizeof(pass))] = {};
     iovec iov = {&zr, sizeof(zr)};
@@ -1027,13 +1387,11 @@ bool premultiplied(const uint8_t* p, size_t n) {
     return true;
 }
 
-uint8_t gStripe[kStripeBytes];
-
 // The worker's answer to the host. Returns false when the connection must end.
 bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* w) {
     if (rq.op == kOpProbe) {
         uint8_t msg[20];
-        ssize_t n = read_full(w->pipe, msg, sizeof(msg), w->deadline, kIdleMs);
+        ssize_t n = worker_read(w, msg, sizeof(msg), w->deadline, kIdleMs);
         Ended e = end_worker(w, n != static_cast<ssize_t>(sizeof(msg)));
         uint32_t fmt = le32(msg + 4), pw = le32(msg + 8), ph = le32(msg + 12), anim = le32(msg + 16);
         if (e != Ended::kClean || n != static_cast<ssize_t>(sizeof(msg))) {
@@ -1048,7 +1406,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
 
     if (rq.op == kOpMetadata) {
         Meta m;
-        ssize_t n = read_full(w->pipe, &m, sizeof(m), w->deadline, kIdleMs);
+        ssize_t n = worker_read(w, &m, sizeof(m), w->deadline, kIdleMs);
         Ended e = end_worker(w, n != static_cast<ssize_t>(sizeof(m)));
         bool ok = e == Ended::kClean && n == static_cast<ssize_t>(sizeof(m)) && m.magic == kMetaMagic &&
                   m.version == 1 && m.format == format && m.width != 0 && m.height != 0 &&
@@ -1062,7 +1420,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
 
     // Thumbnail (and the test hooks, which answer as a 1x1 or 2x1 thumbnail): header, exact pixels, trailer.
     uint8_t hdr[16];
-    ssize_t n = read_full(w->pipe, hdr, sizeof(hdr), w->deadline, kIdleMs);
+    ssize_t n = worker_read(w, hdr, sizeof(hdr), w->deadline, kIdleMs);
     uint32_t tw = le32(hdr + 4), th = le32(hdr + 8), rot = le32(hdr + 12);
     bool turned = rot == 90 || rot == 270;
     bool box = hook || (turned ? (tw <= rq.arg1 && th <= rq.arg0) : (tw <= rq.arg0 && th <= rq.arg1));
@@ -1083,7 +1441,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
     int32_t verdict = kOk;
     while (left > 0) {
         size_t want = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), left));
-        ssize_t got = read_full(w->pipe, gStripe, want, w->deadline, kIdleMs);
+        ssize_t got = worker_read(w, gStripe, want, w->deadline, kIdleMs);
         // A worker that stops early, or sends a colour above alpha (only a compromised one does), ends here. The
         // promised length is kept with zeros and the trailer carries the verdict, so Android tells a bad file or a
         // failed worker from a broken link.
@@ -1107,7 +1465,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
     }
     // All pixels are here. The worker must now end, cleanly and with nothing more to say.
     uint8_t extra;
-    ssize_t more = read_full(w->pipe, &extra, 1, w->deadline, kIdleMs);
+    ssize_t more = worker_read(w, &extra, 1, w->deadline, kIdleMs);
     Ended e = end_worker(w, more != 0);
     verdict = more != 0 ? kInvalid : e == Ended::kClean ? kOk : status_of(e);
     return send_end(c, verdict);
@@ -1120,39 +1478,72 @@ bool serve_one(int c) {
         return false;
     }
     if (rq.magic != kRequestMagic || rq.inputLen > kMaxInputBytes) return false;
-    int input = read_input(c, rq.inputLen);
-    if (input == -2) return false;
-    if (input < 0) return send_failure(c, kInternal);
-    // Only the first bytes, to pick the decoder. The memory file is read, not the broker's memory.
+    // Only the first bytes, to pick the decoder. They are wiped when the request ends.
     uint8_t magic[kMagicBytes] = {};
     size_t got = std::min<size_t>(rq.inputLen, sizeof(magic));
-    if (pread(input, magic, got, 0) != static_cast<ssize_t>(got)) got = 0;
-    uint32_t format = detect_format(magic, got, rq.inputLen);
-    bool result;
-    {
-        struct Closer {
-            int fd;
-            ~Closer() { close(fd); }
-        } closer = {input};
-        if (rq.op == kOpPing) return send_reply(c, kOk, 0, 0, 0, 0, 0) && send_end(c, kOk);
-#ifdef DECODER_TEST_HOOKS
-        bool hook = rq.op == kOpHook;
-#else
-        bool hook = false;
-#endif
-        if (rq.op != kOpProbe && rq.op != kOpThumbnail && rq.op != kOpMetadata && !hook) return false;
-        if (!hook && format == kFormatUnknown) return send_failure(c, kUnsupported);
-        if (rq.op == kOpThumbnail &&
-            (rq.arg0 == 0 || rq.arg1 == 0 || rq.arg0 > kMaxDimension || rq.arg1 > kMaxDimension)) {
-            return send_failure(c, kInvalid);
+    if (read_full(c, magic, got, now_ms() + kHostReadMs, kHostReadMs) != static_cast<ssize_t>(got)) return false;
+    struct Wiper {
+        uint8_t* p;
+        ~Wiper() {
+            wipe(p, kMagicBytes);
+            wipe(gStripe, sizeof(gStripe));
+            wipe(gXfer, sizeof(gXfer));
         }
-        Worker w;
-        if (!start_worker(rq, format, input, rq.inputLen, &w)) return send_failure(c, kInternal);
-        result = serve_worker(c, rq, format, hook, &w);
+    } wiper = {magic};
+    uint64_t rest = rq.inputLen - got;
+    uint32_t format = detect_format(magic, got, rq.inputLen);
+#ifdef DECODER_TEST_HOOKS
+    bool hook = rq.op == kOpHook;
+#else
+    bool hook = false;
+#endif
+    if (rq.op != kOpPing && rq.op != kOpProbe && rq.op != kOpThumbnail && rq.op != kOpMetadata && !hook) return false;
+    // JPEG and PNG thumbnails and records stream: the file goes to the worker as it arrives and is never held whole.
+    // Everything else is read into a memory file first, at most kMaxBufferedBytes.
+    bool streamed = !hook && (format == kFormatJpeg || format == kFormatPng) &&
+                    (rq.op == kOpThumbnail || rq.op == kOpMetadata);
+    int32_t refuse = -1;
+    if (rq.op == kOpPing) {
+        refuse = kOk;
+    } else if (!hook && format == kFormatUnknown) {
+        refuse = kUnsupported;
+    } else if (!streamed && rq.inputLen > kMaxBufferedBytes) {
+        refuse = kInvalid;
+    } else if (rq.op == kOpThumbnail &&
+               (rq.arg0 == 0 || rq.arg1 == 0 || rq.arg0 > kMaxDimension || rq.arg1 > kMaxDimension)) {
+        refuse = kInvalid;
     }
-    // Nothing of this request stays in the broker's memory either.
-    wipe(gStripe, sizeof(gStripe));
-    return result;
+    if (refuse >= 0) {
+        if (!discard_input(c, rest)) return false;
+        if (refuse == kOk) return send_reply(c, kOk, 0, 0, 0, 0, 0) && send_end(c, kOk);
+        return send_failure(c, refuse);
+    }
+    Worker w;
+    if (streamed) {
+        int in[2];
+        if (pipe2(in, O_CLOEXEC) != 0) return discard_input(c, rest) && send_failure(c, kInternal);
+        bool started = start_worker(rq, format, in[0], rq.inputLen, true, &w);
+        close(in[0]);
+        if (!started) {
+            close(in[1]);
+            return discard_input(c, rest) && send_failure(c, kInternal);
+        }
+        bool linkOk = pump_input(c, magic, got, rest, in[1], &w);
+        close(in[1]);
+        if (!linkOk) {
+            end_worker(&w, true);
+            return false;
+        }
+    } else {
+        int input = read_input(c, magic, got, rq.inputLen);
+        if (input == -2) return false;
+        if (input < 0) return send_failure(c, kInternal);
+        bool started = start_worker(rq, format, input, rq.inputLen, false, &w);
+        close(input);
+        if (!started) return send_failure(c, kInternal);
+    }
+    // Nothing of this request stays in the broker's memory either (the wiper, on the way out).
+    return serve_worker(c, rq, format, hook, &w);
 }
 
 // The lockdown itself is tested before the broker serves anyone: a child locks down, says so, then makes a forbidden

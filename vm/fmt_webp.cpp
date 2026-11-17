@@ -82,9 +82,15 @@ bool decode_still(const uint8_t* data, size_t size, const WebPBitstreamFeatures&
     uint64_t out = static_cast<uint64_t>(ow) * oh * 4;
     if (!fits(out + decoder_bytes(w, h, f.format, f.has_alpha != 0))) return false;
     uint8_t* rgba = static_cast<uint8_t*>(arena_alloc(out));
-    if (rgba == nullptr || !decode_into(data, size, w, h, ow, oh, rgba)) return false;
+    if (rgba == nullptr || !decode_into(data, size, w, h, ow, oh, rgba)) {
+        arena_free(rgba);
+        return false;
+    }
     Scaler scaler = {};
-    if (!start_output(&scaler, ow, oh, ow, oh, sink)) return false;
+    if (!start_output(&scaler, ow, oh, ow, oh, sink)) {
+        arena_free(rgba);
+        return false;
+    }
     scaler.premultiplied = true;
     for (uint32_t y = 0; y < oh; y++) {
         if (!scaler_push(&scaler, rgba + static_cast<size_t>(ow) * 4 * y)) return false;

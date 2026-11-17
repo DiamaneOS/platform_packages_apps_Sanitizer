@@ -65,7 +65,10 @@ enum Format : uint32_t {
     kFormatWbmp = 10,
 };
 
-constexpr uint32_t kMaxInputBytes = 32u << 20;
+// A JPEG or PNG streams through the VM and may be up to kMaxInputBytes. Every other file is held in a memory file
+// while its worker decodes it, and may be up to kMaxBufferedBytes.
+constexpr uint32_t kMaxInputBytes = 256u << 20;
+constexpr uint32_t kMaxBufferedBytes = 32u << 20;
 constexpr uint32_t kMaxDimension = 65535;
 constexpr uint32_t kMaxPixels = 8u << 20;
 
