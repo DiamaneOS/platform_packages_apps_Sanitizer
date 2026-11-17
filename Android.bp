@@ -95,6 +95,15 @@ genrule {
     cmd: "$(location decoder_vm_mkinitrd) $(out) $(in)",
 }
 
+// Test only: the initramfs with the hook binary, for the self-test. Nothing installs it.
+genrule {
+    name: "decoder_vm_initrd_test",
+    tools: ["decoder_vm_mkinitrd"],
+    device_first_srcs: [":decoder_vm_init_test"],
+    out: ["initrd-test.img"],
+    cmd: "$(location decoder_vm_mkinitrd) $(out) $(in)",
+}
+
 android_app {
     name: "DiamaneOSSanitizer",
     srcs: ["java/**/*.java"],
