@@ -1,0 +1,73 @@
+// Copyright (C) 2026 DiamaneOS
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// File sanitizer: untrusted images are decoded inside a protected VM.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+aidl_interface {
+    name: "de.diamaneos.sanitizer.aidl",
+    srcs: ["aidl/de/diamaneos/sanitizer/ISanitizer.aidl"],
+    local_include_dir: "aidl",
+    unstable: true,
+    backend: {
+        java: {
+            gen_rpc: true,
+            sdk_version: "system_current",
+        },
+        cpp: {
+            enabled: false,
+        },
+        ndk: {
+            enabled: true,
+        },
+    },
+}
+
+// Loaded by Microdroid from the APK. Only libbinder_ndk, libvm_payload, liblog and the C library come from the VM,
+// the decoders are linked in.
+cc_library_shared {
+    name: "libdiamaneos_sanitizer_payload",
+    srcs: ["native/payload.cpp"],
+    stl: "libc++_static",
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+    shared_libs: [
+        "libbinder_ndk",
+        "liblog",
+        "libvm_payload#current",
+    ],
+    static_libs: [
+        "de.diamaneos.sanitizer.aidl-ndk",
+        "libjpeg",
+        "libpng",
+        "libz",
+    ],
+}
+
+android_app {
+    name: "DiamaneOSSanitizer",
+    srcs: ["java/**/*.java"],
+    resource_dirs: ["res"],
+    static_libs: ["de.diamaneos.sanitizer.aidl-java"],
+    sdk_version: "system_current",
+    jni_libs: ["libdiamaneos_sanitizer_payload"],
+    jni_uses_platform_apis: true,
+    use_embedded_native_libs: true,
+    system_ext_specific: true,
+}
