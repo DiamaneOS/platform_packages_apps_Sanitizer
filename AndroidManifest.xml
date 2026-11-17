@@ -17,6 +17,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="de.diamaneos.sanitizer">
 
+    <!-- Callers of the decode service (IDecodeService): MediaProvider and other system components, allowlisted as
+         privileged permissions. The service also checks the calling package against its own list. -->
+    <permission
+        android:name="de.diamaneos.sanitizer.permission.DECODE"
+        android:protectionLevel="signature|privileged" />
+
     <uses-permission android:name="android.permission.MANAGE_VIRTUAL_MACHINE" />
     <uses-feature android:name="android.software.virtualization_framework" android:required="true" />
 
