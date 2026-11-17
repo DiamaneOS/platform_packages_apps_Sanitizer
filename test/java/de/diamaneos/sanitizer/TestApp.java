@@ -17,21 +17,32 @@
 package de.diamaneos.sanitizer;
 
 import android.app.Application;
+import android.os.SystemProperties;
 
 import java.io.File;
 
 /**
- * Test builds only: the self-test app's application. Its decode service runs the test VM image pushed into the app's
- * external files (decoder-vm/), under a test permission, and only the app itself may call it.
+ * Test builds only: the self-test app's application. Its decode service runs the test VM image adb pushed to
+ * /data/local/tmp/decoder-vm/ (shell_data_file, a label the VM manager accepts for a protected VM's kernel, unlike
+ * this app's own files), under a test permission, and only the app itself may call it. Debuggable builds only.
  */
 public final class TestApp extends Application implements DecoderProvider {
     static final String PERMISSION = "de.diamaneos.sanitizer.test.permission.DECODE";
+    static final File TEST_IMAGES = new File("/data/local/tmp/decoder-vm");
+
+    /** The test VM images, only where adb could have put them: a debuggable build. */
+    static File testImages() {
+        if (!SystemProperties.getBoolean("ro.debuggable", false)) {
+            throw new IllegalStateException("the self-test runs on debuggable builds only");
+        }
+        return TEST_IMAGES;
+    }
     private Decoder mDecoder;
 
     @Override
     public synchronized Decoder decoder() {
         if (mDecoder == null) {
-            File dir = new File(getExternalFilesDir(null), "decoder-vm");
+            File dir = testImages();
             mDecoder = new Decoder(new GuestVm(this, new File(dir, "kernel"), new File(dir, "initrd.img"),
                     DecoderApp.VM_MEMORY_BYTES));
         }

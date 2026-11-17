@@ -53,8 +53,9 @@ import de.diamaneos.sanitizer.decode.Thumbnail;
  * and the scheduler), "all" adds the VM checks (memory sizes, timings, the lockdown hooks, failing closed) and the
  * same service through binder, resolved by its action like MediaProvider binds it.
  *
- * <p>The VM's kernel and initramfs (signed with the test key that test builds' pvmfw trusts) and the test images are
- * pushed to this app's external files directory under decoder-vm/ and images/.
+ * <p>The VM's kernel and initramfs (signed with the test key that test builds' pvmfw trusts) are pushed to
+ * /data/local/tmp/decoder-vm/, whose label the VM manager accepts, and the test images to this app's external files
+ * directory under images/.
  */
 public class SelfTestActivity extends Activity {
     private static final String TAG = "DecoderSelfTest";
@@ -373,7 +374,7 @@ public class SelfTestActivity extends Activity {
 
     private void vmChecks() throws Exception {
         File base = getExternalFilesDir(null);
-        File source = new File(base, "decoder-vm");
+        File source = TestApp.testImages();
         File images = new File(base, "images");
         File[] files = images.listFiles();
         if (files == null || files.length == 0) {
@@ -622,15 +623,7 @@ public class SelfTestActivity extends Activity {
         stopper.join();
         log("info fail-closed mid-request: status " + r.status);
         // 2. The VM cannot start (its kernel is gone): requests answer UNAVAILABLE within their deadline.
-        File hidden = new File(source.getParentFile(), "decoder-vm.hidden");
-        if (!source.renameTo(hidden)) {
-            fail("fail closed without a VM", "could not hide the kernel");
-            return;
-        }
-        File staged = new File(getDataDir(), "files/decoder-vm");
-        File stagedDe = new File(createDeviceProtectedStorageContext().getFilesDir(), "decoder-vm");
-        deleteTree(staged);
-        deleteTree(stagedDe);
+        vm.setImagesForTest(new File(source, "missing-kernel"), new File(source, "missing-initrd"));
         vm.stop();
         d.clearCache();
         int unavailable = 0;
@@ -641,7 +634,7 @@ public class SelfTestActivity extends Activity {
             worst = Math.max(worst, SystemClock.uptimeMillis() - t0);
             if (x.status == Decoder.UNAVAILABLE && x.answer == null) unavailable++;
         }
-        if (!hidden.renameTo(source)) log("info could not restore the kernel");
+        vm.setImagesForTest(new File(source, "kernel"), new File(source, "initrd.img"));
         if (unavailable == 3 && worst <= 5500) {
             pass("fail closed without a VM", "3 of 3 unavailable, worst " + worst + " ms, no decode outside the VM");
         } else {
@@ -661,11 +654,5 @@ public class SelfTestActivity extends Activity {
         } else {
             fail("recovers after backoff", "status " + (back == null ? "none" : back.status) + " after " + ms + " ms");
         }
-    }
-
-    private static void deleteTree(File f) {
-        File[] kids = f.listFiles();
-        if (kids != null) for (File k : kids) deleteTree(k);
-        f.delete();
     }
 }

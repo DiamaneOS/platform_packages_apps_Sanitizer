@@ -90,7 +90,8 @@ payload key.
 
    Adding the kernel to `original_kernels` makes signing fail (found by the SD card work with a throwaway key).
 
-4. `virtmgr` needs no change: the service copies both files into its own data, which the VM manager may read.
+4. `virtmgr` needs no change: the service passes both files from the APEX as they are. They are system_file, one of the
+   labels virtmgr takes for a protected VM's kernel (`check_label_is_allowed`). A copy in app data would be refused.
 
 ## Checks
 

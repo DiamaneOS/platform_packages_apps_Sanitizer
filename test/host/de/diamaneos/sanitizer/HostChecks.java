@@ -249,6 +249,7 @@ public final class HostChecks {
     }
 
     static void linkChecks() throws Exception {
+        vmImageChecks();
         int R = GuestLink.REPLY_MAGIC;
         byte[] px = {1, 2, 3, 4, 5, 6, 7, 8};
         Object ok = stub((in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0, 8), px, end(0))),
@@ -349,6 +350,29 @@ public final class HostChecks {
                 meta(1, 5, 3, 90, -1, "", ""), end(0))), GuestLink.OP_METADATA);
         expectRefused("meta orientation without flag", (in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(0, 4, 3, 90, -1, "", ""), end(0))), GuestLink.OP_METADATA);
+    }
+
+    // The VM manager's label rule for a protected VM's kernel files (virtmgr's own test cases, and the label of the
+    // copy in app data an earlier version made, which the phone refused).
+    static void vmImageChecks() {
+        Object[][] cases = {
+            {"u:object_r:system_file:s0", true},
+            {"u:object_r:shell_data_file:s0", true},
+            {"u:object_r:apk_data_file:s0", true},
+            {"u:object_r:app_data_file:s0", false},
+            {"u:object_r:app_data_file:s0:c512,c768", false},
+            {"u:object_r:privapp_data_file:s0:c512,c768", false},
+            {"invalid", false},
+            {"user:role:apk_data_file:severity:categories", true},
+            {"user:role:apk_data_file:severity:categories:extraneous", false},
+            {"u:object_r:vendor_unknowable:s0", false},
+        };
+        int bad = 0;
+        for (Object[] c : cases) {
+            if (VmImages.labelAllowed((String) c[0]) != (Boolean) c[1]) bad++;
+        }
+        if (bad == 0) pass("VM image labels as the VM manager takes them", cases.length + " labels");
+        else fail("VM image labels as the VM manager takes them", bad + " wrong");
     }
 
     // The fuzzing server: random replies, then mutations of valid ones.

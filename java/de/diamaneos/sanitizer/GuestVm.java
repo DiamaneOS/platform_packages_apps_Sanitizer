@@ -19,6 +19,8 @@ package de.diamaneos.sanitizer;
 import android.content.Context;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
+import android.system.ErrnoException;
+import android.system.Os;
 import android.system.virtualmachine.VirtualMachine;
 import android.system.virtualmachine.VirtualMachineCallback;
 import android.system.virtualmachine.VirtualMachineConfig;
@@ -26,14 +28,9 @@ import android.system.virtualmachine.VirtualMachineManager;
 import android.util.Log;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.lang.reflect.Method;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 
@@ -42,9 +39,11 @@ import java.util.concurrent.Executors;
  * Microdroid. It is started early, kept running, and started again with backoff when it stops or stops answering.
  *
  * <p>The kernel and initramfs ship in the virtualization APEX, where release signing signs them again with the key
- * pvmfw trusts (sign_virt_apex). The VM manager may only read app data files, not system files, so they are copied
- * into this app's device-protected storage first. That copy needs no trust: pvmfw refuses a kernel that is not signed
- * with the build's key, and the kernel's signature covers the initramfs.
+ * pvmfw trusts (sign_virt_apex). They are passed to the VM manager where they are: for a protected VM it takes kernel
+ * files only with a label from a trusted source (VmImages), and the APEX's files are system_file. A copy in app data
+ * (app_data_file) is refused, which an earlier version did. The label is checked here before each start, so a wrong
+ * path fails with its reason. pvmfw still refuses a kernel not signed with the build's key, and the kernel's
+ * signature covers the initramfs.
  *
  * <p>Raw VMs are configured through the VM framework's hidden custom image API, reached by reflection: this app is
  * platform-signed and holds USE_CUSTOM_VIRTUAL_MACHINE.
@@ -52,12 +51,12 @@ import java.util.concurrent.Executors;
 final class GuestVm {
     private static final String TAG = "DecoderVm";
     static final String NAME = "decoder";
-    private static final String KERNEL = "kernel";
-    private static final String INITRD = "initrd.img";
+    // Where an earlier version copied the images, in device-protected storage. Removed at every start.
+    private static final String OLD_COPY = "decoder-vm";
 
     private final Context mContext; // device-protected storage, so the VM runs before the first unlock
-    private final File mKernelSource;
-    private final File mInitrdSource;
+    private File mKernel;
+    private File mInitrd;
     private final long mMemoryBytes;
     private final Executor mCallbacks = Executors.newSingleThreadExecutor();
 
@@ -69,9 +68,15 @@ final class GuestVm {
 
     GuestVm(Context context, File kernel, File initrd, long memoryBytes) {
         mContext = context.createDeviceProtectedStorageContext();
-        mKernelSource = kernel;
-        mInitrdSource = initrd;
+        mKernel = kernel;
+        mInitrd = initrd;
         mMemoryBytes = memoryBytes;
+    }
+
+    /** Test builds only: other image files for the next start (the self-test's fail-closed check). */
+    synchronized void setImagesForTest(File kernel, File initrd) {
+        mKernel = kernel;
+        mInitrd = initrd;
     }
 
     /** Milliseconds from run() to the first answer of the last start, -1 before. */
@@ -132,12 +137,11 @@ final class GuestVm {
 
     private void start() throws IOException {
         stop();
-        File dir = new File(mContext.getFilesDir(), "decoder-vm");
-        if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("no directory");
-        File kernel = new File(dir, KERNEL);
-        File initrd = new File(dir, INITRD);
-        copy(mKernelSource, kernel);
-        copy(mInitrdSource, initrd);
+        deleteTree(new File(mContext.getFilesDir(), OLD_COPY));
+        File kernel = mKernel;
+        File initrd = mInitrd;
+        checkLabel(kernel);
+        checkLabel(initrd);
         try {
             VirtualMachineConfig config = rawConfig(kernel, initrd);
             VirtualMachineManager vmm = mContext.getSystemService(VirtualMachineManager.class);
@@ -205,32 +209,25 @@ final class GuestVm {
                 .build();
     }
 
-    // Copies unless the copy already holds exactly the same bytes (SHA-256): an update may keep the size and the
-    // time of a file whose contents changed. pvmfw checks the kernel's signature at every start either way.
-    private static void copy(File from, File to) throws IOException {
-        byte[] want = sha256(from);
-        if (to.isFile() && MessageDigest.isEqual(want, sha256(to))) return;
-        File tmp = new File(to.getPath() + ".tmp");
-        try (InputStream in = new FileInputStream(from); OutputStream out = new FileOutputStream(tmp)) {
-            byte[] buf = new byte[1 << 16];
-            int n;
-            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+    // The VM manager's own rule for a protected VM's kernel files, checked first so a refusal names its cause.
+    private static void checkLabel(File f) throws IOException {
+        String label;
+        try {
+            byte[] v = Os.getxattr(f.getPath(), "security.selinux");
+            int n = v.length;
+            while (n > 0 && v[n - 1] == 0) n--;
+            label = new String(v, 0, n, StandardCharsets.US_ASCII);
+        } catch (ErrnoException e) {
+            throw new IOException("VM image " + f + " not readable: " + e.getMessage());
         }
-        if (!MessageDigest.isEqual(want, sha256(tmp)) || !tmp.renameTo(to)) {
-            tmp.delete();
-            throw new IOException("copy " + to);
+        if (!VmImages.labelAllowed(label)) {
+            throw new IOException("VM image " + f + " has label " + label + ", which the VM manager refuses");
         }
     }
 
-    private static byte[] sha256(File f) throws IOException {
-        try (InputStream in = new FileInputStream(f)) {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] buf = new byte[1 << 16];
-            int n;
-            while ((n = in.read(buf)) > 0) md.update(buf, 0, n);
-            return md.digest();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IOException(e);
-        }
+    private static void deleteTree(File f) {
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteTree(k);
+        f.delete();
     }
 }
