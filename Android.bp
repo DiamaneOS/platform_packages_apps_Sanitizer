@@ -49,7 +49,7 @@ aidl_interface {
 java_library {
     name: "de.diamaneos.sanitizer.decode-client",
     srcs: ["client/**/*.java"],
-    static_libs: ["de.diamaneos.sanitizer.decode-client"],
+    static_libs: ["de.diamaneos.sanitizer.decode-java"],
     sdk_version: "system_current",
     min_sdk_version: "30",
     apex_available: [
