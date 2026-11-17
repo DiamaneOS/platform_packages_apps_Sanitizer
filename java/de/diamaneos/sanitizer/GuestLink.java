@@ -266,9 +266,9 @@ final class GuestLink implements Closeable {
                     check(endStatus == OK, "end status " + endStatus);
                     try {
                         checkPremultiplied(pixels);
-                    } catch (ProtocolException e) {
+                    } catch (ProtocolException notPremultiplied) {
                         if (mBudget != null) mBudget.release(mLane, a.reserved);
-                        throw e;
+                        throw notPremultiplied;
                     }
                     a.pixels = pixels;
                     return a;
