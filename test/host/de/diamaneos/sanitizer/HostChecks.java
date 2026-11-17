@@ -185,9 +185,14 @@ public final class HostChecks {
     }
 
     static byte[] meta(int flags, int w, int h, int orientation, long date, String description, String id) {
+        return meta(GuestLink.FORMAT_JPEG, 0, flags, w, h, orientation, date, description, id);
+    }
+
+    static byte[] meta(int format, int special, int flags, int w, int h, int orientation, long date,
+            String description, String id) {
         ByteBuffer b = ByteBuffer.allocate(GuestLink.META_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-        b.putInt(GuestLink.META_MAGIC).putInt(1).putInt(flags).putInt(GuestLink.FORMAT_JPEG).putInt(w).putInt(h)
-                .putInt(orientation).putInt(0).putLong(date).putInt(0).putInt(0);
+        b.putInt(GuestLink.META_MAGIC).putInt(1).putInt(flags).putInt(format).putInt(w).putInt(h)
+                .putInt(orientation).putInt(special).putLong(date).putInt(0).putInt(0);
         b.put(description.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
         b.position(432);
         b.put(id.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
@@ -203,7 +208,7 @@ public final class HostChecks {
                     || a.status == GuestLink.INTERNAL;
             return clean && a.pixels == null && a.meta == null ? null : "bad failure answer " + a.status;
         }
-        if (a.format != GuestLink.FORMAT_JPEG && a.format != GuestLink.FORMAT_PNG) return "format";
+        if (a.format < GuestLink.FORMAT_JPEG || a.format > GuestLink.FORMAT_WBMP) return "format";
         if (op == GuestLink.OP_THUMBNAIL) {
             boolean turned = a.extra == 90 || a.extra == 270;
             if (a.extra != 0 && a.extra != 180 && !turned) return "rotation";
@@ -226,7 +231,9 @@ public final class HostChecks {
             }
             if (m.dateTakenMillis > System.currentTimeMillis() + 86400000L) return "future date";
         } else {
-            if (a.extra != 0 && !(a.extra == 1 && a.format == GuestLink.FORMAT_PNG)) return "animated";
+            if (a.extra != 0 && !(a.extra == 1 && GuestLink.mayBeAnimated(a.format))) {
+                return "animated";
+            }
         }
         return null;
     }
@@ -310,8 +317,25 @@ public final class HostChecks {
                 GuestLink.OP_PROBE);
         expectRefused("animated JPEG", (in, out) -> out.write(cat(reply(R, 0, 1, 5, 5, 1, 0), end(0))),
                 GuestLink.OP_PROBE);
-        expectRefused("format 9", (in, out) -> out.write(cat(reply(R, 0, 9, 5, 5, 0, 0), end(0))),
+        expectRefused("format 11", (in, out) -> out.write(cat(reply(R, 0, 11, 5, 5, 0, 0), end(0))),
                 GuestLink.OP_PROBE);
+        expectRefused("animated BMP", (in, out) -> out.write(cat(reply(R, 0, 5, 5, 5, 1, 0), end(0))),
+                GuestLink.OP_PROBE);
+        expectRefused("meta GIF marker on a JPEG", (in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
+                meta(GuestLink.FORMAT_JPEG, 1, 0, 4, 3, -1, -1, "", ""), end(0))), GuestLink.OP_METADATA);
+        expectRefused("meta animated WebP marker on a PNG", (in, out) -> out.write(cat(reply(R, 0, 2, 4, 3, 0, 1024),
+                meta(GuestLink.FORMAT_PNG, 3, 0, 4, 3, -1, -1, "", ""), end(0))), GuestLink.OP_METADATA);
+        // The new formats' answers are accepted: an animated GIF's probe, a GIF's record with its marker.
+        Object gif = stub((in, out) -> out.write(cat(reply(R, 0, 3, 5, 4, 1, 0), end(0))), GuestLink.OP_PROBE, 0, 0,
+                2000);
+        Object gifMeta = stub((in, out) -> out.write(cat(reply(R, 0, 3, 4, 3, 0, 1024),
+                meta(GuestLink.FORMAT_GIF, 1, 0, 4, 3, -1, -1, "", ""), end(0))), GuestLink.OP_METADATA, 0, 0, 2000);
+        if (gif instanceof GuestLink.Answer && ((GuestLink.Answer) gif).extra == 1
+                && gifMeta instanceof GuestLink.Answer && ((GuestLink.Answer) gifMeta).meta.specialFormat == 1) {
+            pass("animated GIF probe and GIF record accepted", "");
+        } else {
+            fail("animated GIF probe and GIF record accepted", gif + " " + gifMeta);
+        }
         expectRefused("meta control char", (in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(1, 4, 3, 90, -1, "A\u001bcamera", ""), end(0))), GuestLink.OP_METADATA);
         expectRefused("meta line separator", (in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
@@ -669,12 +693,97 @@ public final class HostChecks {
                     + (scanMeta.pixels != null ? scanMeta.pixels[0] : -1) + " pixels " + show(scanPixels) + " found "
                     + (scanPixels.pixels != null ? scanPixels.pixels[0] : -1) + " control " + show(control));
         }
+        formatChecks(link, images);
         link.close();
         // The broker serves the next connection.
         GuestLink again = new GuestLink(new UnixChannel(socket));
         GuestLink.Answer p2 = again.ping(now() + 5000);
         if (p2.status == 0) pass("broker second connection", ""); else fail("broker second connection", show(p2));
         again.close();
+    }
+
+    /**
+     * The format table, images/formats.txt: one check per line, "FILE OP W H STATUS [f=FORMAT] [s=WxH] [x=EXTRA]
+     * [sp=SPECIAL] [o=ORIENTATION]". OP is probe (with the first MAX_PROBE_BYTES only, as the service sends), thumb
+     * or meta. STATUS is a status number, or "noint": any clean answer but INTERNAL (a worker that died: a crash or a
+     * seccomp kill). A file name ending in "/" runs the check on every file of that folder.
+     */
+    static void formatChecks(GuestLink link, java.io.File images) throws Exception {
+        java.io.File table = new java.io.File(images, "formats.txt");
+        if (!table.exists()) return;
+        for (String line : java.nio.file.Files.readAllLines(table.toPath())) {
+            line = line.trim();
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            String[] t = line.split("\\s+");
+            java.util.List<String> files = new java.util.ArrayList<>();
+            if (t[0].endsWith("/")) {
+                String[] names = new java.io.File(images, t[0]).list();
+                java.util.Arrays.sort(names);
+                for (String n : names) files.add(t[0] + n);
+            } else {
+                files.add(t[0]);
+            }
+            for (String name : files) formatCheck(link, images, name, t);
+        }
+    }
+
+    static void formatCheck(GuestLink link, java.io.File images, String name, String[] t) throws Exception {
+        byte[] f = file(images, name);
+        String op = t[1];
+        int bw = Integer.parseInt(t[2]), bh = Integer.parseInt(t[3]);
+        long start = now();
+        GuestLink.Answer a;
+        int opCode;
+        if (op.equals("probe")) {
+            a = link.probe(f, Math.min(f.length, 1 << 20), now() + 45000);
+            opCode = GuestLink.OP_PROBE;
+        } else if (op.equals("meta")) {
+            a = link.metadata(f, f.length, now() + 45000);
+            opCode = GuestLink.OP_METADATA;
+        } else {
+            a = link.thumbnail(f, f.length, bw, bh, now() + 45000);
+            opCode = GuestLink.OP_THUMBNAIL;
+        }
+        long ms = now() - start;
+        String why = broken(a, opCode, bw, bh);
+        if (t[4].equals("noint")) {
+            if (a.status == GuestLink.INTERNAL) why = "INTERNAL";
+        } else if (a.status != Integer.parseInt(t[4])) {
+            why = "status " + a.status;
+        }
+        for (int i = 5; i < t.length && why == null && a.status == 0; i++) {
+            String[] kv = t[i].split("=", 2);
+            switch (kv[0]) {
+                case "f": if (a.format != Integer.parseInt(kv[1])) why = "format " + a.format; break;
+                case "s": if (!(a.width + "x" + a.height).equals(kv[1])) why = "size " + a.width + "x" + a.height; break;
+                case "x": if (a.extra != Integer.parseInt(kv[1])) why = "extra " + a.extra; break;
+                case "sp": if (a.meta == null || a.meta.specialFormat != Integer.parseInt(kv[1])) why = "special"; break;
+                case "o": if (a.meta == null || a.meta.orientation != Integer.parseInt(kv[1])) {
+                        why = "orientation " + (a.meta == null ? "none" : a.meta.orientation);
+                    }
+                    break;
+                default: why = "bad table key " + kv[0];
+            }
+        }
+        String dump = System.getenv("FORMAT_DUMP");
+        if (dump != null && a.status == 0 && a.pixels != null) {
+            // Test runs only: the thumbnail as a PNG (straight alpha) for comparison with a reference decoder.
+            java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(a.width, a.height,
+                    java.awt.image.BufferedImage.TYPE_INT_ARGB);
+            for (int i = 0; i < a.width * a.height; i++) {
+                int al = a.pixels[i * 4 + 3] & 0xff;
+                int[] c = new int[3];
+                for (int k = 0; k < 3; k++) {
+                    int v = a.pixels[i * 4 + k] & 0xff;
+                    c[k] = al == 0 ? 0 : Math.min(255, (v * 255 + al / 2) / al);
+                }
+                img.setRGB(i % a.width, i / a.width, al << 24 | c[0] << 16 | c[1] << 8 | c[2]);
+            }
+            java.io.File out = new java.io.File(dump, name.replace('/', '_') + "-" + bw + "x" + bh + ".png");
+            javax.imageio.ImageIO.write(img, "png", out);
+        }
+        String what = "format " + op + " " + name + (opCode == GuestLink.OP_THUMBNAIL ? " in " + bw + "x" + bh : "");
+        if (why == null) pass(what, show(a) + ", " + ms + " ms"); else fail(what, why + ": " + show(a) + ", " + ms + " ms");
     }
 
     public static void main(String[] args) throws Exception {

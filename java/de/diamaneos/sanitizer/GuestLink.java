@@ -54,8 +54,17 @@ final class GuestLink implements Closeable {
     static final int INVALID = 3;
     static final int INTERNAL = 4;
 
+    // The contract's FORMAT_* values (IDecodeService), all of which the VM reads.
     static final int FORMAT_JPEG = 1;
     static final int FORMAT_PNG = 2;
+    static final int FORMAT_GIF = 3;
+    static final int FORMAT_WEBP = 4;
+    static final int FORMAT_BMP = 5;
+    static final int FORMAT_HEIF = 6;
+    static final int FORMAT_AVIF = 7;
+    static final int FORMAT_DNG = 8;
+    static final int FORMAT_ICO = 9;
+    static final int FORMAT_WBMP = 10;
 
     static final int MAX_INPUT_BYTES = 32 << 20;
     static final int MAX_DIMENSION = 65535;
@@ -216,8 +225,8 @@ final class GuestLink implements Closeable {
                 case OP_PROBE:
                     checkFormat(a.format);
                     checkSize(a.width, a.height, MAX_DIMENSION, MAX_DIMENSION);
-                    // Only an animated PNG can be animated among the formats the VM reads.
-                    check(a.extra == 0 || (a.extra == 1 && a.format == FORMAT_PNG), "animated");
+                    // Only GIF, WebP, PNG (APNG), HEIF and AVIF can be animated.
+                    check(a.extra == 0 || (a.extra == 1 && mayBeAnimated(a.format)), "animated");
                     check(payload == 0, "probe payload");
                     break;
                 case OP_THUMBNAIL:
@@ -324,8 +333,14 @@ final class GuestLink implements Closeable {
         if (!ok) throw new ProtocolException("bad " + what);
     }
 
+    /** The contract's rule, as DecodeChecks.mayBeAnimated: only GIF, WebP, PNG (APNG), HEIF and AVIF. */
+    static boolean mayBeAnimated(int format) {
+        return format == FORMAT_GIF || format == FORMAT_WEBP || format == FORMAT_PNG || format == FORMAT_HEIF
+                || format == FORMAT_AVIF;
+    }
+
     private static void checkFormat(int format) throws ProtocolException {
-        check(format == FORMAT_JPEG || format == FORMAT_PNG, "format");
+        check(format >= FORMAT_JPEG && format <= FORMAT_WBMP, "format");
     }
 
     private static void checkSize(int w, int h, int maxW, int maxH) throws ProtocolException {
@@ -347,6 +362,10 @@ final class GuestLink implements Closeable {
     static final int HAS_DATE = 1 << 1;
     static final int OFFSET_KNOWN = 1 << 2;
     static final int HAS_GPS = 1 << 3;
+
+    static final int SPECIAL_GIF = 1;
+    static final int SPECIAL_MOTION_PHOTO = 2;
+    static final int SPECIAL_ANIMATED_WEBP = 3;
     private static final int KNOWN_FLAGS = HAS_ORIENTATION | HAS_DATE | OFFSET_KNOWN | HAS_GPS;
 
     // Dates the record may carry: 1900-01-01 to 9999-12-31 with a day of slack for the offset, and never more than a
@@ -374,7 +393,12 @@ final class GuestLink implements Closeable {
         } else {
             check(m.orientation == -1, "orientation without flag");
         }
-        check(m.specialFormat == 0 || m.specialFormat == 2, "special format");
+        // GIF is always a GIF, an animated WebP is one, a motion photo is marked in its XMP (JPEG, PNG, WebP, HEIF,
+        // AVIF).
+        check(m.specialFormat == 0 || (m.specialFormat == SPECIAL_GIF && format == FORMAT_GIF)
+                || (m.specialFormat == SPECIAL_MOTION_PHOTO && (format == FORMAT_JPEG || format == FORMAT_PNG
+                        || format == FORMAT_WEBP || format == FORMAT_HEIF || format == FORMAT_AVIF))
+                || (m.specialFormat == SPECIAL_ANIMATED_WEBP && format == FORMAT_WEBP), "special format");
         if ((flags & HAS_DATE) != 0) {
             check(m.dateTakenMillis >= MIN_DATE && m.dateTakenMillis <= MAX_DATE
                     && m.dateTakenMillis <= System.currentTimeMillis() + 86400000L, "date");
