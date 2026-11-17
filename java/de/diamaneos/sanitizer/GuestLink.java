@@ -28,9 +28,12 @@ import java.nio.charset.StandardCharsets;
  * allocated before its size passed the checks. The only bytes taken without structure are the pixels, whose length
  * the checked header fixes, and they are checked too (no colour channel above alpha).
  *
- * <p>A reply that breaks any rule throws {@link ProtocolException}: the caller drops the link (and restarts the VM if
- * that keeps happening) and answers its own caller with STATUS_INVALID or STATUS_UNAVAILABLE. Each call has one total
- * deadline that covers the request and the whole reply.
+ * <p>Text fields are ASCII only (each byte 0x20 to 0x7e or the field's narrower set), so no line or paragraph
+ * separator, bidi control or zero-width character can reach a caller.
+ *
+ * <p>A reply that breaks any rule throws {@link ProtocolException}: the caller drops the link, restarts the VM and
+ * answers its own caller with STATUS_UNAVAILABLE. Each call has one total deadline that covers the request and the
+ * whole reply.
  */
 final class GuestLink implements Closeable {
     static final int PORT = 5685;
@@ -192,23 +195,39 @@ final class GuestLink implements Closeable {
                 case OP_PROBE:
                     checkFormat(a.format);
                     checkSize(a.width, a.height, MAX_DIMENSION, MAX_DIMENSION);
-                    check(a.extra == 0 || a.extra == 1, "animated");
+                    // Only an animated PNG can be animated among the formats the VM reads.
+                    check(a.extra == 0 || (a.extra == 1 && a.format == FORMAT_PNG), "animated");
                     check(payload == 0, "probe payload");
                     break;
                 case OP_THUMBNAIL:
                 case OP_HOOK:
+                    check(a.extra == 0 || a.extra == 90 || a.extra == 180 || a.extra == 270, "rotation");
                     if (op == OP_THUMBNAIL) {
                         checkFormat(a.format);
-                        checkSize(a.width, a.height, arg0, arg1);
+                        // The box is for the image as shown: turned by 90 or 270 degrees, the stored image fits it
+                        // the other way round.
+                        boolean turned = a.extra == 90 || a.extra == 270;
+                        checkSize(a.width, a.height, turned ? arg1 : arg0, turned ? arg0 : arg1);
                     } else {
                         check(a.width == 1 && a.height == 1, "hook size");
                     }
                     check((long) a.width * a.height <= MAX_PIXELS, "pixels");
-                    check(a.extra == 0 || a.extra == 90 || a.extra == 180 || a.extra == 270, "rotation");
                     check((long) payload == (long) a.width * a.height * 4, "pixel length");
-                    a.pixels = readExact(payload, deadline).array();
-                    checkPremultiplied(a.pixels);
-                    break;
+                    byte[] pixels = readExact(payload, deadline).array();
+                    // A worker that failed after its header: the VM kept the length with zeros and its trailer says
+                    // INVALID. A clean verdict on the file, not a broken link.
+                    ByteBuffer e = readExact(END_BYTES, deadline);
+                    check(e.getInt() == END_MAGIC, "end");
+                    int endStatus = e.getInt();
+                    if (endStatus == INVALID) {
+                        Answer bad = new Answer();
+                        bad.status = INVALID;
+                        return bad;
+                    }
+                    check(endStatus == OK, "end status " + endStatus);
+                    checkPremultiplied(pixels);
+                    a.pixels = pixels;
+                    return a;
                 case OP_METADATA:
                     checkFormat(a.format);
                     checkSize(a.width, a.height, MAX_DIMENSION, MAX_DIMENSION);
@@ -276,7 +295,8 @@ final class GuestLink implements Closeable {
     static final int HAS_GPS = 1 << 3;
     private static final int KNOWN_FLAGS = HAS_ORIENTATION | HAS_DATE | OFFSET_KNOWN | HAS_GPS;
 
-    // Dates the record may carry: 1900-01-01 to 9999-12-31, with a day of slack for the offset.
+    // Dates the record may carry: 1900-01-01 to 9999-12-31 with a day of slack for the offset, and never more than a
+    // day in the future.
     private static final long MIN_DATE = -2208988800000L - 86400000L;
     private static final long MAX_DATE = 253402300799999L + 86400000L;
 
@@ -302,7 +322,8 @@ final class GuestLink implements Closeable {
         }
         check(m.specialFormat == 0 || m.specialFormat == 2, "special format");
         if ((flags & HAS_DATE) != 0) {
-            check(m.dateTakenMillis >= MIN_DATE && m.dateTakenMillis <= MAX_DATE, "date");
+            check(m.dateTakenMillis >= MIN_DATE && m.dateTakenMillis <= MAX_DATE
+                    && m.dateTakenMillis <= System.currentTimeMillis() + 86400000L, "date");
         } else {
             check(m.dateTakenMillis == -1 && (flags & OFFSET_KNOWN) == 0, "date without flag");
         }

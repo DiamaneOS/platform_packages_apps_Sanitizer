@@ -70,15 +70,13 @@ final class Scheduler {
         long now();
     }
 
-    private final Clock mClock;
     // Insertion-ordered so turns rotate: a served lane moves to the end.
     private final LinkedHashMap<String, ArrayDeque<Job>> mWaiting = new LinkedHashMap<>();
     private final LinkedHashMap<String, ArrayDeque<Job>> mBackground = new LinkedHashMap<>();
     private final Map<String, Integer> mPerLane = new HashMap<>();
     private int mTotal;
 
-    Scheduler(Clock clock) {
-        mClock = clock;
+    Scheduler() {
     }
 
     /** Queues the job. False when its lane or the whole queue is full. */
@@ -92,16 +90,16 @@ final class Scheduler {
         return true;
     }
 
-    /** The next job whose deadline has not passed, waiting for one. Jobs past their deadline are dropped. */
+    /**
+     * The next job, waiting for one. A job whose deadline passed is returned too: the worker completes it as
+     * unavailable and releases what it holds, so nothing leaves the queue without an answer.
+     */
     synchronized Job take() throws InterruptedException {
         for (;;) {
             Job job = next(mWaiting);
             if (job == null) job = next(mBackground);
-            if (job == null) {
-                wait();
-                continue;
-            }
-            if (job.deadline > mClock.now()) return job;
+            if (job != null) return job;
+            wait();
         }
     }
 

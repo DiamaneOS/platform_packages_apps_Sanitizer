@@ -27,6 +27,8 @@
 
     <uses-permission android:name="android.permission.MANAGE_VIRTUAL_MACHINE" />
     <uses-permission android:name="android.permission.USE_CUSTOM_VIRTUAL_MACHINE" />
+    <!-- One service and one VM for every user and profile: callers include the system server and SystemUI. -->
+    <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS" />
     <uses-feature android:name="android.software.virtualization_framework" android:required="true" />
 
     <application
@@ -40,9 +42,10 @@
             android:name=".DecodeService"
             android:exported="true"
             android:directBootAware="true"
+            android:singleUser="true"
             android:permission="de.diamaneos.sanitizer.permission.DECODE">
             <intent-filter>
-                <action android:name="de.diamaneos.sanitizer.decode.IDecodeService" />
+                <action android:name="de.diamaneos.sanitizer.action.DECODE" />
             </intent-filter>
         </service>
     </application>

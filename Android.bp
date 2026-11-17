@@ -66,11 +66,15 @@ cc_binary {
     defaults: ["decoder_vm_defaults"],
 }
 
-// Test builds only: the same program with hooks that break a worker's lockdown on purpose.
-cc_binary {
+// Test only: the same program with hooks that break a worker's lockdown on purpose. A cc_test, so no product can
+// install it into an image (tests go only to the data partition, and this one is not installable at all), and the
+// product's initramfs is built from decoder_vm_init alone.
+cc_test {
     name: "decoder_vm_init_test",
     defaults: ["decoder_vm_defaults"],
     cflags: ["-DDECODER_TEST_HOOKS"],
+    gtest: false,
+    auto_gen_config: false,
 }
 
 // The initramfs: /init and the empty directories it mounts on. Fixed owner, times and inode numbers, so the same

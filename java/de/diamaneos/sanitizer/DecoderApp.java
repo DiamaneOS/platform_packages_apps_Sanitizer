@@ -17,7 +17,6 @@
 package de.diamaneos.sanitizer;
 
 import android.app.Application;
-import android.content.Context;
 
 import java.io.File;
 
@@ -26,7 +25,7 @@ import java.io.File;
  * unlock, and starts the VM right away: early in uptime the VM's memory is least scattered, and the first request
  * does not wait for a VM start.
  */
-public final class DecoderApp extends Application {
+public final class DecoderApp extends Application implements DecoderProvider {
     /** The decoder VM's kernel and initramfs, in the virtualization APEX, signed by sign_virt_apex. */
     static final File VM_KERNEL = new File("/apex/com.android.virt/etc/fs/decoder_vm_kernel");
     static final File VM_INITRD = new File("/apex/com.android.virt/etc/decoder_vm_initrd.img");
@@ -34,19 +33,34 @@ public final class DecoderApp extends Application {
     /** The VM's memory. Measured on the FP6: see the decode service notes. */
     static final long VM_MEMORY_BYTES = 128L << 20;
 
-    private static Decoder sDecoder;
+    private static final String PERMISSION = "de.diamaneos.sanitizer.permission.DECODE";
+    private static final String[] CALLERS = {
+        "com.android.providers.media.module",
+        "com.google.android.providers.media.module",
+        "com.android.systemui",
+    };
+
+    private Decoder mDecoder;
 
     @Override
     public void onCreate() {
         super.onCreate();
-        decoder(this).warmUp();
+        decoder().warmUp();
     }
 
-    static synchronized Decoder decoder(Context context) {
-        if (sDecoder == null) {
-            sDecoder = new Decoder(
-                    new GuestVm(context.getApplicationContext(), VM_KERNEL, VM_INITRD, VM_MEMORY_BYTES));
-        }
-        return sDecoder;
+    @Override
+    public synchronized Decoder decoder() {
+        if (mDecoder == null) mDecoder = new Decoder(new GuestVm(this, VM_KERNEL, VM_INITRD, VM_MEMORY_BYTES));
+        return mDecoder;
+    }
+
+    @Override
+    public String callerPermission() {
+        return PERMISSION;
+    }
+
+    @Override
+    public String[] allowedCallers() {
+        return CALLERS.clone();
     }
 }

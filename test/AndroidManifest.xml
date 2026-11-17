@@ -15,17 +15,32 @@
      limitations under the License.
 -->
 <!-- Test builds only: the decode service's self-test, installed by hand as an ordinary app under its own package
-     name. Its VM permissions are granted with pm on a debuggable build. -->
+     name. Its VM permissions are granted with pm on a debuggable build. It carries the real DecodeService under a
+     test permission, so the self-test also goes through binder. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="de.diamaneos.sanitizer">
 
+    <permission
+        android:name="de.diamaneos.sanitizer.test.permission.DECODE"
+        android:protectionLevel="signature" />
+
+    <uses-permission android:name="de.diamaneos.sanitizer.test.permission.DECODE" />
     <uses-permission android:name="android.permission.MANAGE_VIRTUAL_MACHINE" />
     <uses-permission android:name="android.permission.USE_CUSTOM_VIRTUAL_MACHINE" />
     <uses-feature android:name="android.software.virtualization_framework" android:required="true" />
 
     <application
+        android:name=".TestApp"
         android:label="Decode service self-test"
         android:allowBackup="false">
+        <service
+            android:name=".DecodeService"
+            android:exported="true"
+            android:permission="de.diamaneos.sanitizer.test.permission.DECODE">
+            <intent-filter>
+                <action android:name="de.diamaneos.sanitizer.action.DECODE" />
+            </intent-filter>
+        </service>
         <activity
             android:name=".SelfTestActivity"
             android:exported="true"

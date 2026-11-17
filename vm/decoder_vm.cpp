@@ -40,11 +40,13 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 #include <jpeglib.h>
@@ -198,39 +200,52 @@ bool sink_header(Sink* s, uint32_t w, uint32_t h) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Scaling: rows come in one at a time, straight RGBA. They are premultiplied and, for a factor above 1, averaged
-// over f × f boxes (partial boxes at the right and bottom edges), so a large image never needs to be held whole.
+// Scaling: rows come in one at a time, straight RGBA, and are premultiplied. A fractional area filter fits the image
+// exactly into the box asked for (a wallpaper gets its screen size, not the next integer factor below it), without
+// ever holding the whole image. Weights are exact integers: input pixel x covers [x * ow, (x + 1) * ow) and output
+// pixel o covers [o * iw, (o + 1) * iw) on a common grid, so every output pixel is a weighted mean with one rounding.
+// A weighted mean of premultiplied pixels keeps every colour channel at or below alpha.
 
-uint32_t div_up(uint32_t a, uint32_t b) {
-    return (a + b - 1) / b;
-}
-
-// The smallest factor that keeps the result within maxW x maxH and kMaxPixels.
-uint32_t box_factor(uint32_t w, uint32_t h, uint32_t maxW, uint32_t maxH) {
-    uint32_t f = std::max({1u, div_up(w, maxW), div_up(h, maxH)});
-    while (static_cast<uint64_t>(div_up(w, f)) * div_up(h, f) > kMaxPixels) f++;
-    return f;
+// The largest size within maxW x maxH and kMaxPixels with iw x ih's aspect ratio, never larger than the image.
+void fit_box(uint32_t iw, uint32_t ih, uint32_t maxW, uint32_t maxH, uint32_t* ow, uint32_t* oh) {
+    double s = std::min({1.0, static_cast<double>(maxW) / iw, static_cast<double>(maxH) / ih});
+    s = std::min(s, std::sqrt(static_cast<double>(kMaxPixels) / (static_cast<double>(iw) * ih)));
+    uint64_t w = static_cast<uint64_t>(iw * s + 0.5), h = static_cast<uint64_t>(ih * s + 0.5);
+    w = std::clamp<uint64_t>(w, 1, std::min(iw, maxW));
+    h = std::clamp<uint64_t>(h, 1, std::min(ih, maxH));
+    while (w * h > kMaxPixels) {
+        if (w > 1) w--;
+        if (h > 1) h--;
+    }
+    *ow = static_cast<uint32_t>(w);
+    *oh = static_cast<uint32_t>(h);
 }
 
 struct Scaler {
-    uint32_t iw, ih, f, ow, oh;
-    uint32_t rowsIn, boxRows;
+    uint32_t iw, ih, ow, oh;
+    uint32_t y;  // input rows taken
+    uint32_t p;  // output rows sent
+    uint64_t* hrow;
     uint64_t* acc;
     uint8_t* out;
     Sink* sink;
 };
 
-bool scaler_init(Scaler* s, uint32_t iw, uint32_t ih, uint32_t f, Sink* sink) {
-    *s = {iw, ih, f, div_up(iw, f), div_up(ih, f), 0, 0, nullptr, nullptr, sink};
-    if (f == 1) return true;
-    s->acc = static_cast<uint64_t*>(arena_alloc(static_cast<size_t>(s->ow) * 4 * sizeof(uint64_t)));
-    s->out = static_cast<uint8_t*>(arena_alloc(static_cast<size_t>(s->ow) * 4));
-    if (s->acc == nullptr || s->out == nullptr) return false;
-    memset(s->acc, 0, static_cast<size_t>(s->ow) * 4 * sizeof(uint64_t));
+bool scaler_init(Scaler* s, uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh, Sink* sink) {
+    *s = {iw, ih, ow, oh, 0, 0, nullptr, nullptr, nullptr, sink};
+    if (ow > iw || oh > ih || ow == 0 || oh == 0) return false;
+    if (ow == iw && oh == ih) return true;
+    size_t n = static_cast<size_t>(ow) * 4;
+    s->hrow = static_cast<uint64_t*>(arena_alloc(n * sizeof(uint64_t)));
+    s->acc = static_cast<uint64_t*>(arena_alloc(n * sizeof(uint64_t)));
+    s->out = static_cast<uint8_t*>(arena_alloc(n));
+    if (s->hrow == nullptr || s->acc == nullptr || s->out == nullptr) return false;
+    memset(s->acc, 0, n * sizeof(uint64_t));
     return true;
 }
 
 void scaler_free(Scaler* s) {
+    arena_free(s->hrow);
     arena_free(s->acc);
     arena_free(s->out);
 }
@@ -245,31 +260,59 @@ void premultiply(uint8_t* p, uint32_t w) {
     }
 }
 
+void scaler_add(Scaler* s, uint64_t weight) {
+    size_t n = static_cast<size_t>(s->ow) * 4;
+    for (size_t i = 0; i < n; i++) s->acc[i] += s->hrow[i] * weight;
+}
+
+bool scaler_emit(Scaler* s) {
+    uint64_t d = static_cast<uint64_t>(s->iw) * s->ih;
+    size_t n = static_cast<size_t>(s->ow) * 4;
+    for (size_t i = 0; i < n; i++) {
+        s->out[i] = static_cast<uint8_t>((s->acc[i] + d / 2) / d);
+        s->acc[i] = 0;
+    }
+    s->p++;
+    return sink_put(s->sink, s->out, n);
+}
+
 bool scaler_push(Scaler* s, uint8_t* row) {
+    if (s->y >= s->ih) return false;
     premultiply(row, s->iw);
-    s->rowsIn++;
-    if (s->f == 1) return sink_put(s->sink, row, static_cast<size_t>(s->iw) * 4);
-    for (uint32_t x = 0; x < s->iw; x++) {
-        uint64_t* a = s->acc + static_cast<size_t>(x / s->f) * 4;
-        const uint8_t* p = row + static_cast<size_t>(x) * 4;
-        a[0] += p[0];
-        a[1] += p[1];
-        a[2] += p[2];
-        a[3] += p[3];
+    if (s->hrow == nullptr) {  // same size
+        s->y++;
+        s->p++;
+        return sink_put(s->sink, row, static_cast<size_t>(s->iw) * 4);
     }
-    s->boxRows++;
-    if (s->boxRows < s->f && s->rowsIn < s->ih) return true;
+    // Horizontal: each output column's weighted sum of the input pixels it covers.
     for (uint32_t o = 0; o < s->ow; o++) {
-        uint64_t cols = std::min(s->f, s->iw - o * s->f);
-        uint64_t n = cols * s->boxRows;
-        for (int c = 0; c < 4; c++) {
-            uint64_t* a = s->acc + static_cast<size_t>(o) * 4 + c;
-            s->out[static_cast<size_t>(o) * 4 + c] = static_cast<uint8_t>((*a + n / 2) / n);
-            *a = 0;
+        uint64_t lo = static_cast<uint64_t>(o) * s->iw, hi = lo + s->iw;
+        uint32_t x0 = static_cast<uint32_t>(lo / s->ow), x1 = static_cast<uint32_t>((hi - 1) / s->ow);
+        uint64_t sum[4] = {};
+        for (uint32_t x = x0; x <= x1; x++) {
+            uint64_t xs = static_cast<uint64_t>(x) * s->ow;
+            uint64_t w = std::min(hi, xs + s->ow) - std::max(lo, xs);
+            const uint8_t* px = row + static_cast<size_t>(x) * 4;
+            for (int c = 0; c < 4; c++) sum[c] += w * px[c];
         }
+        for (int c = 0; c < 4; c++) s->hrow[static_cast<size_t>(o) * 4 + c] = sum[c];
     }
-    s->boxRows = 0;
-    return sink_put(s->sink, s->out, static_cast<size_t>(s->ow) * 4);
+    // Vertical: the row covers [y * oh, (y + 1) * oh), at most two output rows since oh <= ih.
+    uint64_t ys = static_cast<uint64_t>(s->y) * s->oh, ye = ys + s->oh;
+    uint64_t pe = static_cast<uint64_t>(s->p + 1) * s->ih;
+    s->y++;
+    if (ye <= pe) {
+        scaler_add(s, ye - ys);
+        return ye < pe || scaler_emit(s);
+    }
+    scaler_add(s, pe - ys);
+    if (!scaler_emit(s)) return false;
+    scaler_add(s, ye - pe);
+    return ye < static_cast<uint64_t>(s->p + 1) * s->ih || scaler_emit(s);
+}
+
+bool scaler_done(const Scaler* s) {
+    return s->y == s->ih && s->p == s->oh;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -303,7 +346,8 @@ void png_fail(png_structp png, png_const_charp) {
 
 void png_quiet(png_structp, png_const_charp) {}
 
-// headerOnly: stop after the header and report its size in *w, *h. Otherwise decode into the sink.
+// headerOnly: stop after the header and report its size in *outW, *outH. Otherwise decode into the sink, fitted into
+// maxW x maxH.
 bool decode_png(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly,
                 uint32_t* outW, uint32_t* outH) {
     png_structp png = png_create_read_struct_2(PNG_LIBPNG_VER_STRING, nullptr, png_fail, png_quiet, nullptr,
@@ -347,9 +391,9 @@ bool decode_png(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, 
     int passes = png_set_interlace_handling(png);
     png_read_update_info(png, info);
     if (png_get_rowbytes(png, info) != static_cast<size_t>(w) * 4) png_error(png, "format");
-    if (!scaler_init(&scaler, w, h, box_factor(w, h, maxW, maxH), sink) || !sink_header(sink, scaler.ow, scaler.oh)) {
-        png_error(png, "output");
-    }
+    uint32_t ow, oh;
+    fit_box(w, h, maxW, maxH, &ow, &oh);
+    if (!scaler_init(&scaler, w, h, ow, oh, sink) || !sink_header(sink, ow, oh)) png_error(png, "output");
     size_t stride = static_cast<size_t>(w) * 4;
     if (passes == 1) {
         pixels = static_cast<uint8_t*>(png_malloc(png, stride));
@@ -368,14 +412,16 @@ bool decode_png(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, 
             if (!scaler_push(&scaler, pixels + stride * y)) png_error(png, "output");
         }
     }
+    bool done = scaler_done(&scaler);
     png_free(png, pixels);
     scaler_free(&scaler);
     png_destroy_read_struct(&png, &info, nullptr);
-    return sink_flush(sink);
+    return done && sink_flush(sink);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// JPEG through libjpeg-turbo, scaled by 1/2, 1/4 or 1/8 in the decoder where that helps, then by the box scaler.
+// JPEG through libjpeg-turbo, scaled by 1/2, 1/4 or 1/8 in the decoder as far as that stays at or above the size
+// asked for, then exactly by the area filter.
 
 struct JpegError {
     jpeg_error_mgr mgr;
@@ -424,25 +470,25 @@ bool decode_jpeg(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
         jpeg_destroy_decompress(&cinfo);
         return true;
     }
+    uint32_t ow, oh;
+    fit_box(cinfo.image_width, cinfo.image_height, maxW, maxH, &ow, &oh);
     cinfo.out_color_space = JCS_EXT_RGBA;
     cinfo.scale_num = 1;
     cinfo.scale_denom = 1;
     jpeg_calc_output_dimensions(&cinfo);
-    // The decoder's own scaling first: halve while the result would still be at least as large as the final box fit.
     while (cinfo.scale_denom < 8) {
-        uint64_t d2 = static_cast<uint64_t>(cinfo.scale_denom) * 2;
-        bool tooBig = static_cast<uint64_t>(cinfo.output_width) * cinfo.output_height > kMaxPixels;
-        bool room = cinfo.image_width >= d2 * maxW || cinfo.image_height >= d2 * maxH;
-        if (!tooBig && !room) break;
         cinfo.scale_denom *= 2;
         jpeg_calc_output_dimensions(&cinfo);
+        if (cinfo.output_width < ow || cinfo.output_height < oh) {
+            cinfo.scale_denom /= 2;
+            jpeg_calc_output_dimensions(&cinfo);
+            break;
+        }
     }
-    uint32_t f = box_factor(cinfo.output_width, cinfo.output_height, maxW, maxH);
     // Without a backing store, a progressive image whose coefficients do not fit the arena fails here.
     cinfo.mem->max_memory_to_use = static_cast<long>(arena_left() - std::min(arena_left(), size_t{1} << 20));
     jpeg_start_decompress(&cinfo);
-    if (!scaler_init(&scaler, cinfo.output_width, cinfo.output_height, f, sink) ||
-        !sink_header(sink, scaler.ow, scaler.oh)) {
+    if (!scaler_init(&scaler, cinfo.output_width, cinfo.output_height, ow, oh, sink) || !sink_header(sink, ow, oh)) {
         jpeg_destroy_decompress(&cinfo);
         return false;
     }
@@ -455,9 +501,10 @@ bool decode_jpeg(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
             return false;
         }
     }
+    bool done = scaler_done(&scaler);
     scaler_free(&scaler);
     jpeg_destroy_decompress(&cinfo);
-    return sink_flush(sink);
+    return done && sink_flush(sink);
 }
 
 uint32_t detect_format(const uint8_t* b, size_t n) {
@@ -483,8 +530,8 @@ void warm_up() {
     Sink sink = {-1, static_cast<uint8_t*>(malloc(kStripeBytes)), 0};
     if (sink.buf == nullptr) return;
     uint32_t w, h;
-    decode_png(kWarmupPng, sizeof(kWarmupPng), 64, 64, &sink, false, &w, &h);
-    decode_jpeg(kWarmupJpeg, sizeof(kWarmupJpeg), 64, 64, &sink, false, &w, &h);
+    decode_png(kWarmupPng, sizeof(kWarmupPng), 5, 3, &sink, false, &w, &h);
+    decode_jpeg(kWarmupJpeg, sizeof(kWarmupJpeg), 5, 3, &sink, false, &w, &h);
     free(sink.buf);
 }
 
@@ -613,8 +660,11 @@ void warm_up() {
     m->orientation = -1;
     read_metadata(data, size, format, m);
     gRotation = m->orientation > 0 ? static_cast<uint32_t>(m->orientation) : 0;
+    // The box is for the image as shown. Turned by 90 or 270 degrees, the stored image fits it the other way round.
+    bool turned = gRotation == 90 || gRotation == 270;
     uint32_t w, h;
-    worker_exit(decode_any(format, data, size, rq.arg0, rq.arg1, &sink, false, &w, &h) ? 0 : 3);
+    worker_exit(decode_any(format, data, size, turned ? rq.arg1 : rq.arg0, turned ? rq.arg0 : rq.arg1, &sink, false,
+                           &w, &h) ? 0 : 3);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -766,7 +816,8 @@ bool serve_one(int c) {
     uint8_t hdr[16];
     ssize_t n = read_full(w.pipe, hdr, sizeof(hdr), w.deadline, kIdleMs);
     uint32_t tw = le32(hdr + 4), th = le32(hdr + 8), rot = le32(hdr + 12);
-    bool box = hook || (tw <= rq.arg0 && th <= rq.arg1);
+    bool turned = rot == 90 || rot == 270;
+    bool box = hook || (turned ? (tw <= rq.arg1 && th <= rq.arg0) : (tw <= rq.arg0 && th <= rq.arg1));
     if (n != static_cast<ssize_t>(sizeof(hdr)) || memcmp(hdr, "DSR2", 4) != 0 || tw == 0 || th == 0 ||
         static_cast<uint64_t>(tw) * th > kMaxPixels || !box || (rot != 0 && rot != 90 && rot != 180 && rot != 270)) {
         end_worker(&w, true);
@@ -780,10 +831,21 @@ bool serve_one(int c) {
     static uint8_t buf[kStripeBytes];
     while (left > 0) {
         size_t want = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), left));
-        if (read_full(w.pipe, buf, want, w.deadline, kIdleMs) != static_cast<ssize_t>(want) ||
-            !write_all(c, buf, want)) {
+        if (read_full(w.pipe, buf, want, w.deadline, kIdleMs) != static_cast<ssize_t>(want)) {
+            // The worker failed or timed out after its header went out: the promised length is kept with zeros and
+            // the trailer says INVALID, so Android tells a bad file from a broken link.
             end_worker(&w, true);
-            return false;  // the header promised these pixels: close instead
+            memset(buf, 0, sizeof(buf));
+            while (left > 0) {
+                size_t k = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), left));
+                if (!write_all(c, buf, k)) return false;
+                left -= k;
+            }
+            return send_end(c, kInvalid);
+        }
+        if (!write_all(c, buf, want)) {
+            end_worker(&w, true);
+            return false;
         }
         left -= want;
     }
@@ -822,6 +884,9 @@ int main() {
     for (;;) {
         int c = accept4(ls, nullptr, nullptr, SOCK_CLOEXEC);
         if (c < 0) continue;
+        // A host that stops reading ends the connection instead of blocking the broker.
+        timeval tv = {60, 0};
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         // The input of each request is dropped once its worker is gone, so the VM holds no file between requests.
         while (serve_one(c)) madvise(gInput, kMaxInputBytes, MADV_DONTNEED);
         madvise(gInput, kMaxInputBytes, MADV_DONTNEED);

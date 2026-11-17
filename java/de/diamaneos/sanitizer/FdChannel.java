@@ -22,6 +22,7 @@ import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
 import android.system.StructPollfd;
+import android.system.StructStat;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -83,25 +84,82 @@ final class FdChannel implements GuestLink.Channel {
         }
     }
 
-    /** Reads the whole stream, at most max bytes. Returns null when the stream is longer than max. */
-    byte[] readAll(int max, long deadline) throws IOException {
-        byte[] buf = new byte[64 * 1024];
-        int used = 0;
-        for (;;) {
-            if (used == buf.length) {
-                if (buf.length > max) return null;
-                byte[] grown = new byte[(int) Math.min((long) buf.length * 2, (long) max + 1)];
-                System.arraycopy(buf, 0, grown, 0, used);
-                buf = grown;
-            }
-            int k = read(buf, used, buf.length - used, deadline);
-            if (k <= 0) break;
-            used += k;
-            if (used > max) return null;
+    /** A caller's file as read: the bytes in data[0, len), and how much of the memory budget it holds. */
+    static final class Input {
+        static final int OK = 0;
+        static final int TOO_LARGE = 1; // or unreadable in time: a verdict on the caller's file
+        static final int NO_MEMORY = 2; // the service holds too much right now: try again later
+
+        int status;
+        byte[] data;
+        int len;
+        long reserved;
+    }
+
+    /**
+     * Reads the stream, at most max bytes, taking every buffer from the budget before it is allocated. With prefix,
+     * a longer stream is cut at max instead of refused (a probe needs only the header). A regular file is read into
+     * one buffer of its size. On OK the caller owns input.reserved and gives it back.
+     */
+    Input readInput(int max, boolean prefix, long deadline, Decoder budget) {
+        Input in = new Input();
+        long size = -1;
+        try {
+            StructStat st = Os.fstat(mFd);
+            if (OsConstants.S_ISREG(st.st_mode)) size = st.st_size;
+        } catch (ErrnoException ignored) {
+            // read as a stream
         }
-        byte[] out = new byte[used];
-        System.arraycopy(buf, 0, out, 0, used);
-        return out;
+        if (size > max && !prefix) {
+            in.status = Input.TOO_LARGE;
+            return in;
+        }
+        int cap = size >= 0 ? (int) Math.min(size + 1, (long) max + 1) : Math.min(64 * 1024, max + 1);
+        if (!budget.reserve(cap)) {
+            in.status = Input.NO_MEMORY;
+            return in;
+        }
+        long reserved = cap;
+        byte[] buf = new byte[cap];
+        int used = 0;
+        try {
+            for (;;) {
+                if (used == buf.length) {
+                    if (buf.length > max) break;
+                    int next = (int) Math.min((long) buf.length * 2, (long) max + 1);
+                    if (!budget.reserve(next)) {
+                        budget.release(reserved);
+                        in.status = Input.NO_MEMORY;
+                        return in;
+                    }
+                    byte[] grown = new byte[next];
+                    System.arraycopy(buf, 0, grown, 0, used);
+                    budget.release(buf.length);
+                    reserved = reserved - buf.length + next;
+                    buf = grown;
+                }
+                int k = read(buf, used, buf.length - used, deadline);
+                if (k <= 0) break;
+                used += k;
+            }
+        } catch (IOException e) {
+            budget.release(reserved);
+            in.status = Input.TOO_LARGE;
+            return in;
+        }
+        if (used > max) {
+            if (!prefix) {
+                budget.release(reserved);
+                in.status = Input.TOO_LARGE;
+                return in;
+            }
+            used = max;
+        }
+        in.status = Input.OK;
+        in.data = buf;
+        in.len = used;
+        in.reserved = reserved;
+        return in;
     }
 
     @Override

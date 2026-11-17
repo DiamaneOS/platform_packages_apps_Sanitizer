@@ -17,7 +17,12 @@
 package de.diamaneos.sanitizer;
 
 import android.app.Activity;
+import android.content.ComponentName;
+import android.content.Intent;
+import android.content.ServiceConnection;
+import android.content.pm.ResolveInfo;
 import android.os.Bundle;
+import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.system.Os;
@@ -33,11 +38,20 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import de.diamaneos.sanitizer.decode.DecodeRequest;
+import de.diamaneos.sanitizer.decode.IDecodeService;
+import de.diamaneos.sanitizer.decode.ImageInfo;
+import de.diamaneos.sanitizer.decode.MetadataRecord;
+import de.diamaneos.sanitizer.decode.Thumbnail;
 
 /**
  * Test builds only. Runs the decode service's checks and logs one line per check under the tag DecoderSelfTest, then
  * "DONE pass=N fail=M". Modes (intent extra "mode"): "host" runs only the checks without a VM (the hostile guest stub
- * and the scheduler), "all" adds the VM checks: memory sizes, timings, the lockdown hooks and failing closed.
+ * and the scheduler), "all" adds the VM checks (memory sizes, timings, the lockdown hooks, failing closed) and the
+ * same service through binder, resolved by its action like MediaProvider binds it.
  *
  * <p>The VM's kernel and initramfs (signed with the test key that test builds' pvmfw trusts) and the test images are
  * pushed to this app's external files directory under decoder-vm/ and images/.
@@ -155,7 +169,7 @@ public class SelfTestActivity extends Activity {
         byte[] file = {(byte) 0xff, (byte) 0xd8, (byte) 0xff, 0};
         try {
             switch (op) {
-                case GuestLink.OP_THUMBNAIL: return link.thumbnail(file, file.length, 2, 2, deadline);
+                case GuestLink.OP_THUMBNAIL: return link.thumbnail(file, file.length, 2, 1, deadline); // a 2x1 box
                 case GuestLink.OP_METADATA: return link.metadata(file, file.length, deadline);
                 default: return link.probe(file, file.length, deadline);
             }
@@ -182,7 +196,7 @@ public class SelfTestActivity extends Activity {
         int R = GuestLink.REPLY_MAGIC, E = GuestLink.END_MAGIC;
         byte[] px = {1, 2, 3, 4, 5, 6, 7, 8}; // 2x1, channels below alpha
         // Positive controls first: a correct VM is accepted.
-        Object ok = stub(fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 90, 8), px, end(E, 0))), GuestLink.OP_THUMBNAIL,
+        Object ok = stub(fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 0, 8), px, end(E, 0))), GuestLink.OP_THUMBNAIL,
                 2000);
         if (ok instanceof GuestLink.Answer && ((GuestLink.Answer) ok).pixels.length == 8) {
             pass("stub control thumbnail", "");
@@ -246,6 +260,37 @@ public class SelfTestActivity extends Activity {
         expectRefused("meta reserved bytes", fd -> writeAll(fd, cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(b -> b.put(1023, (byte) 1)), end(E, 0))), GuestLink.OP_METADATA);
 
+        // A worker that failed after its header: zeros for the promised length, then INVALID. A clean verdict.
+        Object late = stub(fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 0, 8), new byte[8], end(E, 3))),
+                GuestLink.OP_THUMBNAIL, 2000);
+        if (late instanceof GuestLink.Answer && ((GuestLink.Answer) late).status == GuestLink.INVALID
+                && ((GuestLink.Answer) late).pixels == null) {
+            pass("stub late failure is a clean INVALID", "");
+        } else {
+            fail("stub late failure is a clean INVALID", String.valueOf(late));
+        }
+        // Turned by 90 degrees, a stored 1x2 result fits the 2x1 box as shown, and a stored 2x1 one does not.
+        Object turned = stub(fd -> writeAll(fd, cat(reply(R, 0, 1, 1, 2, 90, 8), px, end(E, 0))),
+                GuestLink.OP_THUMBNAIL, 2000);
+        if (turned instanceof GuestLink.Answer && ((GuestLink.Answer) turned).status == GuestLink.OK) {
+            pass("stub turned box accepted", "");
+        } else {
+            fail("stub turned box accepted", String.valueOf(turned));
+        }
+        expectRefused("turned box too tall", fd -> writeAll(fd, cat(reply(R, 0, 1, 1, 3, 90, 12), new byte[12],
+                end(E, 0))), GuestLink.OP_THUMBNAIL);
+        expectRefused("turned box unturned size", fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 90, 8), px,
+                end(E, 0))), GuestLink.OP_THUMBNAIL);
+        expectRefused("animated JPEG", fd -> writeAll(fd, cat(reply(R, 0, 1, 5, 5, 1, 0), end(E, 0))),
+                GuestLink.OP_PROBE);
+        expectRefused("date in the future", fd -> writeAll(fd, cat(reply(R, 0, 1, 4, 3, 0, 1024),
+                meta(b -> b.putInt(8, GuestLink.HAS_ORIENTATION | GuestLink.HAS_DATE)
+                        .putLong(32, System.currentTimeMillis() + 3L * 86400000L)), end(E, 0))),
+                GuestLink.OP_METADATA);
+        expectRefused("line separator in text", fd -> writeAll(fd, cat(reply(R, 0, 1, 4, 3, 0, 1024),
+                meta(b -> b.put(48, (byte) 0xe2).put(49, (byte) 0x80).put(50, (byte) 0xa8)), end(E, 0))),
+                GuestLink.OP_METADATA);
+
         // Random replies: every one must be refused or fully checked, never crash, never pass the deadline.
         Random rnd = new Random(20261117);
         int refused = 0, accepted = 0, bad = 0;
@@ -276,8 +321,7 @@ public class SelfTestActivity extends Activity {
     }
 
     private void schedulerChecks() throws Exception {
-        long[] now = {0};
-        Scheduler s = new Scheduler(() -> now[0]);
+        Scheduler s = new Scheduler();
         List<Scheduler.Job> a = new ArrayList<>();
         int accepted = 0;
         for (int i = 0; i < 40; i++) {
@@ -299,7 +343,7 @@ public class SelfTestActivity extends Activity {
         Scheduler.Job second = s.take();
         boolean ok = accepted == Scheduler.MAX_PER_LANE && otherIn && !urgentIn && first == a.get(0)
                 && second == other;
-        Scheduler s2 = new Scheduler(() -> now[0]);
+        Scheduler s2 = new Scheduler();
         Scheduler.Job bg = new Scheduler.Job("x", false, 1000) {
             @Override void run() {}
         };
@@ -323,7 +367,7 @@ public class SelfTestActivity extends Activity {
     }
 
     private Decoder.Request call(Decoder d, int op, int a, int b, byte[] file, long millis) {
-        return d.run(new Decoder.Request(op, a, b, file, file == null ? 0 : file.length, "selftest", true,
+        return d.run(new Decoder.Request(op, a, b, file, file == null ? 0 : file.length, 0, "selftest", true,
                 SystemClock.uptimeMillis() + millis));
     }
 
@@ -338,7 +382,8 @@ public class SelfTestActivity extends Activity {
         }
         java.util.Arrays.sort(files);
         for (long mib : new long[] {64, 96, 128}) {
-            GuestVm vm = new GuestVm(this, new File(source, "kernel"), new File(source, "initrd.img"), mib << 20);
+            GuestVm vm = new GuestVm(this, new File(source, "kernel"), new File(source, "initrd.img"),
+                    mib << 20);
             Decoder d = new Decoder(vm);
             long t0 = SystemClock.uptimeMillis();
             Decoder.Request ping = call(d, GuestLink.OP_PING, 0, 0, null, 60000);
@@ -386,6 +431,117 @@ public class SelfTestActivity extends Activity {
             if (mib == 128) lockdownChecks(d);
             if (mib == 128) failClosedChecks(vm, d, read(files[0]), source);
             vm.stop();
+        }
+        binderChecks(images);
+    }
+
+    // --- Through the real binder service, as MediaProvider calls it ----------------------------------------------
+
+    private IDecodeService bind() throws Exception {
+        Intent intent = new Intent("de.diamaneos.sanitizer.action.DECODE").setPackage(getPackageName());
+        List<ResolveInfo> found = getPackageManager().queryIntentServices(intent, 0);
+        if (found.size() == 1) {
+            pass("binder action resolves", found.get(0).serviceInfo.name);
+        } else {
+            fail("binder action resolves", found.size() + " services");
+            return null;
+        }
+        IBinder[] got = new IBinder[1];
+        CountDownLatch bound = new CountDownLatch(1);
+        mConnection = new ServiceConnection() {
+            @Override public void onServiceConnected(ComponentName name, IBinder service) {
+                got[0] = service;
+                bound.countDown();
+            }
+            @Override public void onServiceDisconnected(ComponentName name) {}
+        };
+        bindService(intent, mConnection, BIND_AUTO_CREATE);
+        bound.await(10, TimeUnit.SECONDS);
+        return got[0] == null ? null : IDecodeService.Stub.asInterface(got[0]);
+    }
+
+    private ServiceConnection mConnection;
+
+    private DecodeRequest request(File f) throws Exception {
+        DecodeRequest r = new DecodeRequest();
+        r.file = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY);
+        r.ownerPackage = "selftest";
+        r.priority = IDecodeService.PRIORITY_USER_WAITING;
+        r.mimeTypeHint = "image/jpeg";
+        return r;
+    }
+
+    private void binderChecks(File images) throws Exception {
+        IDecodeService s = bind();
+        if (s == null) {
+            fail("binder bind", "no service");
+            return;
+        }
+        // The service's own VM starts on first use.
+        File photo = new File(images, "photo12.jpg");
+        File turned = new File(images, "photo12-rot90.jpg");
+        ImageInfo info = s.probe(request(photo));
+        if (info.status == IDecodeService.STATUS_OK && info.width == 4000 && info.height == 3000) {
+            pass("binder probe", info.width + "x" + info.height + " format " + info.format);
+        } else {
+            fail("binder probe", "status " + info.status + " " + info.width + "x" + info.height);
+        }
+        // A wallpaper-sized box: fitted exactly, not to an integer factor.
+        Thumbnail w = s.decodeThumbnail(request(photo), 1080, 2400);
+        checkThumbnail(s, "binder screen-sized thumbnail", w, 1080, 810, 0);
+        // EXIF orientation 6 in a 300x200 box as shown: stored 200x150, turned by 90 degrees to 150x200.
+        Thumbnail t = s.decodeThumbnail(request(turned), 300, 200);
+        checkThumbnail(s, "binder turned thumbnail", t, 200, 150, 90);
+        // A small output: one stripe that holds the whole height.
+        Thumbnail small = s.decodeThumbnail(request(photo), 64, 64);
+        checkThumbnail(s, "binder small thumbnail", small, 64, 48, 0);
+        MetadataRecord m = s.readMetadata(request(new File(images, "exif-seed.jpg")));
+        if (m.status == IDecodeService.STATUS_OK && m.orientation == 90 && m.offsetKnown
+                && "1/120".equals(m.exposureTime) && "xmp.did:1234-abcd".equals(m.documentId)
+                && Math.abs(m.latitude - 52.52009) < 0.001) {
+            pass("binder metadata", "date " + m.dateTakenMillis + " lat " + m.latitude + " special "
+                    + m.specialFormat);
+        } else {
+            fail("binder metadata", "status " + m.status + " orientation " + m.orientation + " exposure '"
+                    + m.exposureTime + "' doc '" + m.documentId + "'");
+        }
+        Thumbnail bad = s.decodeThumbnail(request(photo), 0, 10);
+        if (bad.status == IDecodeService.STATUS_INVALID) {
+            pass("binder refuses a zero box", "");
+        } else {
+            fail("binder refuses a zero box", "status " + bad.status);
+        }
+        unbindService(mConnection);
+    }
+
+    private void checkThumbnail(IDecodeService s, String what, Thumbnail t, int w, int h, int rotation)
+            throws Exception {
+        if (t.status != IDecodeService.STATUS_OK || t.width != w || t.height != h || t.rotation != rotation
+                || t.stripeRows < 1 || t.stripeRows > t.height
+                || (long) t.stripeRows * t.width * 4 > IDecodeService.MAX_STRIPE_BYTES) {
+            fail(what, "status " + t.status + " " + t.width + "x" + t.height + " rotation " + t.rotation
+                    + " stripeRows " + t.stripeRows);
+            return;
+        }
+        long total = 0;
+        int stripes = (t.height + t.stripeRows - 1) / t.stripeRows;
+        for (int i = 0; i < stripes; i++) {
+            byte[] stripe = s.readStripe(t.handle, i);
+            int rows = Math.min(t.stripeRows, t.height - i * t.stripeRows);
+            if (stripe.length != rows * t.width * 4) {
+                fail(what, "stripe " + i + " has " + stripe.length + " bytes");
+                return;
+            }
+            total += stripe.length;
+        }
+        boolean beyond = s.readStripe(t.handle, stripes).length == 0;
+        s.release(t.handle);
+        boolean gone = s.readStripe(t.handle, 0).length == 0;
+        if (total == (long) t.width * t.height * 4 && beyond && gone) {
+            pass(what, t.width + "x" + t.height + " rotation " + t.rotation + ", " + stripes + " stripes of "
+                    + t.stripeRows + " rows, released");
+        } else {
+            fail(what, "total " + total + " beyond " + beyond + " gone " + gone);
         }
     }
 
