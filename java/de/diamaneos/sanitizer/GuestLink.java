@@ -93,6 +93,7 @@ final class GuestLink implements Closeable {
         int extra; // probe: animated, thumbnail: rotation
         byte[] pixels; // thumbnail
         Meta meta; // metadata
+        long reserved; // budget taken for the pixels, given back by whoever ran the call
     }
 
     /** The metadata record after its checks. Absent values are -1, NaN or "". */
@@ -116,8 +117,23 @@ final class GuestLink implements Closeable {
         String originalDocumentId;
     }
 
+    /** Memory for the pixels of a reply, taken before they are allocated. */
+    interface Budget {
+        boolean reserve(String lane, long n);
+
+        void release(String lane, long n);
+    }
+
     private final Channel mChannel;
     private boolean mBroken;
+    private Budget mBudget;
+    private String mLane = "";
+
+    /** Pixels are read only within this budget, charged to this lane. Without one, they are read freely (tests). */
+    void setBudget(Budget budget, String lane) {
+        mBudget = budget;
+        mLane = lane;
+    }
 
     GuestLink(Channel channel) {
         mChannel = channel;
@@ -153,9 +169,14 @@ final class GuestLink implements Closeable {
         return call(OP_METADATA, 0, 0, file, len, 0, deadlineMillis);
     }
 
-    /** Test builds only: the VM's test image answers with a 1x1 thumbnail or fails, see vm/decoder_vm.cpp. */
+    /** Test builds only: the VM's test image answers with a 1x1 or 2x1 thumbnail or fails, see vm/decoder_vm.cpp. */
     Answer hook(int hook, long deadlineMillis) throws IOException {
         return call(OP_HOOK, hook, 0, null, 0, 0, deadlineMillis);
+    }
+
+    /** Test builds only: a hook with input (the leak scan looks for these bytes). */
+    Answer hook(int hook, byte[] input, int len, long deadlineMillis) throws IOException {
+        return call(OP_HOOK, hook, 0, input, len, 0, deadlineMillis);
     }
 
     private Answer call(int op, int arg0, int arg1, byte[] file, int len, int unused, long deadline)
@@ -209,23 +230,46 @@ final class GuestLink implements Closeable {
                         boolean turned = a.extra == 90 || a.extra == 270;
                         checkSize(a.width, a.height, turned ? arg1 : arg0, turned ? arg0 : arg1);
                     } else {
-                        check(a.width == 1 && a.height == 1, "hook size");
+                        check(a.width >= 1 && a.width <= 2 && a.height == 1, "hook size");
                     }
                     check((long) a.width * a.height <= MAX_PIXELS, "pixels");
                     check((long) payload == (long) a.width * a.height * 4, "pixel length");
-                    byte[] pixels = readExact(payload, deadline).array();
+                    if (mBudget != null && !mBudget.reserve(mLane, payload)) {
+                        // No memory for these pixels now: read past them, keep the link, answer "try later".
+                        drain(payload, deadline);
+                        ByteBuffer skipped = readExact(END_BYTES, deadline);
+                        check(skipped.getInt() == END_MAGIC, "end");
+                        Answer later = new Answer();
+                        later.status = INTERNAL;
+                        return later;
+                    }
+                    a.reserved = mBudget != null ? payload : 0;
+                    byte[] pixels;
+                    try {
+                        pixels = readExact(payload, deadline).array();
+                    } catch (IOException | RuntimeException | Error t) {
+                        if (mBudget != null) mBudget.release(mLane, a.reserved);
+                        throw t;
+                    }
                     // A worker that failed after its header: the VM kept the length with zeros and its trailer says
-                    // INVALID. A clean verdict on the file, not a broken link.
+                    // INVALID (the file) or INTERNAL (the worker died). A clean answer, not a broken link.
                     ByteBuffer e = readExact(END_BYTES, deadline);
                     check(e.getInt() == END_MAGIC, "end");
                     int endStatus = e.getInt();
-                    if (endStatus == INVALID) {
+                    if (endStatus == INVALID || endStatus == INTERNAL) {
+                        if (mBudget != null) mBudget.release(mLane, a.reserved);
                         Answer bad = new Answer();
-                        bad.status = INVALID;
+                        bad.status = endStatus;
                         return bad;
                     }
+                    if (endStatus != OK && mBudget != null) mBudget.release(mLane, a.reserved);
                     check(endStatus == OK, "end status " + endStatus);
-                    checkPremultiplied(pixels);
+                    try {
+                        checkPremultiplied(pixels);
+                    } catch (ProtocolException e) {
+                        if (mBudget != null) mBudget.release(mLane, a.reserved);
+                        throw e;
+                    }
                     a.pixels = pixels;
                     return a;
                 case OP_METADATA:
@@ -239,11 +283,21 @@ final class GuestLink implements Closeable {
             }
             readEnd(OK, deadline);
             return a;
-        } catch (IOException | RuntimeException e) {
+        } catch (IOException | RuntimeException | Error e) {
+            // Anything at all, out of memory included, leaves the link in an unknown state: it is not used again.
             close();
             if (e instanceof ProtocolException) throw (ProtocolException) e;
             if (e instanceof IllegalArgumentException) throw (IllegalArgumentException) e;
             throw new ProtocolException(e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private void drain(int n, long deadline) throws IOException {
+        byte[] b = new byte[(int) Math.min(n, 64 * 1024)];
+        while (n > 0) {
+            int k = mChannel.read(b, 0, Math.min(n, b.length), deadline);
+            if (k <= 0) throw new ProtocolException("stream ended in skipped pixels");
+            n -= k;
         }
     }
 

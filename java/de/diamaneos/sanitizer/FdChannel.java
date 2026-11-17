@@ -37,9 +37,24 @@ final class FdChannel implements GuestLink.Channel {
     private final ParcelFileDescriptor mPfd;
     private final FileDescriptor mFd;
 
+    // Writes go out in pieces of this size, each after poll says there is room, on a non-blocking descriptor.
+    private static final int WRITE_CHUNK = 64 * 1024;
+
     FdChannel(ParcelFileDescriptor pfd) {
         mPfd = pfd;
         mFd = pfd.getFileDescriptor();
+    }
+
+    /** For the VM link: never blocks in read or write, so every deadline holds. */
+    static FdChannel nonBlocking(ParcelFileDescriptor pfd) throws IOException {
+        FdChannel c = new FdChannel(pfd);
+        try {
+            int flags = Os.fcntlInt(c.mFd, OsConstants.F_GETFL, 0);
+            Os.fcntlInt(c.mFd, OsConstants.F_SETFL, flags | OsConstants.O_NONBLOCK);
+        } catch (ErrnoException e) {
+            throw new IOException(e);
+        }
+        return c;
     }
 
     private void await(short events, long deadline) throws IOException {
@@ -75,7 +90,7 @@ final class FdChannel implements GuestLink.Channel {
         while (len > 0) {
             await((short) OsConstants.POLLOUT, deadline);
             try {
-                int k = Os.write(mFd, b, off, len);
+                int k = Os.write(mFd, b, off, Math.min(len, WRITE_CHUNK));
                 off += k;
                 len -= k;
             } catch (ErrnoException e) {
@@ -97,11 +112,12 @@ final class FdChannel implements GuestLink.Channel {
     }
 
     /**
-     * Reads the stream, at most max bytes, taking every buffer from the budget before it is allocated. With prefix,
-     * a longer stream is cut at max instead of refused (a probe needs only the header). A regular file is read into
-     * one buffer of its size. On OK the caller owns input.reserved and gives it back.
+     * Reads the stream, at most max bytes, taking every buffer from the lane's budget before it is allocated. With
+     * prefix, a longer stream is cut at max instead of refused (a probe needs only the header). A regular file is read
+     * into one buffer of its size. On OK the caller owns input.reserved (charged to lane) and gives it back. Blocking
+     * reads (FUSE files) are bounded by the caller, which runs this on a reader thread with a deadline.
      */
-    Input readInput(int max, boolean prefix, long deadline, Decoder budget) {
+    Input readInput(int max, boolean prefix, long deadline, Decoder budget, String lane) {
         Input in = new Input();
         long size = -1;
         try {
@@ -115,51 +131,56 @@ final class FdChannel implements GuestLink.Channel {
             return in;
         }
         int cap = size >= 0 ? (int) Math.min(size + 1, (long) max + 1) : Math.min(64 * 1024, max + 1);
-        if (!budget.reserve(cap)) {
+        if (!budget.reserve(lane, cap)) {
             in.status = Input.NO_MEMORY;
             return in;
         }
         long reserved = cap;
-        byte[] buf = new byte[cap];
-        int used = 0;
+        boolean done = false;
         try {
+            byte[] buf = new byte[cap];
+            int used = 0;
             for (;;) {
                 if (used == buf.length) {
                     if (buf.length > max) break;
                     int next = (int) Math.min((long) buf.length * 2, (long) max + 1);
-                    if (!budget.reserve(next)) {
-                        budget.release(reserved);
+                    if (!budget.reserve(lane, next)) {
                         in.status = Input.NO_MEMORY;
                         return in;
                     }
+                    reserved += next;
                     byte[] grown = new byte[next];
                     System.arraycopy(buf, 0, grown, 0, used);
-                    budget.release(buf.length);
-                    reserved = reserved - buf.length + next;
+                    budget.release(lane, buf.length);
+                    reserved -= buf.length;
                     buf = grown;
                 }
                 int k = read(buf, used, buf.length - used, deadline);
                 if (k <= 0) break;
                 used += k;
             }
+            if (used > max) {
+                if (!prefix) {
+                    in.status = Input.TOO_LARGE;
+                    return in;
+                }
+                used = max;
+            }
+            in.status = Input.OK;
+            in.data = buf;
+            in.len = used;
+            in.reserved = reserved;
+            done = true;
+            return in;
         } catch (IOException e) {
-            budget.release(reserved);
             in.status = Input.TOO_LARGE;
             return in;
+        } catch (Throwable t) {
+            in.status = Input.NO_MEMORY;
+            return in;
+        } finally {
+            if (!done) budget.release(lane, reserved);
         }
-        if (used > max) {
-            if (!prefix) {
-                budget.release(reserved);
-                in.status = Input.TOO_LARGE;
-                return in;
-            }
-            used = max;
-        }
-        in.status = Input.OK;
-        in.data = buf;
-        in.len = used;
-        in.reserved = reserved;
-        return in;
     }
 
     @Override

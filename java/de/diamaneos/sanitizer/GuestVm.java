@@ -32,6 +32,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 
@@ -94,7 +96,7 @@ final class GuestVm {
         while (SystemClock.uptimeMillis() < deadline) {
             try {
                 ParcelFileDescriptor pfd = mVm.connectVsock(GuestLink.PORT);
-                GuestLink link = new GuestLink(new FdChannel(pfd));
+                GuestLink link = new GuestLink(FdChannel.nonBlocking(pfd));
                 link.ping(Math.min(deadline, SystemClock.uptimeMillis() + 2000));
                 if (mReadyAt == 0) mReadyAt = SystemClock.uptimeMillis();
                 mLink = link;
@@ -203,16 +205,32 @@ final class GuestVm {
                 .build();
     }
 
-    // Copies when the size or the time differs. pvmfw checks the kernel's signature at every start either way.
+    // Copies unless the copy already holds exactly the same bytes (SHA-256): an update may keep the size and the
+    // time of a file whose contents changed. pvmfw checks the kernel's signature at every start either way.
     private static void copy(File from, File to) throws IOException {
-        if (to.length() == from.length() && to.lastModified() == from.lastModified() && to.length() > 0) return;
+        byte[] want = sha256(from);
+        if (to.isFile() && MessageDigest.isEqual(want, sha256(to))) return;
         File tmp = new File(to.getPath() + ".tmp");
         try (InputStream in = new FileInputStream(from); OutputStream out = new FileOutputStream(tmp)) {
             byte[] buf = new byte[1 << 16];
             int n;
             while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
         }
-        tmp.setLastModified(from.lastModified());
-        if (!tmp.renameTo(to)) throw new IOException("copy " + to);
+        if (!MessageDigest.isEqual(want, sha256(tmp)) || !tmp.renameTo(to)) {
+            tmp.delete();
+            throw new IOException("copy " + to);
+        }
+    }
+
+    private static byte[] sha256(File f) throws IOException {
+        try (InputStream in = new FileInputStream(f)) {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) md.update(buf, 0, n);
+            return md.digest();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException(e);
+        }
     }
 }

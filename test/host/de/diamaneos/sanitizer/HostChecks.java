@@ -492,7 +492,197 @@ public final class HostChecks {
         else fail("result cache", "stored " + stored);
     }
 
+    // --- The real VM program, built for the build machine (decoder_vm_hosttest), over a Unix socket ---------------
+
+    static final class UnixChannel implements GuestLink.Channel {
+        private final java.nio.channels.SocketChannel mCh;
+        private final java.nio.channels.Selector mSel;
+
+        UnixChannel(String path) throws IOException {
+            mCh = java.nio.channels.SocketChannel.open(java.net.StandardProtocolFamily.UNIX);
+            mCh.connect(java.net.UnixDomainSocketAddress.of(path));
+            mCh.configureBlocking(false);
+            mSel = java.nio.channels.Selector.open();
+        }
+
+        private void await(int ops, long deadline) throws IOException {
+            for (;;) {
+                long left = deadline - now();
+                if (left <= 0) throw new InterruptedIOException("deadline");
+                java.nio.channels.SelectionKey k = mCh.register(mSel, ops);
+                int n = mSel.select(left);
+                mSel.selectedKeys().clear();
+                k.interestOps(0);
+                if (n > 0) return;
+            }
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len, long deadline) throws IOException {
+            for (;;) {
+                int n = mCh.read(java.nio.ByteBuffer.wrap(b, off, len));
+                if (n < 0) return 0;
+                if (n > 0) return n;
+                await(java.nio.channels.SelectionKey.OP_READ, deadline);
+            }
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len, long deadline) throws IOException {
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(b, off, len);
+            while (buf.hasRemaining()) {
+                if (mCh.write(buf) == 0) await(java.nio.channels.SelectionKey.OP_WRITE, deadline);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            mSel.close();
+            mCh.close();
+        }
+    }
+
+    static byte[] file(java.io.File dir, String name) throws IOException {
+        return java.nio.file.Files.readAllBytes(new java.io.File(dir, name).toPath());
+    }
+
+    static byte[] replace(byte[] in, byte[] from, byte[] to) {
+        byte[] out = in.clone();
+        outer:
+        for (int i = 0; i + from.length <= in.length; i++) {
+            for (int j = 0; j < from.length; j++) if (in[i + j] != from[j]) continue outer;
+            System.arraycopy(to, 0, out, i, to.length);
+            return out;
+        }
+        return out;
+    }
+
+    static String show(Object r) {
+        if (!(r instanceof GuestLink.Answer)) return String.valueOf(r);
+        GuestLink.Answer a = (GuestLink.Answer) r;
+        return "status " + a.status + (a.status == 0 ? " " + a.width + "x" + a.height + " extra " + a.extra : "");
+    }
+
+    static void brokerChecks(String socket, java.io.File images) throws Exception {
+        GuestLink link = new GuestLink(new UnixChannel(socket));
+        long t;
+        GuestLink.Answer ping = link.ping(now() + 5000);
+        if (ping.status == GuestLink.OK) pass("broker ping", ""); else fail("broker ping", show(ping));
+
+        byte[] seed = file(images, "exif-seed.jpg");
+        t = now();
+        GuestLink.Answer meta = link.metadata(seed, seed.length, now() + 30000);
+        GuestLink.Meta m = meta.meta;
+        if (meta.status == 0 && m.orientation == 90 && "Holiday shot".equals(m.description)
+                && m.dateTakenMillis == 1794904890123L && "xmp.did:1234-abcd".equals(m.documentId)
+                && m.offsetKnown && Math.abs(m.latitude - 52.52009) < 0.001 && m.specialFormat == 2) {
+            pass("broker metadata", (now() - t) + " ms");
+        } else {
+            fail("broker metadata", show(meta));
+        }
+        String[][] thumbs = {
+            {"photo12.jpg", "1080", "2400", "1080", "810", "0"},
+            {"photo12-rot90.jpg", "300", "200", "200", "150", "90"},
+            {"photo12.jpg", "64", "64", "64", "48", "0"},
+            {"test-rgba.png", "256", "256", "256", "192", "0"},
+            {"interlaced.png", "512", "512", "-1", "-1", "0"},
+            {"png8mp.png", "1080", "1080", "-1", "-1", "0"},
+            {"photo12p.jpg", "1080", "1080", "-1", "-1", "0"},
+        };
+        for (String[] c : thumbs) {
+            byte[] f = file(images, c[0]);
+            int bw = Integer.parseInt(c[1]), bh = Integer.parseInt(c[2]);
+            t = now();
+            GuestLink.Answer a = link.thumbnail(f, f.length, bw, bh, now() + 45000);
+            long ms = now() - t;
+            boolean ok = a.status == 0 && a.extra == Integer.parseInt(c[5])
+                    && (c[3].equals("-1") || (a.width == Integer.parseInt(c[3]) && a.height == Integer.parseInt(c[4])))
+                    && broken(a, GuestLink.OP_THUMBNAIL, bw, bh) == null;
+            if (ok) pass("broker thumbnail " + c[0] + " in " + bw + "x" + bh, show(a) + ", " + ms + " ms");
+            else fail("broker thumbnail " + c[0] + " in " + bw + "x" + bh, show(a) + ", " + ms + " ms");
+        }
+        for (String big : new String[] {"photo50.jpg", "photo50p.jpg", "photo50n.jpg"}) {
+            byte[] f = file(images, big);
+            t = now();
+            GuestLink.Answer a = link.thumbnail(f, f.length, 1080, 1080, now() + 45000);
+            System.out.println("info broker thumbnail " + big + ": " + show(a) + ", " + (now() - t) + " ms");
+        }
+        byte[] broken = {(byte) 0xff, (byte) 0xd8, (byte) 0xff, 0, 1, 2, 3};
+        GuestLink.Answer bad = link.thumbnail(broken, broken.length, 8, 8, now() + 30000);
+        if (bad.status == GuestLink.INVALID) pass("broker broken jpeg", ""); else fail("broker broken jpeg", show(bad));
+        byte[] text = "hello".getBytes();
+        GuestLink.Answer other = link.probe(text, text.length, now() + 30000);
+        if (other.status == GuestLink.UNSUPPORTED) pass("broker unsupported", ""); else fail("broker unsupported",
+                show(other));
+
+        // The lockdown: seccomp strict entered, and every forbidden call kills the worker (no verdict on a file).
+        GuestLink.Answer report = link.hook(4, now() + 30000);
+        if (report.status == 0 && report.pixels[0] == 1 && report.pixels[1] == 0) {
+            pass("broker lockdown entered", "");
+        } else {
+            fail("broker lockdown entered", show(report));
+        }
+        String[] names = {"", "open", "mmap", "spin", "", "fork"};
+        for (int hook : new int[] {1, 2, 5, 3}) {
+            t = now();
+            GuestLink.Answer a = link.hook(hook, now() + 45000);
+            long ms = now() - t;
+            if (a.status == GuestLink.INTERNAL) pass("broker lockdown kills " + names[hook], ms + " ms");
+            else fail("broker lockdown kills " + names[hook], show(a) + ", " + ms + " ms");
+        }
+        GuestLink.Answer colours = link.hook(7, now() + 30000);
+        if (colours.status == GuestLink.INVALID) pass("broker refuses colours above alpha", "");
+        else fail("broker refuses colours above alpha", show(colours));
+
+        // No leak: another request's metadata and pixels must not reach the next worker.
+        Random rnd = new Random();
+        String marker = String.format("LK%010x", rnd.nextLong() & 0xffffffffffL);
+        byte[] withMarker = replace(seed, "Holiday shot".getBytes(), marker.getBytes());
+        GuestLink.Answer mm = link.metadata(withMarker, withMarker.length, now() + 30000);
+        java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(32, 1,
+                java.awt.image.BufferedImage.TYPE_INT_ARGB);
+        byte[] rgba = new byte[32 * 4];
+        for (int x = 0; x < 32; x++) {
+            int r = rnd.nextInt(256), g = rnd.nextInt(256), b = rnd.nextInt(256);
+            img.setRGB(x, 0, 0xff000000 | r << 16 | g << 8 | b);
+            rgba[x * 4] = (byte) r;
+            rgba[x * 4 + 1] = (byte) g;
+            rgba[x * 4 + 2] = (byte) b;
+            rgba[x * 4 + 3] = (byte) 255;
+        }
+        java.io.ByteArrayOutputStream png = new java.io.ByteArrayOutputStream();
+        javax.imageio.ImageIO.write(img, "png", png);
+        byte[] pngBytes = png.toByteArray();
+        GuestLink.Answer px = link.thumbnail(pngBytes, pngBytes.length, 64, 64, now() + 30000);
+        boolean sent = mm.status == 0 && marker.equals(mm.meta.description) && px.status == 0
+                && java.util.Arrays.equals(px.pixels, rgba);
+        GuestLink.Answer scanMeta = link.hook(6, marker.getBytes(), marker.length(), now() + 30000);
+        GuestLink.Answer scanPixels = link.hook(6, rgba, rgba.length, now() + 30000);
+        byte[] dsr = "DSR2".getBytes();
+        GuestLink.Answer control = link.hook(6, dsr, dsr.length, now() + 30000);
+        if (sent && scanMeta.status == 0 && scanMeta.pixels[0] == 0 && scanPixels.status == 0
+                && scanPixels.pixels[0] == 0 && control.status == 0 && control.pixels[0] == 1) {
+            pass("broker no leak between requests", "metadata and pixels markers not found by the next worker ("
+                    + (scanMeta.pixels[1] & 0xff) + " regions scanned), the control found");
+        } else {
+            fail("broker no leak between requests", "sent " + sent + " meta " + show(scanMeta) + " found "
+                    + (scanMeta.pixels != null ? scanMeta.pixels[0] : -1) + " pixels " + show(scanPixels) + " found "
+                    + (scanPixels.pixels != null ? scanPixels.pixels[0] : -1) + " control " + show(control));
+        }
+        link.close();
+        // The broker serves the next connection.
+        GuestLink again = new GuestLink(new UnixChannel(socket));
+        GuestLink.Answer p2 = again.ping(now() + 5000);
+        if (p2.status == 0) pass("broker second connection", ""); else fail("broker second connection", show(p2));
+        again.close();
+    }
+
     public static void main(String[] args) throws Exception {
+        if (args.length >= 3 && args[0].equals("broker")) {
+            brokerChecks(args[1], new java.io.File(args[2]));
+            System.out.println("DONE pass=" + sPass + " fail=" + sFail);
+            System.exit(sFail == 0 ? 0 : 1);
+        }
         int rounds = args.length > 0 ? Integer.parseInt(args[0]) : 3000;
         linkChecks();
         fuzz(rounds);

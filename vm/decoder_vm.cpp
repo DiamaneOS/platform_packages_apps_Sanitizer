@@ -25,6 +25,7 @@
 // gets a process that can write to one pipe and nothing else, and that process ends with the file.
 
 #include <errno.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/seccomp.h>
@@ -41,6 +42,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -56,6 +58,31 @@
 #include "proto.h"
 
 using namespace decoder;
+
+// The host test build uses the host toolchain's older kernel headers and C library.
+#ifndef __NR_close_range
+#define __NR_close_range 436
+#endif
+#ifndef __NR_memfd_create
+#if defined(__x86_64__)
+#define __NR_memfd_create 319
+#elif defined(__aarch64__)
+#define __NR_memfd_create 279
+#endif
+#endif
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 1U
+#endif
+#ifndef PR_SET_NO_NEW_PRIVS
+#define PR_SET_NO_NEW_PRIVS 38
+#endif
+#if defined(DECODER_HOST_TEST)
+static void wipe(void* p, size_t n) {
+    memset(p, 0, n);
+    __asm__ volatile("" : : "r"(p) : "memory");
+}
+#define explicit_bzero wipe
+#endif
 
 namespace {
 
@@ -81,6 +108,8 @@ constexpr uint32_t kHookMmap = 2;
 constexpr uint32_t kHookSpin = 3;
 constexpr uint32_t kHookLockdown = 4;
 constexpr uint32_t kHookFork = 5;
+constexpr uint32_t kHookScan = 6;
+constexpr uint32_t kHookBadPixels = 7;
 #endif
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -536,7 +565,15 @@ void warm_up() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The worker.
+// The worker. Workers are forked by the zygote, a child the broker forks once at start, before any request: so no
+// worker ever inherits another request's file, pixels or metadata from the broker's memory. A worker gets its file
+// as a memory file mapped read-only, and its output pipe.
+
+// Worker exit codes. A signal (seccomp's kill, the CPU limit, the broker's kill at the wall deadline) or an exit code
+// other than these counts as internal: not a verdict on the file.
+constexpr int kExitOk = 0;
+constexpr int kExitDecodeFailed = 3;
+constexpr int kExitLockdown = 4;
 
 [[noreturn]] void worker_exit(int code) {
     syscall(__NR_exit, code);
@@ -551,12 +588,40 @@ void warm_up() {
     Sink sink = {0, static_cast<uint8_t*>(arena_alloc(kStripeBytes)), 0};
     worker_exit(sink_header(&sink, 1, 1) && sink_put(&sink, px, 4) && sink_flush(&sink) ? 0 : 3);
 }
+
+// Test builds: looks for the request's bytes anywhere in the worker's readable memory but the file's own mapping,
+// before the lockdown (it needs /proc/self/maps). 1 means another request's data reached this worker.
+[[noreturn]] void hook_scan(const uint8_t* data, size_t size) {
+    int found = 0, regions = 0;
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    static char maps[1 << 16];
+    ssize_t n = fd >= 0 ? read(fd, maps, sizeof(maps) - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0 || size == 0) hook_report(2, 0, 2);
+    maps[n] = 0;
+    for (char* line = maps; line != nullptr && *line != 0;) {
+        char* next = strchr(line, '\n');
+        if (next != nullptr) *next++ = 0;
+        unsigned long lo, hi;
+        char perms[5] = {};
+        if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) == 3 && perms[0] == 'r' && strstr(line, "[vvar") == nullptr &&
+            strstr(line, "[vsyscall") == nullptr) {
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(lo);
+            size_t len = hi - lo;
+            bool own = data >= b && data < b + len;
+            if (!own && memmem(b, len, data, size) != nullptr) found = 1;
+            regions++;
+        }
+        line = next;
+    }
+    hook_report(static_cast<uint8_t>(found), static_cast<uint8_t>(std::min(regions, 255)), 3);
+}
 #endif
 
 // The lockdown, in this order: rlimits (no new file descriptors, no new processes, no more address space, capped CPU
 // time, no core or file writes), an unprivileged user, no new privileges, then seccomp strict mode. Everything before
-// seccomp is a second layer only. Without seccomp the worker exits: production builds never decode without it.
-[[noreturn]] void worker_main(const Request& rq, uint32_t format, const uint8_t* data, size_t size, int out) {
+// seccomp is a second layer only. Returns 0, or the errno of seccomp. Exits for anything else that fails.
+int lockdown(int out) {
     int adj = open("/proc/self/oom_score_adj", O_WRONLY | O_CLOEXEC);
     if (adj >= 0) {
         (void)!write(adj, "1000", 4);
@@ -569,10 +634,10 @@ void warm_up() {
         if (read(statm, buf, sizeof(buf) - 1) > 0) vmBytes = strtoull(buf, nullptr, 10) * getpagesize();
         close(statm);
     }
-    if (vmBytes == 0) worker_exit(4);
-    // Only the output pipe stays open, as fd 0. The broker's vsock connection must be out of reach.
-    if (out != 0 && dup2(out, 0) != 0) worker_exit(4);
-    if (syscall(__NR_close_range, 1u, ~0u, 0u) != 0) worker_exit(4);
+    if (vmBytes == 0) worker_exit(kExitLockdown);
+    // Only the output pipe stays open, as fd 0.
+    if (out != 0 && dup2(out, 0) != 0) worker_exit(kExitLockdown);
+    if (syscall(__NR_close_range, 1u, ~0u, 0u) != 0) worker_exit(kExitLockdown);
     struct {
         int resource;
         rlim_t value;
@@ -586,24 +651,37 @@ void warm_up() {
     };
     for (const auto& l : limits) {
         rlimit r = {l.value, l.value};
-        if (setrlimit(l.resource, &r) != 0) worker_exit(4);
+        if (setrlimit(l.resource, &r) != 0) worker_exit(kExitLockdown);
     }
-    if (setgroups(0, nullptr) != 0 || setresgid(kWorkerId, kWorkerId, kWorkerId) != 0 ||
-        setresuid(kWorkerId, kWorkerId, kWorkerId) != 0) {
-        worker_exit(4);
+#ifdef DECODER_HOST_TEST
+    // Host test builds run as an ordinary user, who cannot change users.
+    bool dropUser = getuid() == 0;
+#else
+    bool dropUser = true;
+#endif
+    if (dropUser && (setgroups(0, nullptr) != 0 || setresgid(kWorkerId, kWorkerId, kWorkerId) != 0 ||
+                     setresuid(kWorkerId, kWorkerId, kWorkerId) != 0)) {
+        worker_exit(kExitLockdown);
     }
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) worker_exit(4);
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) worker_exit(kExitLockdown);
     gInWorker = true;
     gArenaUsed = 0;
-    int seccompError = 0;
-    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0) != 0) {
-        seccompError = errno;
-#ifndef DECODER_TEST_HOOKS
-        worker_exit(4);
-#endif
-    }
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0) != 0) return errno;
+    return 0;
+}
 
+[[noreturn]] void worker_main(const Request& rq, uint32_t format, const uint8_t* data, size_t size, int out) {
 #ifdef DECODER_TEST_HOOKS
+    if (rq.op == kOpHook && rq.arg0 == kHookScan) {
+        if (out != 0 && dup2(out, 0) != 0) worker_exit(kExitLockdown);
+        hook_scan(data, size);
+    }
+#endif
+    int seccompError = lockdown(out);
+#ifndef DECODER_TEST_HOOKS
+    // Production builds never decode without seccomp.
+    if (seccompError != 0) worker_exit(kExitLockdown);
+#else
     if (rq.op == kOpHook) {
         if (rq.arg0 == kHookOpen) {
             long r = syscall(__NR_openat, AT_FDCWD, "/proc/self/status", O_RDONLY);
@@ -622,49 +700,128 @@ void warm_up() {
             if (r == 0) worker_exit(0);
             hook_report(r < 0, r < 0 ? errno : 0, 0);
         }
+        if (rq.arg0 == kHookBadPixels) {
+            // A compromised worker sending colours above alpha: the broker must answer INVALID itself.
+            uint8_t px[8] = {200, 0, 0, 10, 1, 1, 1, 1};
+            Sink sink = {0, static_cast<uint8_t*>(arena_alloc(kStripeBytes)), 0};
+            worker_exit(sink_header(&sink, 2, 1) && sink_put(&sink, px, 8) && sink_flush(&sink) ? 0 : 3);
+        }
         worker_exit(5);
     }
-#else
-    (void)seccompError;
+    if (seccompError != 0) worker_exit(kExitLockdown);
 #endif
 
     Sink sink = {0, static_cast<uint8_t*>(arena_alloc(kStripeBytes)), 0};
-    if (sink.buf == nullptr) worker_exit(3);
+    if (sink.buf == nullptr) worker_exit(kExitDecodeFailed);
     if (rq.op == kOpProbe) {
         uint32_t w = 0, h = 0;
-        if (!decode_any(format, data, size, 0, 0, &sink, true, &w, &h)) worker_exit(3);
+        if (!decode_any(format, data, size, 0, 0, &sink, true, &w, &h)) worker_exit(kExitDecodeFailed);
         uint8_t msg[20] = {'D', 'P', 'R', '1'};
         put_le32(msg + 4, format);
         put_le32(msg + 8, w);
         put_le32(msg + 12, h);
         put_le32(msg + 16, format == kFormatPng && png_is_animated(data, size) ? 1 : 0);
-        worker_exit(write_all(0, msg, sizeof(msg)) ? 0 : 3);
+        worker_exit(write_all(0, msg, sizeof(msg)) ? kExitOk : kExitDecodeFailed);
     }
-    if (rq.op == kOpMetadata) {
-        Meta* m = static_cast<Meta*>(arena_alloc(sizeof(Meta)));
-        if (m == nullptr) worker_exit(3);
-        memset(m, 0, sizeof(*m));
-        m->magic = kMetaMagic;
-        m->version = 1;
-        m->orientation = -1;
-        m->dateTakenMillis = -1;
-        m->format = format;
-        if (!decode_any(format, data, size, 0, 0, &sink, true, &m->width, &m->height)) worker_exit(3);
-        read_metadata(data, size, format, m);
-        worker_exit(write_all(0, m, sizeof(*m)) ? 0 : 3);
-    }
-    // Thumbnail: the rotation comes from the file's EXIF orientation, read first.
     Meta* m = static_cast<Meta*>(arena_alloc(sizeof(Meta)));
-    if (m == nullptr) worker_exit(3);
+    if (m == nullptr) worker_exit(kExitDecodeFailed);
     memset(m, 0, sizeof(*m));
     m->orientation = -1;
+    m->dateTakenMillis = -1;
+    if (rq.op == kOpMetadata) {
+        m->magic = kMetaMagic;
+        m->version = 1;
+        m->format = format;
+        if (!decode_any(format, data, size, 0, 0, &sink, true, &m->width, &m->height)) worker_exit(kExitDecodeFailed);
+        read_metadata(data, size, format, m);
+        worker_exit(write_all(0, m, sizeof(*m)) ? kExitOk : kExitDecodeFailed);
+    }
+    // Thumbnail: the rotation comes from the file's EXIF orientation, read first.
     read_metadata(data, size, format, m);
     gRotation = m->orientation > 0 ? static_cast<uint32_t>(m->orientation) : 0;
     // The box is for the image as shown. Turned by 90 or 270 degrees, the stored image fits it the other way round.
     bool turned = gRotation == 90 || gRotation == 270;
     uint32_t w, h;
     worker_exit(decode_any(format, data, size, turned ? rq.arg1 : rq.arg0, turned ? rq.arg0 : rq.arg1, &sink, false,
-                           &w, &h) ? 0 : 3);
+                           &w, &h) ? kExitOk : kExitDecodeFailed);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The zygote: forked once, after the warm-up and the lockdown self-test, before the first request. It never sees a
+// file: the broker hands it a memory file and a pipe per request, it forks the worker, reports its pid, waits for it
+// and reports how it ended.
+
+struct ZygoteRequest {
+    Request rq;
+    uint32_t format;
+    uint32_t len;
+};
+
+struct ZygoteReply {
+    int32_t kind;  // 1: started (value is the pid), 2: ended (value is the wait status), 3: fork failed
+    int32_t value;
+};
+
+int gZygote = -1;  // the broker's end of the zygote socket
+pid_t gZygotePid = -1;
+
+[[noreturn]] void zygote_main(int sock) {
+    for (;;) {
+        ZygoteRequest zr;
+        char control[CMSG_SPACE(2 * sizeof(int))];
+        iovec iov = {&zr, sizeof(zr)};
+        msghdr mh = {};
+        mh.msg_iov = &iov;
+        mh.msg_iovlen = 1;
+        mh.msg_control = control;
+        mh.msg_controllen = sizeof(control);
+        ssize_t n = recvmsg(sock, &mh, MSG_CMSG_CLOEXEC);
+        if (n == 0) _exit(0);  // the broker is gone
+        cmsghdr* cm = CMSG_FIRSTHDR(&mh);
+        if (n != static_cast<ssize_t>(sizeof(zr)) || cm == nullptr || cm->cmsg_type != SCM_RIGHTS ||
+            cm->cmsg_len != CMSG_LEN(2 * sizeof(int))) {
+            _exit(1);
+        }
+        int fds[2];
+        memcpy(fds, CMSG_DATA(cm), sizeof(fds));
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(sock);
+            const uint8_t* data = nullptr;
+            if (zr.len > 0) {
+                void* p = mmap(nullptr, zr.len, PROT_READ, MAP_PRIVATE, fds[0], 0);
+                if (p == MAP_FAILED) worker_exit(kExitLockdown);
+                data = static_cast<const uint8_t*>(p);
+            }
+            close(fds[0]);
+            worker_main(zr.rq, zr.format, data, zr.len, fds[1]);
+        }
+        close(fds[0]);
+        close(fds[1]);
+        ZygoteReply started = {pid > 0 ? 1 : 3, static_cast<int32_t>(pid)};
+        if (!write_all(sock, &started, sizeof(started))) _exit(1);
+        if (pid < 0) continue;
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+        ZygoteReply ended = {2, status};
+        if (!write_all(sock, &ended, sizeof(ended))) _exit(1);
+    }
+}
+
+bool start_zygote() {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) != 0) return false;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(sv[0]);
+        zygote_main(sv[1]);
+    }
+    close(sv[1]);
+    if (pid < 0) return false;
+    gZygote = sv[0];
+    gZygotePid = pid;
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -698,44 +855,94 @@ ssize_t read_full(int fd, void* data, size_t n, int64_t deadline, int idleMs) {
     return static_cast<ssize_t>(got);
 }
 
-// The current worker. Ends it, at once with kill, else after it exits on its own (a short grace period, then killed
-// anyway). Returns true for a clean exit.
+// The zygote must answer within this, or the broker gives up on itself (the VM is restarted by Android).
+constexpr int kZygoteMs = 10000;
+
+[[noreturn]] void broker_fail() {
+    _exit(1);  // PID 1 ends: the VM stops, Android answers "unavailable" and starts it again
+}
+
+// How a worker ended.
+enum class Ended { kClean, kDecodeFailed, kInternal };
+
 struct Worker {
     pid_t pid = -1;
     int pipe = -1;
     int64_t deadline = 0;
 };
 
-bool end_worker(Worker* w, bool kill) {
-    if (w->pid < 0) return false;
-    int status = 0;
-    pid_t r = 0;
-    if (!kill) {
-        for (int i = 0; i < 2000 && (r = waitpid(w->pid, &status, WNOHANG)) == 0; i++) usleep(1000);
-    }
-    if (r == 0) {
+// Ends the current worker, at once with kill, else after it exits on its own (a grace period, then killed anyway).
+Ended end_worker(Worker* w, bool kill) {
+    if (w->pid < 0) return Ended::kInternal;
+    ZygoteReply ended = {};
+    ssize_t n = 0;
+    if (!kill) n = read_full(gZygote, &ended, sizeof(ended), now_ms() + 2000, 2000);
+    if (n != static_cast<ssize_t>(sizeof(ended))) {
         ::kill(w->pid, SIGKILL);
-        r = waitpid(w->pid, &status, 0);
+        n = read_full(gZygote, &ended, sizeof(ended), now_ms() + kZygoteMs, kZygoteMs);
+        if (n != static_cast<ssize_t>(sizeof(ended))) broker_fail();
     }
     close(w->pipe);
     *w = Worker();
-    return r > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (ended.kind != 2) broker_fail();
+    int status = ended.value;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == kExitOk) return Ended::kClean;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == kExitDecodeFailed) return Ended::kDecodeFailed;
+    return Ended::kInternal;  // a signal (seccomp, CPU limit, our kill), the lockdown, anything else
 }
 
-bool start_worker(const Request& rq, uint32_t format, const uint8_t* data, size_t size, Worker* w) {
+int32_t status_of(Ended e) {
+    return e == Ended::kDecodeFailed ? kInvalid : kInternal;
+}
+
+// The request's file goes into a memory file the worker maps read-only. The broker reads it straight from the link
+// into that file, so the broker's own memory never holds a caller's file.
+int read_input(int c, uint32_t len) {
+    int fd = static_cast<int>(syscall(__NR_memfd_create, "decoder-input", MFD_CLOEXEC));
+    if (fd < 0) return -1;
+    if (len == 0) return fd;
+    void* p = MAP_FAILED;
+    if (ftruncate(fd, len) == 0) p = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    bool ok = p != MAP_FAILED &&
+              read_full(c, p, len, now_ms() + kHostReadMs, kHostReadMs) == static_cast<ssize_t>(len);
+    if (p != MAP_FAILED) munmap(p, len);
+    if (!ok) {
+        close(fd);
+        return -2;
+    }
+    return fd;
+}
+
+bool start_worker(const Request& rq, uint32_t format, int input, uint32_t len, Worker* w) {
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0) return false;
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(fds[0]);
-        worker_main(rq, format, data, size, fds[1]);
-    }
+    ZygoteRequest zr = {rq, format, len};
+    int pass[2] = {input, fds[1]};
+    char control[CMSG_SPACE(sizeof(pass))] = {};
+    iovec iov = {&zr, sizeof(zr)};
+    msghdr mh = {};
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = control;
+    mh.msg_controllen = sizeof(control);
+    cmsghdr* cm = CMSG_FIRSTHDR(&mh);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(pass));
+    memcpy(CMSG_DATA(cm), pass, sizeof(pass));
+    bool sent = sendmsg(gZygote, &mh, MSG_NOSIGNAL) == static_cast<ssize_t>(sizeof(zr));
     close(fds[1]);
-    if (pid < 0) {
+    if (!sent) broker_fail();
+    ZygoteReply started = {};
+    if (read_full(gZygote, &started, sizeof(started), now_ms() + kZygoteMs, kZygoteMs) !=
+        static_cast<ssize_t>(sizeof(started))) {
+        broker_fail();
+    }
+    if (started.kind != 1 || started.value <= 0) {
         close(fds[0]);
         return false;
     }
-    w->pid = pid;
+    w->pid = started.value;
     w->pipe = fds[0];
     w->deadline = now_ms() + kWorkerWallMs;
     return true;
@@ -756,44 +963,27 @@ bool send_failure(int c, int32_t status) {
     return send_reply(c, status, kFormatUnknown, 0, 0, 0, 0) && send_end(c, status);
 }
 
-uint8_t* gInput = nullptr;
-
-// One request. Returns false when the connection must end (the host's stream is broken, or a worker failed after the
-// reply header went out, so the only honest signal left is to close).
-bool serve_one(int c) {
-    Request rq;
-    if (read_full(c, &rq, sizeof(rq), now_ms() + kHostReadMs, kHostReadMs) != static_cast<ssize_t>(sizeof(rq))) {
-        return false;
+bool premultiplied(const uint8_t* p, size_t n) {
+    for (size_t i = 0; i + 3 < n; i += 4) {
+        if (p[i] > p[i + 3] || p[i + 1] > p[i + 3] || p[i + 2] > p[i + 3]) return false;
     }
-    if (rq.magic != kRequestMagic || rq.inputLen > kMaxInputBytes) return false;
-    if (rq.inputLen > 0 &&
-        read_full(c, gInput, rq.inputLen, now_ms() + kHostReadMs, kHostReadMs) != static_cast<ssize_t>(rq.inputLen)) {
-        return false;
-    }
-    if (rq.op == kOpPing) return send_reply(c, kOk, 0, 0, 0, 0, 0) && send_end(c, kOk);
-#ifdef DECODER_TEST_HOOKS
-    bool hook = rq.op == kOpHook;
-#else
-    bool hook = false;
-#endif
-    if (rq.op != kOpProbe && rq.op != kOpThumbnail && rq.op != kOpMetadata && !hook) return false;
-    uint32_t format = detect_format(gInput, rq.inputLen);
-    if (!hook && format == kFormatUnknown) return send_failure(c, kUnsupported);
-    if (rq.op == kOpThumbnail &&
-        (rq.arg0 == 0 || rq.arg1 == 0 || rq.arg0 > kMaxDimension || rq.arg1 > kMaxDimension)) {
-        return send_failure(c, kInvalid);
-    }
+    return true;
+}
 
-    Worker w;
-    if (!start_worker(rq, format, gInput, rq.inputLen, &w)) return send_failure(c, kInternal);
+uint8_t gStripe[kStripeBytes];
 
+// The worker's answer to the host. Returns false when the connection must end.
+bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* w) {
     if (rq.op == kOpProbe) {
         uint8_t msg[20];
-        ssize_t n = read_full(w.pipe, msg, sizeof(msg), w.deadline, kIdleMs);
-        bool clean = end_worker(&w, n != static_cast<ssize_t>(sizeof(msg)));
+        ssize_t n = read_full(w->pipe, msg, sizeof(msg), w->deadline, kIdleMs);
+        Ended e = end_worker(w, n != static_cast<ssize_t>(sizeof(msg)));
         uint32_t fmt = le32(msg + 4), pw = le32(msg + 8), ph = le32(msg + 12), anim = le32(msg + 16);
-        if (n != static_cast<ssize_t>(sizeof(msg)) || !clean || memcmp(msg, "DPR1", 4) != 0 || fmt != format ||
-            pw == 0 || ph == 0 || pw > kMaxDimension || ph > kMaxDimension || anim > 1) {
+        if (e != Ended::kClean || n != static_cast<ssize_t>(sizeof(msg))) {
+            return send_failure(c, e == Ended::kClean ? kInvalid : status_of(e));
+        }
+        if (memcmp(msg, "DPR1", 4) != 0 || fmt != format || pw == 0 || ph == 0 || pw > kMaxDimension ||
+            ph > kMaxDimension || anim > 1 || (anim == 1 && format != kFormatPng)) {
             return send_failure(c, kInvalid);
         }
         return send_reply(c, kOk, format, pw, ph, anim, 0) && send_end(c, kOk);
@@ -801,95 +991,194 @@ bool serve_one(int c) {
 
     if (rq.op == kOpMetadata) {
         Meta m;
-        ssize_t n = read_full(w.pipe, &m, sizeof(m), w.deadline, kIdleMs);
-        bool clean = end_worker(&w, n != static_cast<ssize_t>(sizeof(m)));
-        if (n != static_cast<ssize_t>(sizeof(m)) || !clean || m.magic != kMetaMagic || m.version != 1 ||
-            m.format != format || m.width == 0 || m.height == 0 || m.width > kMaxDimension ||
-            m.height > kMaxDimension) {
-            return send_failure(c, kInvalid);
-        }
-        return send_reply(c, kOk, format, m.width, m.height, 0, sizeof(m)) && write_all(c, &m, sizeof(m)) &&
-               send_end(c, kOk);
+        ssize_t n = read_full(w->pipe, &m, sizeof(m), w->deadline, kIdleMs);
+        Ended e = end_worker(w, n != static_cast<ssize_t>(sizeof(m)));
+        bool ok = e == Ended::kClean && n == static_cast<ssize_t>(sizeof(m)) && m.magic == kMetaMagic &&
+                  m.version == 1 && m.format == format && m.width != 0 && m.height != 0 &&
+                  m.width <= kMaxDimension && m.height <= kMaxDimension;
+        bool sent = ok ? send_reply(c, kOk, format, m.width, m.height, 0, sizeof(m)) && write_all(c, &m, sizeof(m)) &&
+                                 send_end(c, kOk)
+                       : send_failure(c, e == Ended::kClean ? kInvalid : status_of(e));
+        explicit_bzero(&m, sizeof(m));
+        return sent;
     }
 
-    // Thumbnail (and the test hooks, which answer as a 1x1 thumbnail): header, exact pixels, trailer.
+    // Thumbnail (and the test hooks, which answer as a 1x1 or 2x1 thumbnail): header, exact pixels, trailer.
     uint8_t hdr[16];
-    ssize_t n = read_full(w.pipe, hdr, sizeof(hdr), w.deadline, kIdleMs);
+    ssize_t n = read_full(w->pipe, hdr, sizeof(hdr), w->deadline, kIdleMs);
     uint32_t tw = le32(hdr + 4), th = le32(hdr + 8), rot = le32(hdr + 12);
     bool turned = rot == 90 || rot == 270;
     bool box = hook || (turned ? (tw <= rq.arg1 && th <= rq.arg0) : (tw <= rq.arg0 && th <= rq.arg1));
-    if (n != static_cast<ssize_t>(sizeof(hdr)) || memcmp(hdr, "DSR2", 4) != 0 || tw == 0 || th == 0 ||
-        static_cast<uint64_t>(tw) * th > kMaxPixels || !box || (rot != 0 && rot != 90 && rot != 180 && rot != 270)) {
-        end_worker(&w, true);
+    if (n != static_cast<ssize_t>(sizeof(hdr))) {
+        Ended e = end_worker(w, true);
+        return send_failure(c, e == Ended::kDecodeFailed ? kInvalid : kInternal);
+    }
+    if (memcmp(hdr, "DSR2", 4) != 0 || tw == 0 || th == 0 || static_cast<uint64_t>(tw) * th > kMaxPixels || !box ||
+        (rot != 0 && rot != 180 && !turned)) {
+        end_worker(w, true);
         return send_failure(c, kInvalid);
     }
     uint64_t left = static_cast<uint64_t>(tw) * th * 4;
     if (!send_reply(c, kOk, format, tw, th, rot, static_cast<uint32_t>(left))) {
-        end_worker(&w, true);
+        end_worker(w, true);
         return false;
     }
-    static uint8_t buf[kStripeBytes];
+    int32_t verdict = kOk;
     while (left > 0) {
-        size_t want = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), left));
-        if (read_full(w.pipe, buf, want, w.deadline, kIdleMs) != static_cast<ssize_t>(want)) {
-            // The worker failed or timed out after its header went out: the promised length is kept with zeros and
-            // the trailer says INVALID, so Android tells a bad file from a broken link.
-            end_worker(&w, true);
-            memset(buf, 0, sizeof(buf));
+        size_t want = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), left));
+        ssize_t got = read_full(w->pipe, gStripe, want, w->deadline, kIdleMs);
+        // A worker that stops early, or sends a colour above alpha (only a compromised one does), ends here. The
+        // promised length is kept with zeros and the trailer carries the verdict, so Android tells a bad file or a
+        // failed worker from a broken link.
+        if (got != static_cast<ssize_t>(want) || !premultiplied(gStripe, want)) {
+            bool bad = got == static_cast<ssize_t>(want);
+            Ended e = end_worker(w, true);
+            verdict = bad || e == Ended::kDecodeFailed ? kInvalid : kInternal;
+            explicit_bzero(gStripe, sizeof(gStripe));
             while (left > 0) {
-                size_t k = static_cast<size_t>(std::min<uint64_t>(sizeof(buf), left));
-                if (!write_all(c, buf, k)) return false;
+                size_t k = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), left));
+                if (!write_all(c, gStripe, k)) return false;
                 left -= k;
             }
-            return send_end(c, kInvalid);
+            return send_end(c, verdict);
         }
-        if (!write_all(c, buf, want)) {
-            end_worker(&w, true);
+        if (!write_all(c, gStripe, want)) {
+            end_worker(w, true);
             return false;
         }
         left -= want;
     }
     // All pixels are here. The worker must now end, cleanly and with nothing more to say.
     uint8_t extra;
-    ssize_t more = read_full(w.pipe, &extra, 1, w.deadline, kIdleMs);
-    bool clean = end_worker(&w, more != 0) && more == 0;
-    return send_end(c, clean ? kOk : kInvalid) && clean;
+    ssize_t more = read_full(w->pipe, &extra, 1, w->deadline, kIdleMs);
+    Ended e = end_worker(w, more != 0);
+    verdict = more != 0 ? kInvalid : e == Ended::kClean ? kOk : status_of(e);
+    return send_end(c, verdict);
+}
+
+// One request. Returns false when the connection must end (the host's stream is broken).
+bool serve_one(int c) {
+    Request rq;
+    if (read_full(c, &rq, sizeof(rq), now_ms() + kHostReadMs, kHostReadMs) != static_cast<ssize_t>(sizeof(rq))) {
+        return false;
+    }
+    if (rq.magic != kRequestMagic || rq.inputLen > kMaxInputBytes) return false;
+    int input = read_input(c, rq.inputLen);
+    if (input == -2) return false;
+    if (input < 0) return send_failure(c, kInternal);
+    // Only the first bytes, to pick the decoder. The memory file is read, not the broker's memory.
+    uint8_t magic[8] = {};
+    (void)!pread(input, magic, std::min<uint32_t>(rq.inputLen, sizeof(magic)), 0);
+    uint32_t format = detect_format(magic, std::min<uint32_t>(rq.inputLen, sizeof(magic)));
+    bool result;
+    {
+        struct Closer {
+            int fd;
+            ~Closer() { close(fd); }
+        } closer = {input};
+        if (rq.op == kOpPing) return send_reply(c, kOk, 0, 0, 0, 0, 0) && send_end(c, kOk);
+#ifdef DECODER_TEST_HOOKS
+        bool hook = rq.op == kOpHook;
+#else
+        bool hook = false;
+#endif
+        if (rq.op != kOpProbe && rq.op != kOpThumbnail && rq.op != kOpMetadata && !hook) return false;
+        if (!hook && format == kFormatUnknown) return send_failure(c, kUnsupported);
+        if (rq.op == kOpThumbnail &&
+            (rq.arg0 == 0 || rq.arg1 == 0 || rq.arg0 > kMaxDimension || rq.arg1 > kMaxDimension)) {
+            return send_failure(c, kInvalid);
+        }
+        Worker w;
+        if (!start_worker(rq, format, input, rq.inputLen, &w)) return send_failure(c, kInternal);
+        result = serve_worker(c, rq, format, hook, &w);
+    }
+    // Nothing of this request stays in the broker's memory either.
+    explicit_bzero(gStripe, sizeof(gStripe));
+    return result;
+}
+
+// The lockdown itself is tested before the broker serves anyone: a child locks down, says so, then makes a forbidden
+// system call and must be killed for it. Without a working seccomp the broker refuses to listen at all.
+bool lockdown_works() {
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) return false;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        if (lockdown(fds[1]) != 0) worker_exit(kExitLockdown);
+        (void)!write(0, "S", 1);
+        syscall(__NR_getppid);  // forbidden under strict mode: the kernel kills the process here
+        worker_exit(kExitOk);
+    }
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        return false;
+    }
+    char said = 0;
+    ssize_t n = read_full(fds[0], &said, 1, now_ms() + kZygoteMs, kZygoteMs);
+    close(fds[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    return n == 1 && said == 'S' && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
 }
 
 void setup() {
+#ifndef DECODER_HOST_TEST
     mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr);
+#endif
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_DFL);
     // A worker runs under another user, but it must not be able to attach to the broker either way.
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 }
 
-}  // namespace
-
-int main() {
-    setup();
-    void* arena = mmap(nullptr, kArenaBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    void* input = mmap(nullptr, kMaxInputBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                       -1, 0);
-    if (arena == MAP_FAILED || input == MAP_FAILED) return 1;
-    gArena = static_cast<uint8_t*>(arena);
-    gInput = static_cast<uint8_t*>(input);
-    warm_up();
+int listen_host(int argc, char** argv) {
+#ifdef DECODER_HOST_TEST
+    // Host test builds: a Unix socket instead of vsock, at the path given.
+    if (argc < 2) return -1;
+    int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, argv[1], sizeof(addr.sun_path) - 1);
+    unlink(argv[1]);
+    if (ls < 0 || bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(ls, 1) != 0) return -1;
+    return ls;
+#else
+    (void)argc;
+    (void)argv;
     int ls = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     sockaddr_vm addr = {};
     addr.svm_family = AF_VSOCK;
     addr.svm_port = kPort;
     addr.svm_cid = VMADDR_CID_ANY;
-    if (ls < 0 || bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(ls, 1) != 0) return 1;
+    if (ls < 0 || bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(ls, 1) != 0) return -1;
+    return ls;
+#endif
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    setup();
+    void* arena = mmap(nullptr, kArenaBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (arena == MAP_FAILED) return 1;
+    gArena = static_cast<uint8_t*>(arena);
+    warm_up();
+    // No seccomp, no service: Android sees a VM that never answers and fails closed.
+    if (!lockdown_works()) return 1;
+    if (!start_zygote()) return 1;
+    int ls = listen_host(argc, argv);
+    if (ls < 0) return 1;
     for (;;) {
         int c = accept4(ls, nullptr, nullptr, SOCK_CLOEXEC);
         if (c < 0) continue;
         // A host that stops reading ends the connection instead of blocking the broker.
         timeval tv = {60, 0};
         setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        // The input of each request is dropped once its worker is gone, so the VM holds no file between requests.
-        while (serve_one(c)) madvise(gInput, kMaxInputBytes, MADV_DONTNEED);
-        madvise(gInput, kMaxInputBytes, MADV_DONTNEED);
+        while (serve_one(c)) {
+        }
         close(c);
     }
 }

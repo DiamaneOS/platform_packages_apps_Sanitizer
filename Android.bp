@@ -28,6 +28,11 @@ aidl_interface {
     backend: {
         java: {
             sdk_version: "system_current",
+            min_sdk_version: "30",
+            apex_available: [
+                "//apex_available:platform",
+                "com.android.mediaprovider",
+            ],
         },
         cpp: {
             enabled: false,
@@ -36,6 +41,21 @@ aidl_interface {
             enabled: false,
         },
     },
+}
+
+// The callers' side in one library: the API and the checks every caller applies to what the service returns
+// (DecodeChecks). MediaProvider, SystemUI and the system server link this instead of keeping copies. Where a copy
+// cannot be avoided, tools/check-client-copy.sh compares it with these files.
+java_library {
+    name: "de.diamaneos.sanitizer.decode-client",
+    srcs: ["client/**/*.java"],
+    static_libs: ["de.diamaneos.sanitizer.decode-client"],
+    sdk_version: "system_current",
+    min_sdk_version: "30",
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.mediaprovider",
+    ],
 }
 
 // The decoder VM's whole userspace: one static program, /init of a raw protected VM. Built for the device, never
@@ -77,6 +97,28 @@ cc_test {
     auto_gen_config: false,
 }
 
+// Test only: the same program for the build machine, listening on a Unix socket instead of vsock and staying the
+// build user (it cannot change users), with the test hooks. The host checks run the real broker, zygote, workers,
+// lockdown and decoders through it, without a phone.
+cc_binary_host {
+    name: "decoder_vm_hosttest",
+    srcs: [
+        "vm/decoder_vm.cpp",
+        "vm/meta.cpp",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-DDECODER_HOST_TEST",
+        "-DDECODER_TEST_HOOKS",
+    ],
+    static_libs: [
+        "libjpeg",
+        "libpng",
+        "libz",
+    ],
+}
+
 // The initramfs: /init and the empty directories it mounts on. Fixed owner, times and inode numbers, so the same
 // program always gives the same bytes and the same signature. The virtualization APEX takes it with our guest kernel
 // as etc/decoder_vm_initrd.img and etc/fs/decoder_vm_kernel, so release signing signs both again with the key pvmfw
@@ -108,7 +150,7 @@ android_app {
     name: "DiamaneOSSanitizer",
     srcs: ["java/**/*.java"],
     resource_dirs: ["res"],
-    static_libs: ["de.diamaneos.sanitizer.decode-java"],
+    static_libs: ["de.diamaneos.sanitizer.decode-client"],
     sdk_version: "system_current",
     certificate: "platform",
     privileged: true,
@@ -126,7 +168,7 @@ android_app {
         "test/java/**/*.java",
     ],
     resource_dirs: ["res"],
-    static_libs: ["de.diamaneos.sanitizer.decode-java"],
+    static_libs: ["de.diamaneos.sanitizer.decode-client"],
     sdk_version: "system_current",
     system_ext_specific: true,
 }

@@ -25,6 +25,7 @@ import android.os.SystemClock;
 import android.os.UserHandle;
 import android.util.Log;
 
+import de.diamaneos.sanitizer.decode.DecodeChecks;
 import de.diamaneos.sanitizer.decode.DecodeRequest;
 import de.diamaneos.sanitizer.decode.IDecodeService;
 import de.diamaneos.sanitizer.decode.ImageInfo;
@@ -36,6 +37,11 @@ import java.security.SecureRandom;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * IDecodeService for MediaProvider, SystemUI and the system server, bound with the action
@@ -52,8 +58,6 @@ public final class DecodeService extends Service {
     // How long a caller waits, queue included. The VM's own work has its own budget (Decoder).
     private static final long USER_WAITING_MILLIS = 20000;
     private static final long BACKGROUND_MILLIS = 60000;
-    // A probe reads only the header, which lies in the first megabyte of any PNG or JPEG worth showing.
-    private static final int PROBE_BYTES = 1 << 20;
     // Handles of decoded thumbnails: per caller, at most this many and this long. Their pixels count against the
     // decoder's memory budget until released or expired.
     private static final int MAX_HANDLES_PER_UID = 16;
@@ -105,6 +109,14 @@ public final class DecodeService extends Service {
         throw new SecurityException("not an allowed caller of the decode service");
     }
 
+    // Reads of caller files run here, so a read that never returns (a stalled FUSE file) costs a reader thread, not a
+    // binder thread. Such reads are counted per lane until they end, and capped (Decoder.admit).
+    private static final ExecutorService READERS = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "decoder-read");
+        t.setDaemon(true);
+        return t;
+    });
+
     private Decoder.Request run(DecodeRequest request, int op, int a, int b) {
         boolean waiting = request != null && request.priority == IDecodeService.PRIORITY_USER_WAITING;
         long deadline = SystemClock.uptimeMillis() + (waiting ? USER_WAITING_MILLIS : BACKGROUND_MILLIS);
@@ -114,19 +126,83 @@ public final class DecodeService extends Service {
             failed.status = GuestLink.INVALID;
             return failed;
         }
-        FdChannel.Input in;
-        try (FdChannel channel = new FdChannel(request.file)) {
-            in = channel.readInput(op == GuestLink.OP_PROBE ? PROBE_BYTES : IDecodeService.MAX_INPUT_BYTES,
-                    op == GuestLink.OP_PROBE, SystemClock.uptimeMillis() + READ_MILLIS, mDecoder);
-        } catch (IOException e) {
-            failed.status = GuestLink.INVALID;
+        // Fairness before memory: a lane that is busy or has stuck reads is refused before anything is allocated.
+        if (!mDecoder.admit(lane)) {
+            closeQuietly(request);
             return failed;
         }
-        if (in.status != FdChannel.Input.OK) {
-            failed.status = in.status == FdChannel.Input.NO_MEMORY ? Decoder.UNAVAILABLE : GuestLink.INVALID;
-            return failed;
+        try {
+            FdChannel.Input in = read(request, op, lane);
+            if (in == null) return failed; // the read did not end in time: unavailable
+            if (in.status != FdChannel.Input.OK) {
+                failed.status = in.status == FdChannel.Input.NO_MEMORY ? Decoder.UNAVAILABLE : GuestLink.INVALID;
+                return failed;
+            }
+            return mDecoder.run(new Decoder.Request(op, a, b, in.data, in.len, in.reserved, lane, waiting,
+                    deadline));
+        } finally {
+            mDecoder.leave(lane);
         }
-        return mDecoder.run(new Decoder.Request(op, a, b, in.data, in.len, in.reserved, lane, waiting, deadline));
+    }
+
+    // Reads the caller's file on a reader thread, waiting at most READ_MILLIS. Null when it did not end in time: the
+    // thread stays stuck in the read, counted against the lane until it ends, and gives back its memory then.
+    private FdChannel.Input read(DecodeRequest request, int op, String lane) {
+        int max = op == GuestLink.OP_PROBE ? IDecodeService.MAX_PROBE_BYTES : IDecodeService.MAX_INPUT_BYTES;
+        long deadline = SystemClock.uptimeMillis() + READ_MILLIS;
+        FdChannel channel = new FdChannel(request.file);
+        Object lock = new Object();
+        boolean[] abandoned = {false};
+        Future<FdChannel.Input> f = READERS.submit(() -> {
+            FdChannel.Input in = channel.readInput(max, op == GuestLink.OP_PROBE, deadline, mDecoder, lane);
+            synchronized (lock) {
+                if (abandoned[0]) {
+                    // Too late: nobody takes this input any more.
+                    if (in.status == FdChannel.Input.OK) mDecoder.release(lane, in.reserved);
+                    mDecoder.stuck(lane, -1);
+                    in = null;
+                }
+            }
+            try {
+                channel.close();
+            } catch (IOException ignored) {
+                // closed already
+            }
+            return in;
+        });
+        try {
+            return f.get(READ_MILLIS + 1000, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            synchronized (lock) {
+                if (!f.isDone()) {
+                    abandoned[0] = true;
+                    mDecoder.stuck(lane, 1);
+                }
+            }
+            if (!abandoned[0]) {
+                try {
+                    return f.get();
+                } catch (Exception again) {
+                    return null;
+                }
+            }
+            try {
+                channel.close(); // may not wake a FUSE read, but frees what it can
+            } catch (IOException ignored) {
+                // closed already
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static void closeQuietly(DecodeRequest request) {
+        try {
+            request.file.close();
+        } catch (IOException ignored) {
+            // closed already
+        }
     }
 
     static int status(int vmStatus) {
@@ -153,6 +229,11 @@ public final class DecodeService extends Service {
                     info.width = r.answer.width;
                     info.height = r.answer.height;
                     info.animated = r.answer.extra == 1;
+                }
+                // The callers' own checks, once more before anything leaves.
+                if (DecodeChecks.check(info) != null) {
+                    info = new ImageInfo();
+                    info.status = IDecodeService.STATUS_INVALID;
                 }
             } catch (Throwable t) {
                 Log.e(TAG, "probe", t);
@@ -235,7 +316,7 @@ public final class DecodeService extends Service {
             expire();
             int held = 0;
             for (Held h : mHandles.values()) if (h.uid == uid) held++;
-            if (held >= MAX_HANDLES_PER_UID || !mDecoder.reserve(a.pixels.length)) {
+            if (held >= MAX_HANDLES_PER_UID || !mDecoder.reserve("uid:" + uid, a.pixels.length)) {
                 t.status = IDecodeService.STATUS_UNAVAILABLE;
                 return t;
             }
@@ -250,6 +331,12 @@ public final class DecodeService extends Service {
             mHandles.put(handle, new Held(uid, a.pixels, a.width, a.height, t.stripeRows,
                     SystemClock.uptimeMillis() + IDecodeService.HANDLE_TIMEOUT_MILLIS));
             t.handle = handle;
+            if (DecodeChecks.check(t, maxWidth, maxHeight) != null) {
+                drop(handle, mHandles.get(handle));
+                Thumbnail bad = new Thumbnail();
+                bad.status = IDecodeService.STATUS_INVALID;
+                return bad;
+            }
         }
         return t;
     }
@@ -257,7 +344,7 @@ public final class DecodeService extends Service {
     // With mHandles held.
     private void drop(long handle, Held h) {
         mHandles.remove(handle);
-        mDecoder.release(h.pixels.length);
+        mDecoder.release("uid:" + h.uid, h.pixels.length);
     }
 
     static MetadataRecord metadata(Decoder.Request r) {
@@ -297,6 +384,11 @@ public final class DecodeService extends Service {
         m.instanceId = v.instanceId;
         m.originalDocumentId = v.originalDocumentId;
         m.specialFormat = v.specialFormat;
+        if (DecodeChecks.check(m, System.currentTimeMillis()) != null) {
+            Decoder.Request bad = new Decoder.Request(GuestLink.OP_METADATA, 0, 0, null, 0, 0, "", false, 0);
+            bad.status = GuestLink.INVALID;
+            return metadata(bad);
+        }
         return m;
     }
 
@@ -308,7 +400,7 @@ public final class DecodeService extends Service {
             Held h = it.next().getValue();
             if (h.expires <= now) {
                 it.remove();
-                mDecoder.release(h.pixels.length);
+                mDecoder.release("uid:" + h.uid, h.pixels.length);
             }
         }
     }

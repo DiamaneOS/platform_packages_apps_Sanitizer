@@ -30,8 +30,11 @@ public final class DecoderApp extends Application implements DecoderProvider {
     static final File VM_KERNEL = new File("/apex/com.android.virt/etc/fs/decoder_vm_kernel");
     static final File VM_INITRD = new File("/apex/com.android.virt/etc/decoder_vm_initrd.img");
 
-    /** The VM's memory. Measured on the FP6: see the decode service notes. */
-    static final long VM_MEMORY_BYTES = 128L << 20;
+    /**
+     * The VM's memory. The worst case the limits allow: a 32 MiB file in a memory file, a 64 MiB worker arena, the
+     * kernel, the broker and the zygote. 160 MiB until a phone run measures the floor.
+     */
+    static final long VM_MEMORY_BYTES = 160L << 20;
 
     private static final String PERMISSION = "de.diamaneos.sanitizer.permission.DECODE";
     private static final String[] CALLERS = {

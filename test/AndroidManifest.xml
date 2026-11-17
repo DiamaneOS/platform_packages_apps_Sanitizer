@@ -41,6 +41,10 @@
                 <action android:name="de.diamaneos.sanitizer.action.DECODE" />
             </intent-filter>
         </service>
+        <provider
+            android:name=".HealthProvider"
+            android:authorities="de.diamaneos.sanitizer.test.health"
+            android:exported="false" />
         <activity
             android:name=".SelfTestActivity"
             android:exported="true"

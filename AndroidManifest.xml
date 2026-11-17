@@ -48,5 +48,11 @@
                 <action android:name="de.diamaneos.sanitizer.action.DECODE" />
             </intent-filter>
         </service>
+        <!-- The health check for the release suite: only its dump, which only shell or root can run (dumpsys). -->
+        <provider
+            android:name=".HealthProvider"
+            android:authorities="de.diamaneos.sanitizer.health"
+            android:exported="false"
+            android:directBootAware="true" />
     </application>
 </manifest>

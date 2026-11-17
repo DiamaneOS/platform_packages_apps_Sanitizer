@@ -381,7 +381,7 @@ public class SelfTestActivity extends Activity {
             return;
         }
         java.util.Arrays.sort(files);
-        for (long mib : new long[] {64, 96, 128}) {
+        for (long mib : new long[] {96, 128, 160}) {
             GuestVm vm = new GuestVm(this, new File(source, "kernel"), new File(source, "initrd.img"),
                     mib << 20);
             Decoder d = new Decoder(vm);
@@ -428,8 +428,9 @@ public class SelfTestActivity extends Activity {
                     fail("vm " + mib + " MiB cache " + f.getName(), cms + " ms");
                 }
             }
-            if (mib == 128) lockdownChecks(d);
-            if (mib == 128) failClosedChecks(vm, d, read(files[0]), source);
+            if (mib == 160) lockdownChecks(d);
+            if (mib == 160) leakChecks(d, images);
+            if (mib == 160) failClosedChecks(vm, d, read(files[0]), source);
             vm.stop();
         }
         binderChecks(images);
@@ -561,7 +562,8 @@ public class SelfTestActivity extends Activity {
             long t0 = SystemClock.uptimeMillis();
             Decoder.Request r = call(d, GuestLink.OP_HOOK, hook, 0, null, 45000);
             long ms = SystemClock.uptimeMillis() - t0;
-            if (r.status == GuestLink.INVALID) {
+            // Killed: the worker died, which is no verdict on a file, so "unavailable" (never cached).
+            if (r.status == Decoder.UNAVAILABLE && r.died) {
                 pass("lockdown kills " + names[hook], ms + " ms");
             } else {
                 fail("lockdown kills " + names[hook], "status " + r.status + (r.answer != null
@@ -569,6 +571,43 @@ public class SelfTestActivity extends Activity {
                         + " ms");
             }
         }
+    }
+
+    private void leakChecks(Decoder d, File images) throws Exception {
+        // Another request's metadata must not reach the next worker: a worker scans its own memory for it.
+        byte[] seed = read(new File(images, "exif-seed.jpg"));
+        String marker = "LK" + Long.toHexString(System.nanoTime() & 0xffffffffffL);
+        marker = (marker + "0000000000").substring(0, 12); // the length of "Holiday shot"
+        byte[] withMarker = replace(seed, "Holiday shot".getBytes(), marker.getBytes());
+        Decoder.Request meta = call(d, GuestLink.OP_METADATA, 0, 0, withMarker, 20000);
+        Decoder.Request scan = hookCall(d, 6, marker.getBytes());
+        Decoder.Request control = hookCall(d, 6, "DSR2".getBytes());
+        boolean ok = meta.status == GuestLink.OK && marker.equals(meta.answer.meta.description)
+                && scan.status == GuestLink.OK && scan.answer.pixels[0] == 0 && control.status == GuestLink.OK
+                && control.answer.pixels[0] == 1;
+        if (ok) {
+            pass("no leak between requests", "marker not found in the next worker, the control found");
+        } else {
+            fail("no leak between requests", "meta " + meta.status + " scan " + scan.status
+                    + (scan.answer != null && scan.answer.pixels != null ? " found " + scan.answer.pixels[0] : "")
+                    + " control " + control.status);
+        }
+    }
+
+    private Decoder.Request hookCall(Decoder d, int hook, byte[] input) {
+        return d.run(new Decoder.Request(GuestLink.OP_HOOK, hook, 0, input, input.length, 0, "selftest", true,
+                SystemClock.uptimeMillis() + 30000));
+    }
+
+    private static byte[] replace(byte[] in, byte[] from, byte[] to) {
+        byte[] out = in.clone();
+        outer:
+        for (int i = 0; i + from.length <= in.length; i++) {
+            for (int j = 0; j < from.length; j++) if (in[i + j] != from[j]) continue outer;
+            System.arraycopy(to, 0, out, i, to.length);
+            return out;
+        }
+        return out;
     }
 
     private void failClosedChecks(GuestVm vm, Decoder d, byte[] file, File source) throws Exception {

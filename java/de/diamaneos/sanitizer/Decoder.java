@@ -20,40 +20,57 @@ import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The decode service's core: the queue, the cache, the VM and its restarts, and one memory budget for everything the
- * service holds for callers (their files while read and queued, decoded thumbnails until fetched). Every way to fail
- * ends in an answer the caller treats as fail closed: {@link #UNAVAILABLE} (ask again later) or a VM status. Nothing
- * here ever parses a file: the bytes go to the VM as they are.
+ * service holds for callers (their files while read and queued, pixels while received, decoded thumbnails until
+ * fetched). Every way to fail ends in an answer the caller treats as fail closed: {@link #UNAVAILABLE} (ask again
+ * later) or a VM status. Nothing here ever parses a file: the bytes go to the VM as they are.
+ *
+ * <p>Fairness comes before memory: each lane (the package that supplied the bytes) may have at most
+ * {@link #MAX_ACTIVE_PER_LANE} requests in the service and at most a quarter of the budget, checked before anything
+ * is allocated, so one app cannot take the budget from the others.
  *
  * <p>Two clocks: a request's deadline bounds how long its caller waits (queue included). Once the VM works on it, the
  * call gets its own budget, longer than the VM's own worker limit, so a request that waited in the queue never cuts
- * the VM short. Only a VM that stays silent past that budget, or breaks the protocol, is restarted.
+ * the VM short. Only a VM that stays silent past that budget, or breaks the protocol, is restarted. A worker that died
+ * (seccomp's kill, the CPU limit, the wall deadline) costs no restart: it answers "unavailable", and the same file
+ * doing it twice is answered INVALID from then on.
  */
-final class Decoder {
+final class Decoder implements GuestLink.Budget {
     private static final String TAG = "DecoderService";
 
     /** Not a VM status: the VM could not answer in time, try again later. */
     static final int UNAVAILABLE = -1;
 
-    // The VM ends a worker after 30 s of wall time and answers INVALID. Its answer then still has to cross the link.
+    // The VM ends a worker after 30 s of wall time. Its answer then still has to cross the link.
     static final long CALL_BUDGET_MILLIS = 45000;
     // Restart backoff after a failed start or a broken link: 1 s doubling to 5 minutes, never giving up.
     static final long BACKOFF_MIN = 1000;
     static final long BACKOFF_MAX = 300000;
-    // Everything held for callers at once: files being read or queued, thumbnails not yet fetched.
+    // Everything held for callers at once, and the share one lane may hold.
     static final long MAX_HELD_BYTES = 128L << 20;
-    // A file that broke the link this many times is answered INVALID from then on.
+    static final long MAX_LANE_BYTES = MAX_HELD_BYTES / 4;
+    // Requests one lane may have in the service at once (reading, queued or with the VM).
+    static final int MAX_ACTIVE_PER_LANE = 32;
+    // Reads that never ended (a stalled pipe or FUSE file): per lane, and in all.
+    static final int MAX_STUCK_PER_LANE = 2;
+    static final int MAX_STUCK = 16;
+    // A file that made a worker die this many times is answered INVALID from then on.
     static final int STRIKES = 2;
 
     private final GuestVm mVm;
     private final Scheduler mScheduler = new Scheduler();
     private final ResultCache mCache = new ResultCache();
-    private final AtomicLong mHeld = new AtomicLong();
+    private final Object mLock = new Object();
+    private long mHeld;
+    private final Map<String, Long> mLaneHeld = new HashMap<>();
+    private final Map<String, Integer> mActive = new HashMap<>();
+    private final Map<String, Integer> mStuck = new HashMap<>();
+    private int mStuckTotal;
     private final Map<String, Integer> mStrikes = new LinkedHashMap<String, Integer>(64, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, Integer> eldest) {
@@ -78,21 +95,62 @@ final class Decoder {
         mCache.clear();
     }
 
-    /** Takes n bytes from the memory budget. False when that would pass it: the caller answers unavailable. */
-    boolean reserve(long n) {
-        for (;;) {
-            long held = mHeld.get();
-            if (n < 0 || held + n > MAX_HELD_BYTES) return false;
-            if (mHeld.compareAndSet(held, held + n)) return true;
+    // --- Admission and memory ---------------------------------------------------------------------------------------
+
+    /** Lets a request of this lane into the service, or refuses it (its lane is busy or stuck). Pair with leave. */
+    boolean admit(String lane) {
+        synchronized (mLock) {
+            int active = mActive.getOrDefault(lane, 0);
+            if (active >= MAX_ACTIVE_PER_LANE || mStuck.getOrDefault(lane, 0) >= MAX_STUCK_PER_LANE
+                    || mStuckTotal >= MAX_STUCK) {
+                return false;
+            }
+            mActive.put(lane, active + 1);
+            return true;
         }
     }
 
-    void release(long n) {
-        mHeld.addAndGet(-n);
+    void leave(String lane) {
+        synchronized (mLock) {
+            int active = mActive.getOrDefault(lane, 0) - 1;
+            if (active <= 0) mActive.remove(lane); else mActive.put(lane, active);
+        }
+    }
+
+    /** A read of this lane did not end in time. Counted until it does end (if ever). */
+    void stuck(String lane, int delta) {
+        synchronized (mLock) {
+            int n = mStuck.getOrDefault(lane, 0) + delta;
+            if (n <= 0) mStuck.remove(lane); else mStuck.put(lane, n);
+            mStuckTotal += delta;
+        }
+    }
+
+    @Override
+    public boolean reserve(String lane, long n) {
+        synchronized (mLock) {
+            long laneHeld = mLaneHeld.getOrDefault(lane, 0L);
+            if (n < 0 || mHeld + n > MAX_HELD_BYTES || laneHeld + n > MAX_LANE_BYTES) return false;
+            mHeld += n;
+            mLaneHeld.put(lane, laneHeld + n);
+            return true;
+        }
+    }
+
+    @Override
+    public void release(String lane, long n) {
+        if (n == 0) return;
+        synchronized (mLock) {
+            mHeld -= n;
+            long laneHeld = mLaneHeld.getOrDefault(lane, 0L) - n;
+            if (laneHeld <= 0) mLaneHeld.remove(lane); else mLaneHeld.put(lane, laneHeld);
+        }
     }
 
     long held() {
-        return mHeld.get();
+        synchronized (mLock) {
+            return mHeld;
+        }
     }
 
     /** Starts the VM in the background, so the first request does not wait for it. */
@@ -106,9 +164,10 @@ final class Decoder {
         final int op, a, b;
         final byte[] file;
         final int len;
-        final long reserved; // budget held for this request, given back when it is done
+        final long reserved; // budget held for the file, given back when the request is done
         volatile int status = UNAVAILABLE;
         volatile GuestLink.Answer answer;
+        volatile boolean died; // a worker died, or the link broke, on this file
 
         Request(int op, int a, int b, byte[] file, int len, long reserved, String lane, boolean userWaiting,
                 long deadline) {
@@ -130,7 +189,7 @@ final class Decoder {
     /**
      * Runs the request and returns it with its status: a VM status for a clean answer, or UNAVAILABLE. Blocks the
      * calling thread until done or until the request's deadline. The request's reserved budget is given back here or
-     * by the worker, exactly once.
+     * by the worker thread, exactly once.
      */
     Request run(Request r) {
         String digest = null;
@@ -141,14 +200,14 @@ final class Decoder {
             key = ResultCache.key(d, r.op, r.a, r.b);
             GuestLink.Answer hit = mCache.get(key);
             if (hit != null) {
-                release(r.reserved);
+                release(r.lane, r.reserved);
                 r.answer = hit;
                 r.status = hit.status;
                 return r;
             }
         }
         if (!mScheduler.offer(r)) {
-            release(r.reserved);
+            release(r.lane, r.reserved);
             return r;
         }
         try {
@@ -159,14 +218,11 @@ final class Decoder {
         }
         if (key != null && r.answer != null && r.status != UNAVAILABLE) {
             mCache.put(key, r.answer);
-        } else if (digest != null && r.status == UNAVAILABLE && r.answer == BROKE_LINK) {
+        } else if (digest != null && r.died) {
             strike(digest, key, r);
         }
         return r;
     }
-
-    // Marks an answer the worker set when this request's file broke the link.
-    private static final GuestLink.Answer BROKE_LINK = new GuestLink.Answer();
 
     private void strike(String digest, Object key, Request r) {
         int n;
@@ -175,15 +231,12 @@ final class Decoder {
             mStrikes.put(digest, n);
         }
         if (n >= STRIKES) {
-            // Twice now: not bad luck but the file. Answered INVALID and remembered, so it cannot keep the VM
-            // restarting.
+            // Twice now: not bad luck but the file. Answered INVALID and remembered.
             GuestLink.Answer a = new GuestLink.Answer();
             a.status = GuestLink.INVALID;
             mCache.put(key, a);
             r.answer = a;
             r.status = GuestLink.INVALID;
-        } else {
-            r.answer = null;
         }
     }
 
@@ -198,11 +251,18 @@ final class Decoder {
             Request r = (Request) job;
             try {
                 if (r.deadline > SystemClock.uptimeMillis()) handle(r);
-            } catch (RuntimeException e) {
-                Log.e(TAG, "request failed", e);
+            } catch (Throwable t) {
+                // Out of memory included: this request is unavailable, the service stays up.
+                Log.e(TAG, "request failed", t);
                 r.status = UNAVAILABLE;
+                r.answer = null;
             } finally {
-                release(r.reserved);
+                release(r.lane, r.reserved);
+                GuestLink.Answer a = r.answer;
+                if (a != null && a.reserved > 0) {
+                    release(r.lane, a.reserved);
+                    a.reserved = 0;
+                }
                 r.finish();
             }
         }
@@ -221,6 +281,7 @@ final class Decoder {
             backOff();
             return;
         }
+        link.setBudget(this, r.lane);
         try {
             GuestLink.Answer a;
             switch (r.op) {
@@ -231,16 +292,22 @@ final class Decoder {
                 case GuestLink.OP_HOOK: a = link.hook(r.a, budget); break;
                 default: throw new IllegalArgumentException("op");
             }
-            r.answer = a;
-            r.status = a.status == GuestLink.INTERNAL ? UNAVAILABLE : a.status;
             mBackoff = BACKOFF_MIN;
+            if (a.status == GuestLink.INTERNAL) {
+                // A worker died, or the service had no memory for the pixels: no verdict on the file, not cached.
+                r.status = UNAVAILABLE;
+                r.died = true;
+                return;
+            }
+            r.answer = a;
+            r.status = a.status;
         } catch (IOException e) {
             // Silent past the budget, or a reply that broke the protocol: the link and the VM are not trusted any
             // more. The request is unavailable, never cached as a verdict on the file, unless the same file does it
-            // again (see strike).
+            // again. A worker cannot cause this: the broker checks everything a worker sends.
             Log.w(TAG, "VM link broken: " + e.getMessage());
             r.status = UNAVAILABLE;
-            r.answer = r.op == GuestLink.OP_PING || r.op == GuestLink.OP_HOOK ? null : BROKE_LINK;
+            r.died = r.op != GuestLink.OP_PING && r.op != GuestLink.OP_HOOK;
             mVm.stop();
             backOff();
         }
