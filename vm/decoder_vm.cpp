@@ -39,6 +39,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -56,6 +57,7 @@
 #include <jpeglib.h>
 #include <png.h>
 
+#include "image.h"
 #include "meta.h"
 #include "proto.h"
 
@@ -87,11 +89,6 @@ static void wipe(void* p, size_t n) {
 
 namespace {
 
-// A worker's whole heap. Under strict seccomp it cannot map more, so this is the most a worker can use besides its
-// stack. It fits an interlaced PNG of kMaxPixels or the coefficients of a progressive JPEG of about 20 MP.
-constexpr size_t kArenaBytes = 64u << 20;
-constexpr size_t kStripeBytes = 64u << 10;
-
 // Deadlines. The worker's CPU time is capped by the kernel, its wall time by the broker. The host link is trusted but
 // a stalled read still ends the connection.
 constexpr int kWorkerCpuSeconds = 20;
@@ -112,31 +109,6 @@ constexpr uint32_t kHookFork = 5;
 constexpr uint32_t kHookScan = 6;
 constexpr uint32_t kHookBadPixels = 7;
 #endif
-
-// ---------------------------------------------------------------------------------------------------------------
-// Memory. In a worker: a bump allocator over a mapping the broker reserved and never touches, so each worker starts
-// from fresh zero pages and gives everything back by exiting. In the broker (the warm-up decode): malloc.
-
-uint8_t* gArena = nullptr;
-size_t gArenaUsed = 0;
-bool gInWorker = false;
-
-void* arena_alloc(size_t n) {
-    if (!gInWorker) return malloc(n);
-    size_t need = (n + 15) & ~static_cast<size_t>(15);
-    if (need < n || need > kArenaBytes - gArenaUsed) return nullptr;
-    void* p = gArena + gArenaUsed;
-    gArenaUsed += need;
-    return p;
-}
-
-void arena_free(void* p) {
-    if (!gInWorker) free(p);
-}
-
-size_t arena_left() {
-    return gInWorker ? kArenaBytes - gArenaUsed : kArenaBytes;
-}
 
 }  // namespace
 
@@ -169,16 +141,12 @@ long jpeg_mem_init(j_common_ptr) {
 void jpeg_mem_term(j_common_ptr) {}
 }
 
-namespace {
+namespace decoder {
 
 // ---------------------------------------------------------------------------------------------------------------
 // Output: a stripe buffer flushed to the pipe. fd -1 discards (the warm-up).
 
-struct Sink {
-    int fd;
-    uint8_t* buf;
-    size_t used;
-};
+Outcome gOutcome = {};
 
 bool write_all(int fd, const void* data, size_t n) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -218,7 +186,6 @@ uint32_t le32(const uint8_t* b) {
     return b[0] | b[1] << 8 | b[2] << 16 | static_cast<uint32_t>(b[3]) << 24;
 }
 
-// The worker's thumbnail header to the broker: "DSR2", width, height, rotation.
 uint32_t gRotation = 0;
 
 bool sink_header(Sink* s, uint32_t w, uint32_t h) {
@@ -251,18 +218,8 @@ void fit_box(uint32_t iw, uint32_t ih, uint32_t maxW, uint32_t maxH, uint32_t* o
     *oh = static_cast<uint32_t>(h);
 }
 
-struct Scaler {
-    uint32_t iw, ih, ow, oh;
-    uint32_t y;  // input rows taken
-    uint32_t p;  // output rows sent
-    uint64_t* hrow;
-    uint64_t* acc;
-    uint8_t* out;
-    Sink* sink;
-};
-
 bool scaler_init(Scaler* s, uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh, Sink* sink) {
-    *s = {iw, ih, ow, oh, 0, 0, nullptr, nullptr, nullptr, sink};
+    *s = {iw, ih, ow, oh, 0, 0, nullptr, nullptr, nullptr, sink, false};
     if (ow > iw || oh > ih || ow == 0 || oh == 0) return false;
     if (ow == iw && oh == ih) return true;
     size_t n = static_cast<size_t>(ow) * 4;
@@ -308,7 +265,7 @@ bool scaler_emit(Scaler* s) {
 
 bool scaler_push(Scaler* s, uint8_t* row) {
     if (s->y >= s->ih) return false;
-    premultiply(row, s->iw);
+    if (!s->premultiplied) premultiply(row, s->iw);
     if (s->hrow == nullptr) {  // same size
         s->y++;
         s->p++;
@@ -343,6 +300,12 @@ bool scaler_push(Scaler* s, uint8_t* row) {
 
 bool scaler_done(const Scaler* s) {
     return s->y == s->ih && s->p == s->oh;
+}
+
+bool start_output(Scaler* s, uint32_t iw, uint32_t ih, uint32_t maxW, uint32_t maxH, Sink* sink) {
+    uint32_t ow, oh;
+    fit_box(iw, ih, maxW, maxH, &ow, &oh);
+    return scaler_init(s, iw, ih, ow, oh, sink) && sink_header(sink, ow, oh);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -537,22 +500,109 @@ bool decode_jpeg(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
     return done && sink_flush(sink);
 }
 
-uint32_t detect_format(const uint8_t* b, size_t n) {
+}  // namespace decoder
+
+namespace {
+
+// The broker reads this much of the file's start to pick the decoder, and nothing else of it.
+constexpr size_t kMagicBytes = 64;
+
+bool brand_in(const uint8_t* b, const char* const* list) {
+    for (; *list != nullptr; list++) {
+        if (memcmp(b, *list, 4) == 0) return true;
+    }
+    return false;
+}
+
+// HEIF or AVIF from the ftyp box's major and compatible brands. A file that lists both is what its major brand says,
+// else AVIF. The decoder reads either codec, so the choice only names the format.
+uint32_t detect_isobmff(const uint8_t* b, size_t n) {
+    static const char* const kHeif[] = {"heic", "heix", "heim", "heis", "hevc", "hevx", "hevm", "hevs", nullptr};
+    static const char* const kAvif[] = {"avif", "avis", nullptr};
+    uint32_t boxSize = static_cast<uint32_t>(b[0]) << 24 | b[1] << 16 | b[2] << 8 | b[3];
+    if (n < 16 || boxSize < 16) return kFormatUnknown;
+    if (brand_in(b + 8, kAvif)) return kFormatAvif;
+    if (brand_in(b + 8, kHeif)) return kFormatHeif;
+    size_t end = std::min<size_t>(n, boxSize);
+    bool heif = false;
+    for (size_t at = 16; at + 4 <= end; at += 4) {
+        if (brand_in(b + at, kAvif)) return kFormatAvif;
+        heif = heif || brand_in(b + at, kHeif);
+    }
+    return heif ? kFormatHeif : kFormatUnknown;
+}
+
+// WBMP has no signature: type 0, a fixed header byte with only the extension bits possibly set, then width and height
+// as multi-byte integers. Checked as strictly as the format allows, against the whole input's length, and only after
+// every format with a signature.
+bool is_wbmp(const uint8_t* b, size_t n, uint64_t total) {
+    if (n < 4 || b[0] != 0 || (b[1] & 0x9f) != 0) return false;
+    size_t at = 2;
+    uint32_t dim[2];
+    for (uint32_t& d : dim) {
+        uint64_t v = 0;
+        int k = 0;
+        for (;; k++) {
+            if (at >= n || k >= 3) return false;
+            uint8_t c = b[at++];
+            v = v << 7 | (c & 0x7f);
+            if ((c & 0x80) == 0) break;
+        }
+        if (v == 0 || v > kMaxDimension) return false;
+        d = static_cast<uint32_t>(v);
+    }
+    return at + static_cast<uint64_t>((dim[0] + 7) / 8) * dim[1] <= total;
+}
+
+uint32_t detect_format(const uint8_t* b, size_t n, uint64_t total) {
     if (n >= 8 && memcmp(b, "\x89PNG\r\n\x1a\n", 8) == 0) return kFormatPng;
     if (n >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff) return kFormatJpeg;
+    if (n >= 6 && (memcmp(b, "GIF87a", 6) == 0 || memcmp(b, "GIF89a", 6) == 0)) return kFormatGif;
+    if (n >= 12 && memcmp(b, "RIFF", 4) == 0 && memcmp(b + 8, "WEBP", 4) == 0) return kFormatWebp;
+    if (n >= 14 && b[0] == 'B' && b[1] == 'M') return kFormatBmp;
+    if (n >= 6 && b[0] == 0 && b[1] == 0 && (b[2] == 1 || b[2] == 2) && b[3] == 0 && (b[4] | b[5]) != 0) {
+        return kFormatIco;
+    }
+    if (n >= 16 && memcmp(b + 4, "ftyp", 4) == 0) return detect_isobmff(b, n);
+    // A TIFF file: the worker decodes it only when it is a DNG, and answers UNSUPPORTED otherwise.
+    if (n >= 8 && (memcmp(b, "II*\0", 4) == 0 || memcmp(b, "MM\0*", 4) == 0)) return kFormatDng;
+    if (is_wbmp(b, n, total)) return kFormatWbmp;
     return kFormatUnknown;
+}
+
+DecodeFn decoder_for(uint32_t format) {
+    switch (format) {
+        case kFormatJpeg: return decode_jpeg;
+        case kFormatPng: return decode_png;
+        case kFormatGif: return decode_gif;
+        case kFormatWebp: return decode_webp;
+        case kFormatBmp: return decode_bmp;
+        case kFormatHeif: return decode_heif;
+        case kFormatAvif: return decode_heif;
+        case kFormatDng: return decode_dng;
+        case kFormatIco: return decode_ico;
+        case kFormatWbmp: return decode_wbmp;
+        default: return nullptr;
+    }
 }
 
 bool decode_any(uint32_t format, const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink,
                 bool headerOnly, uint32_t* w, uint32_t* h) {
-    return format == kFormatPng ? decode_png(data, size, maxW, maxH, sink, headerOnly, w, h)
-                                : decode_jpeg(data, size, maxW, maxH, sink, headerOnly, w, h);
+    DecodeFn fn = decoder_for(format);
+    return fn != nullptr && fn(data, size, maxW, maxH, sink, headerOnly, w, h);
+}
+
+// Formats whose files can hold more than one frame (the contract allows animated only for these).
+bool may_be_animated(uint32_t format) {
+    return format == kFormatGif || format == kFormatWebp || format == kFormatPng || format == kFormatHeif ||
+           format == kFormatAvif;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Warm-up. Both decoders check the CPU's features once on first use, which may read /proc. libjpeg-turbo keeps the
-// result per thread, so the broker decodes two tiny images before it forks any worker. A locked-down worker would be
-// killed by the check.
+// Warm-up. libjpeg-turbo and libpng check the CPU's features once on first use, which may read /proc. libjpeg-turbo
+// keeps the result per thread, so the broker decodes two tiny images before it forks any worker. dav1d reads
+// /proc/cpuinfo once per process when its first decoder opens, and libwebp sets up its function tables once: their
+// warm-ups run here too. A locked-down worker would be killed by any of these checks.
 
 #include "warmup_images.h"
 
@@ -563,6 +613,8 @@ void warm_up() {
     decode_png(kWarmupPng, sizeof(kWarmupPng), 5, 3, &sink, false, &w, &h);
     decode_jpeg(kWarmupJpeg, sizeof(kWarmupJpeg), 5, 3, &sink, false, &w, &h);
     free(sink.buf);
+    warm_up_webp();
+    warm_up_heif();
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -575,6 +627,7 @@ void warm_up() {
 constexpr int kExitOk = 0;
 constexpr int kExitDecodeFailed = 3;
 constexpr int kExitLockdown = 4;
+constexpr int kExitUnsupported = 6;  // a valid file of a kind the VM does not decode
 
 [[noreturn]] void worker_exit(int code) {
     syscall(__NR_exit, code);
@@ -665,8 +718,7 @@ int lockdown(int out) {
         worker_exit(kExitLockdown);
     }
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) worker_exit(kExitLockdown);
-    gInWorker = true;
-    gArenaUsed = 0;
+    arena_enter_worker();
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0) != 0) return errno;
     return 0;
 }
@@ -714,14 +766,17 @@ int lockdown(int out) {
 
     Sink sink = {0, static_cast<uint8_t*>(arena_alloc(kStripeBytes)), 0};
     if (sink.buf == nullptr) worker_exit(kExitDecodeFailed);
+    // A decode that failed: UNSUPPORTED when the decoder found a valid file of a kind it does not read.
+    auto failed = [] { return gOutcome.unsupported ? kExitUnsupported : kExitDecodeFailed; };
     if (rq.op == kOpProbe) {
         uint32_t w = 0, h = 0;
-        if (!decode_any(format, data, size, 0, 0, &sink, true, &w, &h)) worker_exit(kExitDecodeFailed);
+        if (!decode_any(format, data, size, 0, 0, &sink, true, &w, &h)) worker_exit(failed());
+        bool animated = format == kFormatPng ? png_is_animated(data, size) : gOutcome.animated;
         uint8_t msg[20] = {'D', 'P', 'R', '1'};
         put_le32(msg + 4, format);
         put_le32(msg + 8, w);
         put_le32(msg + 12, h);
-        put_le32(msg + 16, format == kFormatPng && png_is_animated(data, size) ? 1 : 0);
+        put_le32(msg + 16, animated && may_be_animated(format) ? 1 : 0);
         worker_exit(write_all(0, msg, sizeof(msg)) ? kExitOk : kExitDecodeFailed);
     }
     Meta* m = static_cast<Meta*>(arena_alloc(sizeof(Meta)));
@@ -733,7 +788,7 @@ int lockdown(int out) {
         m->magic = kMetaMagic;
         m->version = 1;
         m->format = format;
-        if (!decode_any(format, data, size, 0, 0, &sink, true, &m->width, &m->height)) worker_exit(kExitDecodeFailed);
+        if (!decode_any(format, data, size, 0, 0, &sink, true, &m->width, &m->height)) worker_exit(failed());
         read_metadata(data, size, format, m);
         worker_exit(write_all(0, m, sizeof(*m)) ? kExitOk : kExitDecodeFailed);
     }
@@ -744,7 +799,7 @@ int lockdown(int out) {
     bool turned = gRotation == 90 || gRotation == 270;
     uint32_t w, h;
     worker_exit(decode_any(format, data, size, turned ? rq.arg1 : rq.arg0, turned ? rq.arg0 : rq.arg1, &sink, false,
-                           &w, &h) ? kExitOk : kExitDecodeFailed);
+                           &w, &h) ? kExitOk : failed());
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -864,7 +919,7 @@ constexpr int kZygoteMs = 10000;
 }
 
 // How a worker ended.
-enum class Ended { kClean, kDecodeFailed, kInternal };
+enum class Ended { kClean, kDecodeFailed, kUnsupported, kInternal };
 
 struct Worker {
     pid_t pid = -1;
@@ -889,11 +944,12 @@ Ended end_worker(Worker* w, bool kill) {
     int status = ended.value;
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitOk) return Ended::kClean;
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitDecodeFailed) return Ended::kDecodeFailed;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == kExitUnsupported) return Ended::kUnsupported;
     return Ended::kInternal;  // a signal (seccomp, CPU limit, our kill), the lockdown, anything else
 }
 
 int32_t status_of(Ended e) {
-    return e == Ended::kDecodeFailed ? kInvalid : kInternal;
+    return e == Ended::kDecodeFailed ? kInvalid : e == Ended::kUnsupported ? kUnsupported : kInternal;
 }
 
 // The request's file goes into a memory file the worker maps read-only. The broker reads it straight from the link
@@ -984,7 +1040,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
             return send_failure(c, e == Ended::kClean ? kInvalid : status_of(e));
         }
         if (memcmp(msg, "DPR1", 4) != 0 || fmt != format || pw == 0 || ph == 0 || pw > kMaxDimension ||
-            ph > kMaxDimension || anim > 1 || (anim == 1 && format != kFormatPng)) {
+            ph > kMaxDimension || anim > 1 || (anim == 1 && !may_be_animated(format))) {
             return send_failure(c, kInvalid);
         }
         return send_reply(c, kOk, format, pw, ph, anim, 0) && send_end(c, kOk);
@@ -1012,7 +1068,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
     bool box = hook || (turned ? (tw <= rq.arg1 && th <= rq.arg0) : (tw <= rq.arg0 && th <= rq.arg1));
     if (n != static_cast<ssize_t>(sizeof(hdr))) {
         Ended e = end_worker(w, true);
-        return send_failure(c, e == Ended::kDecodeFailed ? kInvalid : kInternal);
+        return send_failure(c, status_of(e));
     }
     if (memcmp(hdr, "DSR2", 4) != 0 || tw == 0 || th == 0 || static_cast<uint64_t>(tw) * th > kMaxPixels || !box ||
         (rot != 0 && rot != 180 && !turned)) {
@@ -1068,9 +1124,10 @@ bool serve_one(int c) {
     if (input == -2) return false;
     if (input < 0) return send_failure(c, kInternal);
     // Only the first bytes, to pick the decoder. The memory file is read, not the broker's memory.
-    uint8_t magic[8] = {};
-    (void)!pread(input, magic, std::min<uint32_t>(rq.inputLen, sizeof(magic)), 0);
-    uint32_t format = detect_format(magic, std::min<uint32_t>(rq.inputLen, sizeof(magic)));
+    uint8_t magic[kMagicBytes] = {};
+    size_t got = std::min<size_t>(rq.inputLen, sizeof(magic));
+    if (pread(input, magic, got, 0) != static_cast<ssize_t>(got)) got = 0;
+    uint32_t format = detect_format(magic, got, rq.inputLen);
     bool result;
     {
         struct Closer {
@@ -1159,14 +1216,71 @@ int listen_host(int argc, char** argv) {
 #endif
 }
 
+#ifdef DECODER_HOST_TEST
+// Host test builds only: "--bench W H FILE...". Each file is decoded into a W x H thumbnail by a forked worker under
+// the real lockdown, strict seccomp included. Prints the wall time from fork to exit and the arena's peak, the most of
+// it the decoders touched.
+int bench(int argc, char** argv) {
+    uint32_t bw = static_cast<uint32_t>(atoi(argv[2])), bh = static_cast<uint32_t>(atoi(argv[3]));
+    for (int i = 4; i < argc; i++) {
+        int fd = open(argv[i], O_RDONLY | O_CLOEXEC);
+        struct stat st;
+        if (fd < 0 || fstat(fd, &st) != 0) {
+            printf("bench %s: cannot read\n", argv[i]);
+            continue;
+        }
+        size_t size = static_cast<size_t>(st.st_size);
+        void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (map == MAP_FAILED) continue;
+        const uint8_t* data = static_cast<const uint8_t*>(map);
+        uint32_t format = detect_format(data, std::min(size, kMagicBytes), size);
+        int fds[2];
+        if (pipe2(fds, O_CLOEXEC) != 0) return 1;
+        int64_t t0 = now_ms();
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(fds[0]);
+            if (lockdown(fds[1]) != 0) worker_exit(kExitLockdown);
+            Sink sink = {-1, static_cast<uint8_t*>(arena_alloc(kStripeBytes)), 0};
+            uint32_t w = 0, h = 0;
+            bool ok = decode_any(format, data, size, bw, bh, &sink, false, &w, &h);
+            uint32_t msg[3] = {ok ? 1u : 0u, static_cast<uint32_t>(arena_peak() >> 10), gOutcome.unsupported};
+            (void)!write(0, msg, sizeof(msg));
+            worker_exit(0);
+        }
+        close(fds[1]);
+        uint32_t msg[3] = {};
+        ssize_t n = read_full(fds[0], msg, sizeof(msg), now_ms() + 60000, 60000);
+        close(fds[0]);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        int64_t ms = now_ms() - t0;
+        munmap(map, size);
+        if (n != static_cast<ssize_t>(sizeof(msg))) {
+            printf("bench %s format %u: worker died (status 0x%x) after %lld ms\n", argv[i], format, status,
+                   static_cast<long long>(ms));
+        } else {
+            printf("bench %s format %u %ux%u: %s in %lld ms, arena peak %.1f MiB\n", argv[i], format, bw, bh,
+                   msg[0] ? "ok" : msg[2] ? "unsupported" : "refused", static_cast<long long>(ms), msg[1] / 1024.0);
+        }
+        fflush(stdout);
+    }
+    return 0;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
     setup();
     void* arena = mmap(nullptr, kArenaBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (arena == MAP_FAILED) return 1;
-    gArena = static_cast<uint8_t*>(arena);
+    arena_setup(static_cast<uint8_t*>(arena), kArenaBytes);
     warm_up();
+#ifdef DECODER_HOST_TEST
+    if (argc >= 4 && strcmp(argv[1], "--bench") == 0) return bench(argc, argv);
+#endif
     // No seccomp, no service: Android sees a VM that never answers and fails closed.
     if (!lockdown_works()) return 1;
     if (!start_zygote()) return 1;

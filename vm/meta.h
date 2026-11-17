@@ -23,9 +23,17 @@
 
 namespace decoder {
 
-// Fills the EXIF and XMP fields of m from a JPEG or PNG file. m must be zeroed with orientation -1 first. Uses no
-// memory but the stack, so it runs in the locked-down worker.
+// Fills the EXIF and XMP fields of m from a file of the given format. m must be zeroed with orientation -1 first.
+// Uses no memory but the stack (HEIF and AVIF: the arena for the box index), so it runs in the locked-down worker.
 void read_metadata(const uint8_t* data, size_t size, uint32_t format, Meta* m);
+
+// One EXIF block (a TIFF header and its IFDs) and one XMP packet, for the containers that keep them as items.
+void read_exif_block(const uint8_t* data, size_t size, Meta* m);
+void read_xmp_block(const uint8_t* data, size_t size, Meta* m);
+
+// HEIF and AVIF (fmt_heif.cpp): the Exif and XMP items of the primary image, and its orientation from irot and
+// imir (the file's EXIF orientation is not used, as the format says).
+void heif_metadata(const uint8_t* data, size_t size, Meta* m);
 
 // True when a PNG carries an acTL chunk before its image data (an animated PNG).
 bool png_is_animated(const uint8_t* data, size_t size);

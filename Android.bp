@@ -58,16 +58,22 @@ java_library {
     ],
 }
 
-// The decoder VM's whole userspace: one static program, /init of a raw protected VM. Built for the device, never
-// installed on it: it goes into the VM's initramfs.
+// The decoder VM's program and its decoders, for the device and the build machine alike. Every library is the tree's
+// own, unchanged: libjpeg-turbo, libpng, libwebp, libhevc, dav1d, piex, and Wuffs (one C file, compiled into
+// vm/fmt_wuffs.cpp with the modules it needs). The link wraps the C allocator, so that in a worker every library's
+// malloc comes from the worker's fixed arena (vm/arena.cpp).
 cc_defaults {
-    name: "decoder_vm_defaults",
+    name: "decoder_vm_common",
     srcs: [
+        "vm/arena.cpp",
         "vm/decoder_vm.cpp",
+        "vm/fmt_dng.cpp",
+        "vm/fmt_heif.cpp",
+        "vm/fmt_ico.cpp",
+        "vm/fmt_webp.cpp",
+        "vm/fmt_wuffs.cpp",
         "vm/meta.cpp",
     ],
-    static_executable: true,
-    stl: "libc++_static",
     cflags: [
         "-Wall",
         "-Werror",
@@ -76,7 +82,39 @@ cc_defaults {
         "libjpeg",
         "libpng",
         "libz",
+        "libwebp-decode",
+        "libhevcdec",
+        "libdav1d",
+        "libpiex",
+        "libbinary_parse",
+        "libimage_type_recognition",
+        "libtiff_directory",
+        // For its header only: vm/fmt_wuffs.cpp compiles the file itself, with every function static.
+        "libwuffs_mirror_release_c",
     ],
+    ldflags: [
+        "-Wl,--wrap=malloc",
+        "-Wl,--wrap=calloc",
+        "-Wl,--wrap=realloc",
+        "-Wl,--wrap=free",
+        "-Wl,--wrap=posix_memalign",
+        "-Wl,--wrap=memalign",
+        "-Wl,--wrap=aligned_alloc",
+        "-Wl,--wrap=malloc_usable_size",
+    ],
+}
+
+// The decoder VM's whole userspace: one static program, /init of a raw protected VM. Built for the device, never
+// installed on it: it goes into the VM's initramfs. libhevc's arm64 assembly has no BTI landing pads (its module
+// carries no_bti, like Android's own software HEVC codec), so the whole program is linked without BTI enforcement.
+cc_defaults {
+    name: "decoder_vm_defaults",
+    defaults: [
+        "decoder_vm_common",
+        "no_bti",
+    ],
+    static_executable: true,
+    stl: "libc++_static",
     installable: false,
     compile_multilib: "64",
 }
@@ -102,20 +140,10 @@ cc_test {
 // lockdown and decoders through it, without a phone.
 cc_binary_host {
     name: "decoder_vm_hosttest",
-    srcs: [
-        "vm/decoder_vm.cpp",
-        "vm/meta.cpp",
-    ],
+    defaults: ["decoder_vm_common"],
     cflags: [
-        "-Wall",
-        "-Werror",
         "-DDECODER_HOST_TEST",
         "-DDECODER_TEST_HOOKS",
-    ],
-    static_libs: [
-        "libjpeg",
-        "libpng",
-        "libz",
     ],
 }
 

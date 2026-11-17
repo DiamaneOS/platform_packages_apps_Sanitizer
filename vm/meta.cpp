@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-// Metadata for MediaProvider, read inside the locked-down worker: EXIF (JPEG APP1, PNG eXIf) and three XMP
-// identifiers plus the motion photo marker. No allocation, every offset checked against the buffer with 64-bit
+// Metadata for MediaProvider, read inside the locked-down worker: EXIF (JPEG APP1, PNG eXIf, WebP EXIF, the HEIF and
+// AVIF Exif item, a DNG's own TIFF structure) and three XMP identifiers plus the motion photo marker. No allocation, every offset checked against the buffer with 64-bit
 // arithmetic, fixed limits on segments, chunks and IFD entries. Text goes into the fixed record only when it passes the
 // field's rule, so a hostile file can at worst leave fields empty or pick values within the rules.
 
@@ -436,14 +436,52 @@ void read_png(Span s, Meta* m) {
     finish_exif(m, st);
 }
 
+// RIFF chunks of a WebP file: EXIF (with or without the "Exif\0\0" prefix some writers add), XMP, and the animation
+// flag of VP8X for MediaProvider's special format.
+void read_webp(Span s, Meta* m) {
+    ExifState st;
+    uint64_t at = 12;
+    for (uint32_t i = 0; i < kMaxChunks && has(s, at, 8); i++) {
+        const uint8_t* type = s.p + at;
+        uint32_t len = static_cast<uint32_t>(s.p[at + 4] | s.p[at + 5] << 8 | s.p[at + 6] << 16) |
+                       static_cast<uint32_t>(s.p[at + 7]) << 24;
+        if (!has(s, at + 8, len)) break;
+        Span data = {s.p + at + 8, len};
+        if (memcmp(type, "VP8X", 4) == 0 && data.n >= 1 && (data.p[0] & 0x02) != 0) {
+            m->specialFormat = kSpecialAnimatedWebp;
+        } else if (memcmp(type, "EXIF", 4) == 0) {
+            if (data.n >= 6 && memcmp(data.p, "Exif\0\0", 6) == 0) data = {data.p + 6, data.n - 6};
+            read_tiff(data, m, &st);
+        } else if (memcmp(type, "XMP ", 4) == 0) {
+            read_xmp(data, m);
+        }
+        at += 8 + static_cast<uint64_t>(len) + (len & 1);
+    }
+    finish_exif(m, st);
+}
+
 }  // namespace
+
+void read_exif_block(const uint8_t* data, size_t size, Meta* m) {
+    ExifState st;
+    read_tiff({data, size}, m, &st);
+    finish_exif(m, st);
+}
+
+void read_xmp_block(const uint8_t* data, size_t size, Meta* m) {
+    read_xmp({data, size}, m);
+}
 
 void read_metadata(const uint8_t* data, size_t size, uint32_t format, Meta* m) {
     Span s = {data, size};
-    if (format == kFormatJpeg) {
-        read_jpeg(s, m);
-    } else if (format == kFormatPng) {
-        read_png(s, m);
+    switch (format) {
+        case kFormatJpeg: read_jpeg(s, m); break;
+        case kFormatPng: read_png(s, m); break;
+        case kFormatWebp: read_webp(s, m); break;
+        case kFormatGif: m->specialFormat = kSpecialGif; break;
+        case kFormatHeif: case kFormatAvif: heif_metadata(data, size, m); break;
+        case kFormatDng: read_exif_block(data, size, m); break;
+        default: break;  // BMP, ICO and WBMP carry no metadata MediaProvider reads
     }
 }
 

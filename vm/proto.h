@@ -37,7 +37,7 @@ constexpr uint32_t kMetaMagic = 0x31304d44;     // "DM01"
 
 enum Op : uint32_t {
     kOpPing = 1,       // no input, reply payload 0
-    kOpProbe = 2,      // format, size, animation, no pixels
+    kOpProbe = 2,      // format, size, animation (GIF, WebP, PNG, HEIF and AVIF only), no pixels
     kOpThumbnail = 3,  // pixels fitting arg0 x arg1, payload width * height * 4 premultiplied RGBA
     kOpMetadata = 4,   // payload: one Meta record
     kOpHook = 5,       // test builds only: arg0 selects a lockdown hook
@@ -45,15 +45,24 @@ enum Op : uint32_t {
 
 enum Status : int32_t {
     kOk = 0,
-    kUnsupported = 2,  // not a format the VM decodes
+    kUnsupported = 2,  // not a format the VM decodes, or a kind of it the VM does not decode (a 10-bit HEIF)
     kInvalid = 3,      // broken or hostile file, or a limit was hit
     kInternal = 4,     // the broker itself failed (no pipe, no fork)
 };
 
+// The contract's FORMAT_* values (IDecodeService.aidl).
 enum Format : uint32_t {
     kFormatUnknown = 0,
     kFormatJpeg = 1,
     kFormatPng = 2,
+    kFormatGif = 3,
+    kFormatWebp = 4,
+    kFormatBmp = 5,
+    kFormatHeif = 6,
+    kFormatAvif = 7,
+    kFormatDng = 8,
+    kFormatIco = 9,
+    kFormatWbmp = 10,
 };
 
 constexpr uint32_t kMaxInputBytes = 32u << 20;
