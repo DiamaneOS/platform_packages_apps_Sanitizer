@@ -86,7 +86,7 @@ python_binary_host {
 genrule {
     name: "decoder_vm_initrd",
     tools: ["decoder_vm_mkinitrd"],
-    srcs: [":decoder_vm_init"],
+    device_first_srcs: [":decoder_vm_init"],
     out: ["initrd.img"],
     cmd: "$(location decoder_vm_mkinitrd) $(out) $(in)",
 }
