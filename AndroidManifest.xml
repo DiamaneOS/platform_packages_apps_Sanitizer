@@ -14,6 +14,8 @@
      See the License for the specific language governing permissions and
      limitations under the License.
 -->
+<!-- The decode service: untrusted media is decoded inside a protected VM, for MediaProvider and other system
+     components. No activity, nothing for apps to start. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="de.diamaneos.sanitizer">
 
@@ -24,24 +26,24 @@
         android:protectionLevel="signature|privileged" />
 
     <uses-permission android:name="android.permission.MANAGE_VIRTUAL_MACHINE" />
+    <uses-permission android:name="android.permission.USE_CUSTOM_VIRTUAL_MACHINE" />
     <uses-feature android:name="android.software.virtualization_framework" android:required="true" />
 
     <application
+        android:name=".DecoderApp"
         android:label="@string/app_name"
-        android:allowBackup="false">
-        <activity
-            android:name=".SanitizeActivity"
+        android:allowBackup="false"
+        android:persistent="true"
+        android:directBootAware="true"
+        android:usesNonSdkApi="true">
+        <service
+            android:name=".DecodeService"
             android:exported="true"
-            android:label="@string/share_label"
-            android:excludeFromRecents="true"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|locale|layoutDirection"
-            android:theme="@android:style/Theme.DeviceDefault.Dialog.NoActionBar">
+            android:directBootAware="true"
+            android:permission="de.diamaneos.sanitizer.permission.DECODE">
             <intent-filter>
-                <action android:name="android.intent.action.SEND" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="image/png" />
-                <data android:mimeType="image/jpeg" />
+                <action android:name="de.diamaneos.sanitizer.decode.IDecodeService" />
             </intent-filter>
-        </activity>
+        </service>
     </application>
 </manifest>

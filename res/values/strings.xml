@@ -1,10 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Sanitizer</string>
-    <string name="share_label">Sanitize</string>
-    <string name="working">Decoding the image in an isolated virtual machine…</string>
-    <string name="saved">Clean copy saved to Pictures/Sanitized</string>
-    <string name="failed">The image could not be sanitized</string>
-    <string name="no_file">No image to sanitize</string>
-    <string name="share_copy">Share the clean copy</string>
+    <string name="app_name">Decode service</string>
 </resources>

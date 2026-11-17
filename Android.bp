@@ -12,29 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// File sanitizer: untrusted images are decoded inside a protected VM.
+// The decode service: untrusted media is decoded inside a protected VM for MediaProvider and other system callers.
 
 package {
     default_applicable_licenses: ["Android-Apache-2.0"],
-}
-
-aidl_interface {
-    name: "de.diamaneos.sanitizer.aidl",
-    srcs: ["aidl/de/diamaneos/sanitizer/ISanitizer.aidl"],
-    local_include_dir: "aidl",
-    unstable: true,
-    backend: {
-        java: {
-            gen_rpc: true,
-            sdk_version: "system_current",
-        },
-        cpp: {
-            enabled: false,
-        },
-        ndk: {
-            enabled: true,
-        },
-    },
 }
 
 // The decode service's API for MediaProvider, SystemUI and the system server. MediaProvider compiles a copy of these
@@ -57,57 +38,71 @@ aidl_interface {
     },
 }
 
-// Loaded by Microdroid from the APK. Only libbinder_ndk, libvm_payload, liblog and the C library come from the VM,
-// the decoders are linked in.
+// The decoder VM's whole userspace: one static program, /init of a raw protected VM. Built for the device, never
+// installed on it: it goes into the VM's initramfs.
 cc_defaults {
-    name: "diamaneos_sanitizer_payload_defaults",
-    srcs: ["native/payload.cpp"],
+    name: "decoder_vm_defaults",
+    srcs: [
+        "vm/decoder_vm.cpp",
+        "vm/meta.cpp",
+    ],
+    static_executable: true,
     stl: "libc++_static",
     cflags: [
         "-Wall",
         "-Werror",
     ],
-    shared_libs: [
-        "libbinder_ndk",
-        "liblog",
-        "libvm_payload#current",
-    ],
     static_libs: [
-        "de.diamaneos.sanitizer.aidl-ndk",
         "libjpeg",
         "libpng",
         "libz",
     ],
-}
-
-cc_library_shared {
-    name: "libdiamaneos_sanitizer_payload",
-    defaults: ["diamaneos_sanitizer_payload_defaults"],
-}
-
-// Test builds only: the same payload with hooks that break the worker's lockdown on purpose.
-cc_library_shared {
-    name: "libdiamaneos_sanitizer_payload_test",
-    defaults: ["diamaneos_sanitizer_payload_defaults"],
-    stem: "libdiamaneos_sanitizer_payload",
-    cflags: ["-DSANITIZER_TEST_HOOKS"],
-    // Only inside the test APK: an installed copy would clash with the plain payload's.
     installable: false,
+    compile_multilib: "64",
+}
+
+cc_binary {
+    name: "decoder_vm_init",
+    defaults: ["decoder_vm_defaults"],
+}
+
+// Test builds only: the same program with hooks that break a worker's lockdown on purpose.
+cc_binary {
+    name: "decoder_vm_init_test",
+    defaults: ["decoder_vm_defaults"],
+    cflags: ["-DDECODER_TEST_HOOKS"],
+}
+
+// The initramfs: /init and the empty directories it mounts on. Fixed owner, times and inode numbers, so the same
+// program always gives the same bytes and the same signature. The virtualization APEX takes it with our guest kernel
+// as etc/decoder_vm_initrd.img and etc/fs/decoder_vm_kernel, so release signing signs both again with the key pvmfw
+// trusts (docs/virt-apex.md).
+python_binary_host {
+    name: "decoder_vm_mkinitrd",
+    main: "vm/mkinitrd.py",
+    srcs: ["vm/mkinitrd.py"],
+}
+
+genrule {
+    name: "decoder_vm_initrd",
+    tools: ["decoder_vm_mkinitrd"],
+    srcs: [":decoder_vm_init"],
+    out: ["initrd.img"],
+    cmd: "$(location decoder_vm_mkinitrd) $(out) $(in)",
 }
 
 android_app {
     name: "DiamaneOSSanitizer",
     srcs: ["java/**/*.java"],
     resource_dirs: ["res"],
-    static_libs: ["de.diamaneos.sanitizer.aidl-java"],
+    static_libs: ["de.diamaneos.sanitizer.decode-java"],
     sdk_version: "system_current",
-    jni_libs: ["libdiamaneos_sanitizer_payload"],
-    jni_uses_platform_apis: true,
-    use_embedded_native_libs: true,
+    certificate: "platform",
+    privileged: true,
     system_ext_specific: true,
 }
 
-// Test builds only, installed by hand as an ordinary app: the test payload and a benchmark activity.
+// Test builds only, installed by hand as an ordinary app: the service's classes and the self-test activity.
 android_app {
     name: "DiamaneOSSanitizerTest",
     package_name: "de.diamaneos.sanitizer.test",
@@ -117,10 +112,8 @@ android_app {
         "test/java/**/*.java",
     ],
     resource_dirs: ["res"],
-    static_libs: ["de.diamaneos.sanitizer.aidl-java"],
+    static_libs: ["de.diamaneos.sanitizer.decode-java"],
     sdk_version: "system_current",
-    jni_libs: ["libdiamaneos_sanitizer_payload_test"],
-    jni_uses_platform_apis: true,
-    use_embedded_native_libs: true,
     system_ext_specific: true,
+    installable: false,
 }
