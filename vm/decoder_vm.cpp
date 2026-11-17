@@ -29,7 +29,6 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/seccomp.h>
-#include <linux/vm_sockets.h>
 #include <poll.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -43,6 +42,9 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#ifndef DECODER_HOST_TEST
+#include <linux/vm_sockets.h>  // after sys/socket.h, which older headers need
+#endif
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -76,13 +78,12 @@ using namespace decoder;
 #ifndef PR_SET_NO_NEW_PRIVS
 #define PR_SET_NO_NEW_PRIVS 38
 #endif
-#if defined(DECODER_HOST_TEST)
+
+// Clears memory in a way the compiler cannot drop as a dead store.
 static void wipe(void* p, size_t n) {
     memset(p, 0, n);
     __asm__ volatile("" : : "r"(p) : "memory");
 }
-#define explicit_bzero wipe
-#endif
 
 namespace {
 
@@ -999,7 +1000,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
         bool sent = ok ? send_reply(c, kOk, format, m.width, m.height, 0, sizeof(m)) && write_all(c, &m, sizeof(m)) &&
                                  send_end(c, kOk)
                        : send_failure(c, e == Ended::kClean ? kInvalid : status_of(e));
-        explicit_bzero(&m, sizeof(m));
+        wipe(&m, sizeof(m));
         return sent;
     }
 
@@ -1034,7 +1035,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
             bool bad = got == static_cast<ssize_t>(want);
             Ended e = end_worker(w, true);
             verdict = bad || e == Ended::kDecodeFailed ? kInvalid : kInternal;
-            explicit_bzero(gStripe, sizeof(gStripe));
+            wipe(gStripe, sizeof(gStripe));
             while (left > 0) {
                 size_t k = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), left));
                 if (!write_all(c, gStripe, k)) return false;
@@ -1093,7 +1094,7 @@ bool serve_one(int c) {
         result = serve_worker(c, rq, format, hook, &w);
     }
     // Nothing of this request stays in the broker's memory either.
-    explicit_bzero(gStripe, sizeof(gStripe));
+    wipe(gStripe, sizeof(gStripe));
     return result;
 }
 
