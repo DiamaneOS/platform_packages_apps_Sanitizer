@@ -1007,19 +1007,30 @@ bool warm_up() {
 // memory the VM has free then (MemAvailable, which already leaves out the request's memory file), less a margin for
 // what the worker touches outside the arena (its stack, its copies of the broker's pages, page tables, the kernel's
 // own reserve). So a file that needs more than the VM has is refused cleanly, and the kernel's out-of-memory killer
-// never decides it.
-constexpr uint64_t kWorkerMargin = 16u << 20;
+// never decides it. MemAvailable already leaves out the kernel's free-memory watermarks, so the margin is small: a
+// worker that still meets the out-of-memory killer is BUSY, never a strike.
+constexpr uint64_t kWorkerMargin = 4u << 20;
+
+// The small lane (proto.h): a second broker beside the first, with its own zygote, for small files. Its workers get at
+// most kSmallArena, and the big lane's workers always leave kSmallReserve for one small worker and its file, so the
+// two never take memory from each other: the explicit budget of the VM is the big worker, the small worker, and the
+// kernel, the brokers and the zygotes (what MemAvailable leaves out).
+constexpr size_t kSmallArena = 8u << 20;
+constexpr size_t kSmallReserve = kSmallArena + kSmallInputBytes;
+bool gSmallLane = false;  // this broker, its zygote and its workers are the small lane
 
 #ifdef DECODER_HOST_TEST
-// The host test program pretends to be a VM of DECODER_VM_RAM_MIB (default 160), with what the arm64 test VM had
-// free at that size after the broker's start (kHostVmUsed, measured: MemTotal 141 MiB, MemAvailable 119 MiB).
-constexpr uint64_t kHostVmUsed = 41u << 20;
+// The host test program pretends to be a VM of DECODER_VM_RAM_MIB (default 288, DecoderApp.VM_MEMORY_BYTES), as the
+// arm64 test VM showed it at that size after both brokers' start (two vCPUs): MemTotal 22 MiB and MemAvailable
+// 54 MiB below the VM's size (measured: 266 and 234 MiB).
+constexpr uint64_t kHostKernel = 22u << 20;
+constexpr uint64_t kHostVmUsed = 54u << 20;
 
 uint64_t meminfo(const char* key) {
     const char* mib = getenv("DECODER_VM_RAM_MIB");
-    uint64_t total = (mib != nullptr ? static_cast<uint64_t>(atoi(mib)) : 160u) << 20;
-    if (strcmp(key, "MemTotal") == 0) return total;
-    return total > kHostVmUsed ? total - kHostVmUsed : 0;
+    uint64_t vm = (mib != nullptr ? static_cast<uint64_t>(atoi(mib)) : 288u) << 20;
+    uint64_t less = strcmp(key, "MemTotal") == 0 ? kHostKernel : kHostVmUsed;
+    return vm > less ? vm - less : 0;
 }
 #else
 uint64_t meminfo(const char* key) {
@@ -1056,7 +1067,8 @@ constexpr int kExitOk = 0;
 constexpr int kExitDecodeFailed = 3;
 constexpr int kExitLockdown = 4;
 constexpr int kExitUnsupported = 6;  // a valid file of a kind the VM does not decode
-constexpr int kExitBusy = 7;         // the VM's free memory could not be read: not the file's fault
+constexpr int kExitBusy = 7;         // short of the VM's free memory (arena_short), or it could not be read
+constexpr int kExitBigLane = 8;      // small lane only: the file is too large for it, the big lane takes it
 
 [[noreturn]] void worker_exit(int code) {
     syscall(__NR_exit, code);
@@ -1120,6 +1132,7 @@ int lockdown(int out, int in = -1) {
     }
     if (vmBytes == 0) worker_exit(kExitLockdown);
     size_t memory = worker_memory();
+    memory = gSmallLane ? std::min(memory, kSmallArena) : memory > kSmallReserve ? memory - kSmallReserve : 0;
     if (memory == 0) worker_exit(kExitBusy);
     // Only the output pipe stays open, as fd 0, and a streamed input as fd 1.
     if (in == 0) {
@@ -1157,6 +1170,7 @@ int lockdown(int out, int in = -1) {
     }
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) worker_exit(kExitLockdown);
     arena_enter_worker(memory);
+    arena_short_exit(gSmallLane ? kExitBigLane : kExitBusy);
 #if defined(DECODER_TEST_HOOKS) && !defined(DECODER_HOST_TEST)
     if (gSeccompLog) {
         // Test runs only (--log-seccomp): strict mode's four system calls are allowed, every other one is logged by
@@ -1228,7 +1242,11 @@ constexpr size_t kPrefixBytes = 1u << 20;
     Sink sink = {0, static_cast<uint8_t*>(arena_alloc(kStripeBytes)), 0};
     if (sink.buf == nullptr) worker_exit(kExitDecodeFailed);
     // A decode that failed: UNSUPPORTED when the decoder found a valid file of a kind it does not read.
-    auto failed = [] { return gOutcome.unsupported ? kExitUnsupported : kExitDecodeFailed; };
+    auto failed = [] {
+        return gOutcome.unsupported ? kExitUnsupported
+               : arena_short()      ? (gSmallLane ? kExitBigLane : kExitBusy)
+                                    : kExitDecodeFailed;
+    };
     // A streamed JPEG or PNG (thumbnail or metadata): its start into the arena, the rest stays in the pipe.
     Src stream = {nullptr, 0, 0, -1, 0};
     if (in >= 0) {
@@ -1282,6 +1300,13 @@ constexpr size_t kPrefixBytes = 1u << 20;
     read_metadata(data, size, format, m, &mirror);
     gRotation = m->orientation > 0 ? static_cast<uint32_t>(m->orientation) : 0;
     gFlip = mirror;
+    // The small lane decodes only what its header declares small: the rest goes to the big lane, decided here from
+    // the file, never from the request.
+    if (gSmallLane) {
+        uint32_t dw = 0, dh = 0;
+        if (!decode(0, 0, true, &dw, &dh)) worker_exit(failed());
+        if (static_cast<uint64_t>(dw) * dh > kSmallPixels) worker_exit(kExitBigLane);
+    }
     // The box is for the image as shown. Turned by 90 or 270 degrees, the stored image fits it the other way round.
     bool turned = gRotation == 90 || gRotation == 270;
     uint32_t w, h;
@@ -1411,7 +1436,7 @@ constexpr int kZygoteMs = 10000;
 }
 
 // How a worker ended. kBusy: stopped for a reason outside the file (see kBusy in proto.h).
-enum class Ended { kClean, kDecodeFailed, kUnsupported, kBusy, kInternal };
+enum class Ended { kClean, kDecodeFailed, kUnsupported, kBusy, kBigLane, kInternal };
 
 // The kernel's count of out-of-memory kills so far (/proc/vmstat).
 uint64_t oom_kills() {
@@ -1465,6 +1490,7 @@ Ended end_worker(Worker* w, bool kill) {
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitDecodeFailed) return Ended::kDecodeFailed;
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitUnsupported) return Ended::kUnsupported;
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitBusy) return Ended::kBusy;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == kExitBigLane && gSmallLane) return Ended::kBigLane;
     if (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) {
         // Killed, not by the file: the kernel's out-of-memory killer took it, or the broker ended a worker that sat
         // at its idle or wall limit having had less than half the time on a CPU (the VM was starved, a file that
@@ -1484,6 +1510,7 @@ int32_t status_of(Ended e) {
         case Ended::kDecodeFailed: return kInvalid;
         case Ended::kUnsupported: return kUnsupported;
         case Ended::kBusy: return kBusy;
+        case Ended::kBigLane: return kBigLane;
         default: return kInternal;
     }
 }
@@ -1682,6 +1709,35 @@ bool premultiplied(const uint8_t* p, size_t n) {
     return true;
 }
 
+// A big-lane worker that was short of memory (BUSY, before it answered anything) is started once more, from the same
+// memory file, when the VM's free memory has stopped growing (at most 6 s): memory a large worker gave back may still
+// be on its way (setup keeps the per-CPU lists small, so this is rare). Never in the small lane, never for a streamed
+// file (its stream is gone).
+int gRetryInput = -1;  // the request's memory file while its worker may still be started once more
+bool gRetried = false;
+
+void wait_for_memory() {
+    uint64_t last = meminfo("MemAvailable");
+    int64_t grew = now_ms(), end = now_ms() + 6000;
+    while (now_ms() < end && now_ms() - grew < 1200) {
+        usleep(200000);
+        uint64_t avail = meminfo("MemAvailable");
+        if (avail > last + (1u << 20)) grew = now_ms();
+        last = std::max(last, avail);
+    }
+}
+
+bool start_worker(const Request& rq, uint32_t format, int input, uint32_t len, bool streamed, Worker* w);
+bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* w);
+
+// Starts the worker once more for a BUSY that came before any answer. True when the new worker runs.
+bool retry_busy(Ended e, const Request& rq, uint32_t format, Worker* w) {
+    if (e != Ended::kBusy || gSmallLane || gRetryInput < 0 || gRetried) return false;
+    gRetried = true;
+    wait_for_memory();
+    return start_worker(rq, format, gRetryInput, rq.inputLen, false, w);
+}
+
 // The worker's answer to the host. Returns false when the connection must end.
 bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* w) {
     if (rq.op == kOpProbe) {
@@ -1690,6 +1746,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
         Ended e = end_worker(w, n != static_cast<ssize_t>(sizeof(msg)));
         uint32_t fmt = le32(msg + 4), pw = le32(msg + 8), ph = le32(msg + 12), anim = le32(msg + 16);
         if (e != Ended::kClean || n != static_cast<ssize_t>(sizeof(msg))) {
+            if (retry_busy(e, rq, format, w)) return serve_worker(c, rq, format, hook, w);
             return send_failure(c, e == Ended::kClean ? kInvalid : status_of(e));
         }
         if (memcmp(msg, "DPR1", 4) != 0 || fmt != format || pw == 0 || ph == 0 || pw > kMaxDimension ||
@@ -1703,6 +1760,10 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
         Meta m;
         ssize_t n = worker_read(w, &m, sizeof(m), w->deadline, kIdleMs);
         Ended e = end_worker(w, n != static_cast<ssize_t>(sizeof(m)));
+        if (retry_busy(e, rq, format, w)) {
+            wipe(&m, sizeof(m));
+            return serve_worker(c, rq, format, hook, w);
+        }
         bool ok = e == Ended::kClean && n == static_cast<ssize_t>(sizeof(m)) && m.magic == kMetaMagic &&
                   m.version == 1 && m.format == format && m.width != 0 && m.height != 0 &&
                   m.width <= kMaxDimension && m.height <= kMaxDimension;
@@ -1721,6 +1782,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
     bool box = hook || (turned ? (tw <= rq.arg1 && th <= rq.arg0) : (tw <= rq.arg0 && th <= rq.arg1));
     if (n != static_cast<ssize_t>(sizeof(hdr))) {
         Ended e = end_worker(w, true);
+        if (retry_busy(e, rq, format, w)) return serve_worker(c, rq, format, hook, w);
         return send_failure(c, status_of(e));
     }
     if (memcmp(hdr, "DSR2", 4) != 0 || tw == 0 || th == 0 || static_cast<uint64_t>(tw) * th > kMaxPixels || !box ||
@@ -1809,6 +1871,8 @@ bool serve_one(int c) {
     int32_t refuse = -1;
     if (rq.op == kOpPing) {
         refuse = kOk;
+    } else if (gSmallLane && (streamed || rq.inputLen > kSmallInputBytes)) {
+        refuse = kBigLane;
     } else if (!hook && format == kFormatUnknown) {
         refuse = kUnsupported;
     } else if (!streamed && rq.inputLen > kMaxBufferedBytes) {
@@ -1843,9 +1907,20 @@ bool serve_one(int c) {
         if (input == -2) return false;
         if (input < 0) return send_failure(c, kInternal);
         bool started = start_worker(rq, format, input, rq.inputLen, false, &w);
-        close(input);
-        if (!started) return send_failure(c, kInternal);
+        if (!started) {
+            close(input);
+            return send_failure(c, kInternal);
+        }
+        // Kept while the worker may be started once more (retry_busy), closed when the request ends.
+        gRetryInput = input;
+        gRetried = false;
     }
+    struct RetryCloser {
+        ~RetryCloser() {
+            if (gRetryInput >= 0) close(gRetryInput);
+            gRetryInput = -1;
+        }
+    } retryCloser;
     // Nothing of this request stays in the broker's memory either (the wiper, on the way out).
     return serve_worker(c, rq, format, hook, &w);
 }
@@ -1880,6 +1955,15 @@ bool lockdown_works() {
 void setup() {
 #ifndef DECODER_HOST_TEST
     mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr);
+    // Small per-CPU page lists: the kernel keeps freed pages on per-CPU lists, which it grows on its own after a
+    // large free and drains over seconds, and MemAvailable does not count them. After a 200 MiB worker the VM then
+    // showed about 12 MiB less free for several seconds, and the next large file was refused for it (measured in the
+    // arm64 test VM). With lists of the minimum size the free memory is back as the worker ends.
+    int pcp = open("/proc/sys/vm/percpu_pagelist_high_fraction", O_WRONLY | O_CLOEXEC);
+    if (pcp >= 0) {
+        (void)!write(pcp, "100000", 6);
+        close(pcp);
+    }
 #endif
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_DFL);
@@ -1889,13 +1973,13 @@ void setup() {
 
 int listen_host(int argc, char** argv) {
 #ifdef DECODER_HOST_TEST
-    // Host test builds: a Unix socket instead of vsock, at the path given.
+    // Host test builds: a Unix socket instead of vsock, at the path given (the small lane: the path and ".small").
     if (argc < 2) return -1;
     int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     sockaddr_un addr = {};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, argv[1], sizeof(addr.sun_path) - 1);
-    unlink(argv[1]);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s%s", argv[1], gSmallLane ? ".small" : "");
+    unlink(addr.sun_path);
     if (ls < 0 || bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(ls, 1) != 0) return -1;
     return ls;
 #else
@@ -1904,7 +1988,7 @@ int listen_host(int argc, char** argv) {
     int ls = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     sockaddr_vm addr = {};
     addr.svm_family = AF_VSOCK;
-    addr.svm_port = kPort;
+    addr.svm_port = gSmallLane ? kSmallPort : kPort;
     addr.svm_cid = VMADDR_CID_ANY;
     if (ls < 0 || bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(ls, 1) != 0) return -1;
     return ls;
@@ -2031,12 +2115,20 @@ int bench(int argc, char** argv) {
 // Test runs only (the device test program in the arm64 test VM, which has no vsock): the broker serves one virtio
 // serial port (found by its name) instead, with the zygote, the memory files, the pump and the workers as in
 // the product. A host side that is not connected reads as the end of the stream: the broker waits and tries again.
-int serve_port(const char* name) {
-    // The port by its name (qemu's virtserialport name=...), through sysfs, as a device node made here.
-    int devErr = mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, nullptr) == 0 ? 0 : errno;
-    mkdir("/sys", 0755);
-    int sysErr = mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, nullptr) == 0 ? 0 : errno;
-    print_memory("serve");
+int serve_port(const char* lane) {
+    // The port by its name (qemu's virtserialport name=...), through sysfs, as a device node made here. The small lane
+    // serves the port named with "-small".
+    char nameBuf[64];
+    snprintf(nameBuf, sizeof(nameBuf), "%s%s", lane, gSmallLane ? "-small" : "");
+    const char* name = nameBuf;
+    const char* node = gSmallLane ? "/dev/decoder-port-small" : "/dev/decoder-port";
+    int devErr = 0, sysErr = 0;
+    if (!gSmallLane) {
+        devErr = mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, nullptr) == 0 ? 0 : errno;
+        mkdir("/sys", 0755);
+        sysErr = mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, nullptr) == 0 ? 0 : errno;
+        print_memory("serve");
+    }
     int c = -1;
     for (int tries = 0; tries < 100 && c < 0; tries++) {
         DIR* d = opendir("/sys/class/virtio-ports");
@@ -2058,10 +2150,8 @@ int serve_port(const char* name) {
             if (fd >= 0) close(fd);
             unsigned major = 0, minor = 0;
             if (n <= 0 || sscanf(buf, "%u:%u", &major, &minor) != 2) continue;
-            unlink("/dev/decoder-port");
-            if (mknod("/dev/decoder-port", S_IFCHR | 0600, makedev(major, minor)) == 0) {
-                c = open("/dev/decoder-port", O_RDWR | O_CLOEXEC);
-            }
+            unlink(node);
+            if (mknod(node, S_IFCHR | 0600, makedev(major, minor)) == 0) c = open(node, O_RDWR | O_CLOEXEC);
         }
         if (d != nullptr) closedir(d);
         if (c < 0) usleep(100000);
@@ -2073,8 +2163,8 @@ int serve_port(const char* name) {
     printf("serve: ready on port %s\n", name);
     fflush(stdout);
     for (;;) {
-        while (serve_one(c)) {
-        }
+        // The VM's memory after every request, on the console: what the next worker will find.
+        while (serve_one(c)) print_memory(gSmallLane ? "serve small" : "serve");
         usleep(100000);
     }
 }
@@ -2108,9 +2198,22 @@ int main(int argc, char** argv) {
 #endif
     // No seccomp, no service: Android sees a VM that never answers and fails closed.
     if (!lockdown_works()) return 1;
+    // The small lane: a second broker with its own zygote, forked before anything was served. If it ever ends, its
+    // port stops answering and Android restarts the VM.
+    pid_t parent = getpid();
+    pid_t small = fork();
+    if (small < 0) return 1;
+    if (small == 0) {
+        gSmallLane = true;
+        prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);  // never outlives the first broker
+        if (getppid() != parent) return 1;           // which went before the line above
+    }
     if (!start_zygote()) return 1;
 #if defined(DECODER_TEST_HOOKS) && !defined(DECODER_HOST_TEST)
-    if (argc >= 3 && strcmp(argv[1], "--serve-port") == 0) return serve_port(argv[2]);
+    if (argc >= 3 && strcmp(argv[1], "--serve-port") == 0) {
+        if (gSmallLane) usleep(500000);  // after the first broker's mounts
+        return serve_port(argv[2]);
+    }
 #endif
     int ls = listen_host(argc, argv);
     if (ls < 0) return 1;

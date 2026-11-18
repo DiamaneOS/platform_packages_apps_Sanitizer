@@ -21,7 +21,7 @@
 //   request:  Request header, then inputLen bytes of the file.
 //   reply:    Reply header, then payloadLen bytes, then an End trailer. A worker that fails after the header was
 //             sent: the broker keeps the promised length with zeros and the trailer carries the verdict (INVALID,
-//             INTERNAL or BUSY). A trailer after pixels is never UNSUPPORTED.
+//             INTERNAL, BUSY or, in the small lane, BIG_LANE). A trailer after pixels is never UNSUPPORTED.
 
 #pragma once
 
@@ -29,7 +29,8 @@
 
 namespace decoder {
 
-constexpr uint32_t kPort = 5685;
+constexpr uint32_t kPort = 5685;       // the big lane: any file
+constexpr uint32_t kSmallPort = 5686;  // the small lane, beside it: small files only (kSmallInputBytes, kSmallPixels)
 
 constexpr uint32_t kRequestMagic = 0x31305144;  // "DQ01"
 constexpr uint32_t kReplyMagic = 0x31305344;    // "DS01"
@@ -51,7 +52,16 @@ enum Status : int32_t {
     kInternal = 4,     // the worker died (seccomp's kill, a crash, the CPU limit) or the broker failed (no pipe, no fork)
     kBusy = 5,         // the worker was stopped for a reason outside the file: the VM ran out of memory, or the worker
                        // got too little CPU before the wall deadline. Never a verdict on the file: try again later.
+    kBigLane = 6,      // small lane only: the file is too large for it (input, declared pixels or memory). Never a
+                       // verdict: send it again on the big lane.
 };
+
+// The small lane runs beside the big one (a second broker with its own zygote, on kSmallPort), so icons and small
+// thumbnails do not wait behind a large decode. It takes files of at most kSmallInputBytes whose header declares at
+// most kSmallPixels, decoded in a worker of at most kSmallArena (decoder_vm.cpp). Anything else, and any file that
+// needs more memory than that, is answered kBigLane, decided in the VM from the file itself, never from the request.
+constexpr uint32_t kSmallInputBytes = 1u << 20;
+constexpr uint32_t kSmallPixels = 1u << 20;
 
 // The contract's FORMAT_* values (IDecodeService.aidl).
 enum Format : uint32_t {

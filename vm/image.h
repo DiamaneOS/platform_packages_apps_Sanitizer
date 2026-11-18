@@ -46,6 +46,12 @@ bool arena_allow(size_t n);
 // True when another n bytes fit, asking for them when they do not fit the current allowance.
 bool arena_room(size_t n);
 size_t arena_limit();  // the whole arena, in a worker what it may grow to
+// The worker was refused memory that the VM has (it fits the arena) but did not have free when the worker started:
+// then a failure is not the file's (kBusy), and the same file is tried again later.
+bool arena_short();
+// The exit code of a worker whose allocation failed that way (decoder_vm.cpp: kExitBusy, or kExitBigLane in the small
+// lane, whose arena is small on purpose).
+void arena_short_exit(int code);
 // From now on malloc and friends use the arena, which starts empty, and this worker may grow to memory bytes of it.
 void arena_enter_worker(size_t memory);
 bool arena_in_worker();

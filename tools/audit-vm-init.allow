@@ -62,6 +62,7 @@ clock_gettime _ZN12_GLOBAL__N_113discard_inputEim
 clock_gettime _ZN12_GLOBAL__N_16now_msEv
 clock_gettime _ZN12_GLOBAL__N_19read_fullEiPvmli
 clock_gettime _ZN12_GLOBAL__N_19serve_oneEi
+clock_gettime _ZN12_GLOBAL__N_110retry_busyENS_5EndedERKN7decoder7RequestEjPNS_6WorkerE
 clock_gettime main
 gettid fork
 

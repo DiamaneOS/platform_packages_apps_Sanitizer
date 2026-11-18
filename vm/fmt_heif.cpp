@@ -69,12 +69,16 @@ constexpr uint32_t kMaxRefs = 8192;        // item references, all types togethe
 constexpr uint32_t kMaxTracks = 16;
 constexpr uint32_t kMaxGridTiles = 1024;
 constexpr uint32_t kMaxGridColumns = 64;  // a row of tiles is held at once
-constexpr uint64_t kMaxCodedPixels = 16u << 20;  // one coded image: a tile or a whole image
+// One coded image, a tile or a whole image: the largest picture HEVC and AV1 levels allow (MaxLumaPs of HEVC level 6,
+// AV1 level 6: 35,651,584). The arena bounds what it may cost.
+constexpr uint64_t kMaxCodedPixels = 35651584;
 constexpr uint64_t kMaxGridPixels = 256u << 20;  // all tiles of a grid together
-constexpr size_t kSlack = 4u << 20;              // decoder state, scaler and stripe buffer, besides what is counted
-// Measured (decoder_vm_hosttest --bench): what the decoders hold per pixel of one coded image, besides its picture.
-// libhevc: 208.5 MiB for a 12 MP single image, about 14.4 bytes a pixel besides the two pictures.
-constexpr uint64_t kHevcBytesPerPixel = 16;
+constexpr size_t kSlack = 8u << 20;              // decoder state, scaler and stripe buffer, besides what is counted
+// Measured (decoder_vm_hosttest --bench): what the decoders hold per pixel of one coded image, besides the two
+// pictures counted with it. libhevc, single images, all in: 41.2 MiB at 2 MP, 208.5 at 12 MP, 340.2 at 20 MP, 597.1 at
+// 35 MP, about 5 MiB and 17.6 bytes a pixel (its buffers follow the SPS's DPB size, its API has no limit on them).
+// With these the estimate stays 1 to 19 MiB above each.
+constexpr uint64_t kHevcBytesPerPixel = 15;
 constexpr uint64_t kAv1BytesPerPixel = 3;
 
 constexpr uint32_t fourcc(const char* s) {
@@ -964,7 +968,10 @@ bool hevc_mode(Hevc* d, IVD_VIDEO_DECODE_MODE_T mode) {
     ivd_ctl_set_config_op_t op = {};
     ip.u4_disp_wd = 0;
     ip.e_frm_skip_mode = IVD_SKIP_NONE;
-    ip.e_frm_out_mode = IVD_DISPLAY_FRAME_OUT;
+    // Pictures come out in decode order: libhevc then keeps no extra pictures for reordering (it sizes its picture
+    // buffers as the SPS's DPB size plus its reorder depth in display order, plus one). A still picture has no
+    // order to restore.
+    ip.e_frm_out_mode = IVD_DECODE_FRAME_OUT;
     ip.e_vid_dec_mode = mode;
     ip.e_cmd = IVD_CMD_VIDEO_CTL;
     ip.e_sub_cmd = IVD_CMD_CTL_SETPARAMS;

@@ -54,6 +54,8 @@ uint8_t* gBase = nullptr;
 size_t gLimit = 0;   // the mapping: a worker can never go beyond it
 size_t gMemory = 0;  // what this worker may grow to: the memory the VM had free when it started, at most gLimit
 size_t gCap = 0;     // what this worker may use now (arena_allow raises it, up to gMemory)
+bool gShort = false; // a request fit the arena but not the memory free when this worker started
+int gShortExit = 7;  // the worker's exit code for a failed allocation when gShort (decoder_vm.cpp)
 size_t gTop = 0;       // everything from here on was never handed out since the worker started
 size_t gLast = kNone;  // offset of the block that ends at gTop
 size_t gInUse = 0;
@@ -170,9 +172,15 @@ bool round_size(size_t n, size_t* need) {
     return true;
 }
 
+// A failed allocation of a worker already allowed all the memory it started with: short of memory, not of rights.
+void* failed_take(size_t n) {
+    if (gWorker && gCap == gMemory && gMemory < gLimit && n <= gLimit) gShort = true;
+    return nullptr;
+}
+
 void* take(size_t n) {
     size_t need;
-    if (!round_size(n, &need)) return nullptr;
+    if (!round_size(n, &need)) return failed_take(n);
     for (int i = bin_of(need); i < kBins; i++) {
         for (Block* b = gBins[i]; b != nullptr; b = links(b)->next) {
             if (size_of(b) < need) continue;
@@ -183,7 +191,7 @@ void* take(size_t n) {
             return payload(b);
         }
     }
-    if (gCap - gTop < need) return nullptr;
+    if (gCap - gTop < need) return failed_take(n);
     Block* b = at(gTop);
     b->prev = gLast == kNone ? 0 : size_of(at(gLast));
     b->head = need | kUsedBit;
@@ -220,13 +228,26 @@ void arena_setup(uint8_t* base, size_t size) {
 bool arena_allow(size_t n) {
     n = (n + 15) & ~static_cast<size_t>(15);
     if (n > gCap) gCap = std::min(n, gMemory);
+    if (n > gCap && n <= gLimit) gShort = true;
     return n <= gCap;
+}
+
+bool arena_short() {
+    return gShort;
+}
+
+void arena_short_exit(int code) {
+    gShortExit = code;
 }
 
 bool arena_room(size_t n) {
     if (!gWorker) return n <= kArenaDefault;
     if (n <= gCap - gInUse) return true;
-    return n <= gMemory - gInUse && arena_allow(gInUse + n);
+    if (n > gMemory - gInUse) {
+        if (n <= gLimit - gInUse) gShort = true;  // the arena holds it, the memory free at the start did not
+        return false;
+    }
+    return arena_allow(gInUse + n);
 }
 
 size_t arena_limit() {
@@ -235,6 +256,7 @@ size_t arena_limit() {
 
 void arena_enter_worker(size_t memory) {
     gMemory = std::min(memory, gLimit) & ~static_cast<size_t>(15);
+    gShort = false;
     gCap = std::min(kArenaDefault, gMemory);
     gTop = 0;
     gLast = kNone;
@@ -380,7 +402,8 @@ size_t arena_usable(const void* p) {
 
 // A failed operator new: in a worker, the file needed more memory than the limits give (a decode failure, INVALID).
 [[noreturn]] void out_of_memory() {
-    if (gWorker) syscall(__NR_exit, 3);
+    if (gWorker) syscall(__NR_exit, gShort ? gShortExit : 3);  // decoder_vm.cpp: kExitBusy or kExitBigLane, or
+                                                               // kExitDecodeFailed
     abort();
 }
 
