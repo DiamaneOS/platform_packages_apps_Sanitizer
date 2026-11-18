@@ -472,6 +472,22 @@ public final class HostChecks {
 
     // Which files the service may stream: only those whose own device the mount table names as local, every mount
     // of it local. Unknown devices, FUSE, vfat and mixed devices are not streamed.
+    /** Who may call: on a user build exactly the two production callers, the client tests on a debuggable build only. */
+    static void callerChecks() {
+        String[] user = Callers.allowed(false);
+        check("callers: a user build has exactly the two production callers",
+                java.util.Arrays.equals(user, new String[] {"com.android.providers.media.module", "com.android.systemui"}),
+                java.util.Arrays.toString(user));
+        String[] debug = Callers.allowed(true);
+        check("callers: a debuggable build adds the client tests and nothing else",
+                java.util.Arrays.equals(debug, new String[] {"com.android.providers.media.module", "com.android.systemui",
+                        "de.diamaneos.decode.client.tests"}),
+                java.util.Arrays.toString(debug));
+        user[0] = "changed";
+        check("callers: the list handed out is a copy", Callers.allowed(false)[0].equals("com.android.providers.media.module")
+                && Callers.PRODUCTION[0].equals("com.android.providers.media.module"), Callers.allowed(false)[0]);
+    }
+
     static void mountChecks() {
         String mi = String.join("\n",
                 "1 0 254:0 / / ro,relatime - erofs /dev/block/dm-0 ro",
@@ -1517,6 +1533,7 @@ public final class HostChecks {
         linkChecks();
         fuzz(rounds);
         schedulerChecks();
+        callerChecks();
         cacheChecks();
         decoderChecks();
         System.out.println("DONE pass=" + sPass + " fail=" + sFail + " in " + (System.nanoTime() - T0) / 1000000

@@ -41,10 +41,6 @@ public final class DecoderApp extends Application implements DecoderProvider {
     static final long VM_MEMORY_BYTES = 288L << 20;
 
     private static final String PERMISSION = "de.diamaneos.sanitizer.permission.DECODE";
-    private static final String[] CALLERS = {
-        "com.android.providers.media.module",
-        "com.android.systemui",
-    };
 
     private Decoder mDecoder;
 
@@ -70,6 +66,7 @@ public final class DecoderApp extends Application implements DecoderProvider {
 
     @Override
     public String[] allowedCallers() {
-        return CALLERS.clone();
+        // The client tests only on a debuggable build, through the same gate as every other test hook.
+        return Callers.allowed(DebugBuild.debuggable());
     }
 }
