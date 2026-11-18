@@ -9,6 +9,9 @@
 #      sigprocmask, sched_getaffinity or clock_gettime is listed and compared with audit-vm-init.allow, where each
 #      known one carries the reason a worker never makes that call (warmed up in the broker, broker only, unreachable).
 #      A new caller fails the audit until it is understood and added.
+#   5. No test hooks: the product program has none of the test build's functions or strings (hooks, the bench, the
+#      serial port broker), so a wrong compile flag cannot ship them unseen. TEST_PROGRAM=1 inverts it, to show the
+#      check finds them in decoder_vm_init_test.
 set -u
 P=${1:?program}
 B=${2:-}
@@ -52,4 +55,15 @@ else
   echo "$new" | sed 's/^/       /'
 fi
 [ -z "$gone" ] || { echo "note allowed but no longer present:"; echo "$gone" | sed 's/^/       /'; }
+hooks=$("$(tool llvm-nm)" -C --format=just-symbols "$P" | grep -E '(^|::)(hook_report|hook_scan|bench|serve_port)\(' | sort -u)
+for t in "--bench" "/dev/decoder-port" "bench seccomp log"; do
+  LC_ALL=C grep -a -q -F -e "$t" "$P" && hooks="$hooks string:$t"
+done
+if [ "${TEST_PROGRAM:-0}" = 1 ]; then
+  [ -n "$hooks" ] && say "ok   test program carries its hooks (the check sees them)" || bad "no hooks found in the test program"
+elif [ -z "$hooks" ]; then
+  say "ok   no test hooks"
+else
+  bad "test hooks in the product program: $(echo $hooks | cut -c1-200)"
+fi
 exit $rc

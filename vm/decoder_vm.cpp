@@ -107,9 +107,14 @@ namespace {
 
 // Deadlines. The worker's CPU time is capped by the kernel, its wall time by the broker. The host link is trusted but
 // a stalled read still ends the connection.
+// The small lane's workers get far less: a file that is slow there is sent to the big lane (BIG_LANE), so a slow icon
+// costs the small lane at most kSmallWallMs. The idle limit lets formats that write nothing before the whole decode
+// (still WebP, GIF, BMP, progressive JPEG) use most of the wall time.
 constexpr int kWorkerCpuSeconds = 20;
 constexpr int64_t kWorkerWallMs = 30000;
-constexpr int kIdleMs = 15000;
+constexpr int kSmallCpuSeconds = 2;
+constexpr int64_t kSmallWallMs = 4000;
+constexpr int kIdleMs = 25000;
 constexpr int64_t kHostReadMs = 60000;
 
 // The unprivileged user and group of a worker.
@@ -1147,7 +1152,7 @@ int lockdown(int out, int in = -1) {
         int resource;
         rlim_t value;
     } limits[] = {
-            {RLIMIT_CPU, kWorkerCpuSeconds},
+            {RLIMIT_CPU, static_cast<rlim_t>(gSmallLane ? kSmallCpuSeconds : kWorkerCpuSeconds)},
             {RLIMIT_NOFILE, in >= 0 ? 2u : 1u},  // the open descriptors take every number allowed
             {RLIMIT_NPROC, 0},
             {RLIMIT_AS, vmBytes + (16u << 20)},
@@ -1155,7 +1160,8 @@ int lockdown(int out, int in = -1) {
             {RLIMIT_CORE, 0},
     };
     for (const auto& l : limits) {
-        rlimit r = {l.value, l.value};
+        // The small lane's CPU limit sends SIGXCPU first (a second later SIGKILL): told apart from seccomp's kill.
+        rlimit r = {l.value, l.resource == RLIMIT_CPU && gSmallLane ? l.value + 1 : l.value};
         if (setrlimit(l.resource, &r) != 0) worker_exit(kExitLockdown);
     }
 #ifdef DECODER_HOST_TEST
@@ -1379,6 +1385,11 @@ pid_t gZygotePid = -1;
                       (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000;
         ZygoteReply ended = {2, status, static_cast<int32_t>(std::min<int64_t>(cpu, INT32_MAX))};
         if (!write_all(sock, &ended, sizeof(ended))) _exit(1);
+        // The next fork copies this frame: nothing of this worker's end (its CPU time, faults, status) goes along.
+        wipe(&ru, sizeof(ru));
+        wipe(&ended, sizeof(ended));
+        wipe(&status, sizeof(status));
+        wipe(&cpu, sizeof(cpu));
     }
 }
 
@@ -1455,6 +1466,23 @@ uint64_t oom_kills() {
 #endif
 }
 
+// The CPUs the VM has online (the cpuN lines of /proc/stat, which come first). The ping answers it, so the host's
+// health check sees the vCPUs the VM really has, not only the count it asked for.
+uint32_t online_cpus() {
+    int fd = open("/proc/stat", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    static char buf[16384];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    uint32_t count = 0;
+    for (const char* p = buf; (p = strstr(p, "\ncpu")) != nullptr; p += 4) {
+        if (p[4] >= '0' && p[4] <= '9') count++;
+    }
+    return count;
+}
+
 struct Worker {
     pid_t pid = -1;
     int pipe = -1;
@@ -1468,11 +1496,14 @@ struct Worker {
     uint64_t bufAt = 0;
 };
 
+int64_t gLastWorkerMs = 0;  // how long the last worker ran, from its start to end_worker
+
 // Ends the current worker, at once with kill, else after it exits on its own (a grace period, then killed anyway).
 Ended end_worker(Worker* w, bool kill) {
     if (w->pid < 0) return Ended::kInternal;
     const int64_t started = w->started;
     const uint64_t oomBefore = w->oomBefore;
+    gLastWorkerMs = now_ms() - started;
     ZygoteReply ended = {};
     ssize_t n = 0;
     if (!kill) n = read_full(gZygote, &ended, sizeof(ended), now_ms() + 2000, 2000);
@@ -1491,6 +1522,10 @@ Ended end_worker(Worker* w, bool kill) {
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitUnsupported) return Ended::kUnsupported;
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitBusy) return Ended::kBusy;
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitBigLane && gSmallLane) return Ended::kBigLane;
+    if (gSmallLane && WIFSIGNALED(status) &&
+        (WTERMSIG(status) == SIGXCPU || (WTERMSIG(status) == SIGKILL && gLastWorkerMs + 500 >= kSmallWallMs))) {
+        return Ended::kBigLane;  // too slow for the small lane: the big lane takes it, no verdict on the file
+    }
     if (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) {
         // Killed, not by the file: the kernel's out-of-memory killer took it, or the broker ended a worker that sat
         // at its idle or wall limit having had less than half the time on a CPU (the VM was starved, a file that
@@ -1682,7 +1717,7 @@ bool start_worker(const Request& rq, uint32_t format, int input, uint32_t len, b
     w->pid = started.value;
     w->pipe = fds[0];
     w->started = now_ms();
-    w->deadline = w->started + kWorkerWallMs;
+    w->deadline = w->started + (gSmallLane ? kSmallWallMs : kWorkerWallMs);
     w->oomBefore = oom_kills();
     return true;
 }
@@ -1712,7 +1747,9 @@ bool premultiplied(const uint8_t* p, size_t n) {
 // A big-lane worker that was short of memory (BUSY, before it answered anything) is started once more, from the same
 // memory file, when the VM's free memory has stopped growing (at most 6 s): memory a large worker gave back may still
 // be on its way (setup keeps the per-CPU lists small, so this is rare). Never in the small lane, never for a streamed
-// file (its stream is gone).
+// file (its stream is gone), and only when the first worker ended within kRetryWithinMs, so both fit the host's call
+// budget (two walls would not).
+constexpr int64_t kRetryWithinMs = 5000;
 int gRetryInput = -1;  // the request's memory file while its worker may still be started once more
 bool gRetried = false;
 
@@ -1732,7 +1769,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
 
 // Starts the worker once more for a BUSY that came before any answer. True when the new worker runs.
 bool retry_busy(Ended e, const Request& rq, uint32_t format, Worker* w) {
-    if (e != Ended::kBusy || gSmallLane || gRetryInput < 0 || gRetried) return false;
+    if (e != Ended::kBusy || gSmallLane || gRetryInput < 0 || gRetried || gLastWorkerMs > kRetryWithinMs) return false;
     gRetried = true;
     wait_for_memory();
     return start_worker(rq, format, gRetryInput, rq.inputLen, false, w);
@@ -1883,18 +1920,19 @@ bool serve_one(int c) {
     }
     if (refuse >= 0) {
         if (!discard_input(c, rest)) return false;
-        if (refuse == kOk) return send_reply(c, kOk, 0, 0, 0, 0, 0) && send_end(c, kOk);
+        if (refuse == kOk) return send_reply(c, kOk, 0, 0, 0, online_cpus(), 0) && send_end(c, kOk);  // the ping
         return send_failure(c, refuse);
     }
     Worker w;
     if (streamed) {
         int in[2];
-        if (pipe2(in, O_CLOEXEC) != 0) return discard_input(c, rest) && send_failure(c, kInternal);
+        // The broker's own resources (a pipe, a memory file, a worker) are no verdict on the file: BUSY.
+        if (pipe2(in, O_CLOEXEC) != 0) return discard_input(c, rest) && send_failure(c, kBusy);
         bool started = start_worker(rq, format, in[0], rq.inputLen, true, &w);
         close(in[0]);
         if (!started) {
             close(in[1]);
-            return discard_input(c, rest) && send_failure(c, kInternal);
+            return discard_input(c, rest) && send_failure(c, kBusy);
         }
         bool linkOk = pump_input(c, magic, got, rest, in[1], &w);
         close(in[1]);
@@ -1905,11 +1943,11 @@ bool serve_one(int c) {
     } else {
         int input = read_input(c, magic, got, rq.inputLen);
         if (input == -2) return false;
-        if (input < 0) return send_failure(c, kInternal);
+        if (input < 0) return send_failure(c, kBusy);
         bool started = start_worker(rq, format, input, rq.inputLen, false, &w);
         if (!started) {
             close(input);
-            return send_failure(c, kInternal);
+            return send_failure(c, kBusy);
         }
         // Kept while the worker may be started once more (retry_busy), closed when the request ends.
         gRetryInput = input;
