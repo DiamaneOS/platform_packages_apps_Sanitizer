@@ -78,6 +78,9 @@ cc_defaults {
         "-Wall",
         "-Werror",
     ],
+    // No thread-safe function-local statics: their guard asks for the thread id on first use, a system call a worker
+    // may not make. The program has no threads.
+    cppflags: ["-fno-threadsafe-statics"],
     static_libs: [
         "libjpeg",
         "libpng",
@@ -103,8 +106,12 @@ cc_defaults {
         "-Wl,--wrap=malloc_usable_size",
     ],
     target: {
+        // bionic's setjmp saves the signal mask, a system call a worker may not make (vm/decoder_vm.cpp).
+        // tools/audit-vm-init.sh checks that nothing calls setjmp or sigsetjmp itself.
         android_arm64: {
-            // bionic's setjmp saves the signal mask, a system call a worker may not make (vm/decoder_vm.cpp).
+            ldflags: ["-Wl,--wrap=setjmp"],
+        },
+        android_x86_64: {
             ldflags: ["-Wl,--wrap=setjmp"],
         },
     },

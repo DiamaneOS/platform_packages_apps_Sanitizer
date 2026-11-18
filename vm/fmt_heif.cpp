@@ -1652,17 +1652,17 @@ void heif_metadata(const uint8_t* data, size_t size, Meta* m, bool* mirror) {
     }
 }
 
-void warm_up_heif() {
+bool warm_up_heif() {
     // dav1d reads /proc/cpuinfo once, when its first decoder opens. A real decode also sets up its tables, and a
     // 12-bit frame the tables of the C transforms (a pthread_once, whose first run in a worker was a futex call that
     // killed it: 12-bit AVIF on arm64, found in the arm64 test run).
     Sink sink = {-1, static_cast<uint8_t*>(arena_alloc(kStripeBytes)), 0};
-    uint32_t w, h;
-    if (sink.buf != nullptr) {
-        decode_heif(kWarmupAvif, sizeof(kWarmupAvif), 8, 8, &sink, false, &w, &h);
-        decode_heif(kWarmupAvif12, sizeof(kWarmupAvif12), 8, 8, &sink, false, &w, &h);
-    }
+    if (sink.buf == nullptr) return false;
+    uint32_t w = 0, h = 0;
+    bool ok = decode_heif(kWarmupAvif, sizeof(kWarmupAvif), 8, 8, &sink, false, &w, &h);
+    ok &= decode_heif(kWarmupAvif12, sizeof(kWarmupAvif12), 8, 8, &sink, false, &w, &h);
     arena_free(sink.buf);
+    return ok;
 }
 
 }  // namespace decoder

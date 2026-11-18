@@ -24,11 +24,16 @@
 // memory arena and streams to the broker, which checks every size before it passes anything on. A decoder exploit
 // gets a process that can write to one pipe and nothing else, and that process ends with the file.
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/seccomp.h>
+#if defined(DECODER_TEST_HOOKS) && !defined(DECODER_HOST_TEST)
+#include <linux/filter.h>
+#include <stddef.h>
+#endif
 #include <poll.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -40,7 +45,8 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/sysinfo.h>
+#include <sys/sysmacros.h>
+
 #if defined(__aarch64__)
 #include <sys/auxv.h>
 #endif
@@ -52,9 +58,12 @@
 #endif
 #include <sys/wait.h>
 #include <time.h>
+#include <wchar.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <string>
+#include <vector>
 #include <cmath>
 #include <cstdint>
 
@@ -115,6 +124,9 @@ constexpr uint32_t kHookLockdown = 4;
 constexpr uint32_t kHookFork = 5;
 constexpr uint32_t kHookScan = 6;
 constexpr uint32_t kHookBadPixels = 7;
+
+// Test runs only: workers log stray system calls instead of being killed for them (--log-seccomp).
+bool gSeccompLog = false;
 #endif
 
 }  // namespace
@@ -443,6 +455,15 @@ __asm__(
     "    bti c\n"
     "    b _setjmp\n"
     ".size __wrap_setjmp, . - __wrap_setjmp\n");
+#elif defined(__x86_64__) && defined(__BIONIC__)
+// The same for an x86_64 device build (Cuttlefish): a jump keeps the caller's return address on the stack.
+__asm__(
+    ".text\n"
+    ".globl __wrap_setjmp\n"
+    ".type __wrap_setjmp, @function\n"
+    "__wrap_setjmp:\n"
+    "    jmp _setjmp\n"
+    ".size __wrap_setjmp, . - __wrap_setjmp\n");
 #endif
 
 void png_read_input(png_structp png, png_bytep out, size_t n) {
@@ -715,6 +736,11 @@ bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool hea
         jpeg_calc_output_dimensions(&cinfo);
         fit_box(cinfo.output_width, cinfo.output_height, maxW, maxH, &ow, &oh);
         room = kJpegSlack;  // the band of full blocks in memory, the rest goes to the DC store
+    } else {
+        // The whole store fits: libjpeg may use everything the arena has. Its own allocations so far (the
+        // controllers, the source buffer) count against max_memory_to_use too, and a limit of exactly the store would
+        // push a wide image's arrays to the backing store, which fails (an INVALID instead of a decode).
+        room = arena_left();
     }
     cinfo.mem->max_memory_to_use = static_cast<long>(room);
     jpeg_start_decompress(&cinfo);
@@ -870,52 +896,105 @@ bool may_be_animated(uint32_t format) {
 
 #include "warmup_images.h"
 
-// The static bionic of the VM program picks the implementation of each string function (memcpy, strlen and the rest)
-// on its first call, behind a C++ static guard, and a guard's first use asks for the thread id (gettid): a system
-// call, so a worker that made the first call of one was killed (GIF, WBMP and DNG on arm64, found in the arm64 test
-// run). Each is called once here, through volatile pointers the compiler cannot replace with inline code.
-void warm_up_libc() {
-    static void* (*volatile const vMemchr)(const void*, int, size_t) = memchr;
+// The static bionic of the VM program picks the implementation of each string function on its first call, behind a
+// C++ static guard, and a guard's first use asks for the thread id (gettid): a system call, so a worker that made the
+// first call of one was killed (GIF, WBMP and DNG on arm64, found in the arm64 test run). Each function bionic
+// dispatches on arm64 (DEFINE_IFUNC_FOR in bionic/libc/arch-arm64/ifuncs.cpp, all 17) is called once here, through
+// volatile pointers the compiler cannot replace with inline code. tools/audit-vm-init.sh checks the linked program
+// for any other first-use guard. True when every result is the expected one.
+bool warm_up_libc() {
+    // Lambdas where C and C++ declare different overloads (bionic, and glibc for the host test build).
+    static const void* (*volatile const vMemchr)(const void*, int, size_t) = [](const void* p, int c,
+                                                                              size_t n) -> const void* {
+        return memchr(p, c, n);
+    };
     static int (*volatile const vMemcmp)(const void*, const void*, size_t) = memcmp;
     static void* (*volatile const vMemcpy)(void*, const void*, size_t) = memcpy;
     static void* (*volatile const vMemmove)(void*, const void*, size_t) = memmove;
+    static const void* (*volatile const vMemrchr)(const void*, int, size_t) = [](const void* p, int c,
+                                                                               size_t n) -> const void* {
+        return memrchr(p, c, n);
+    };
     static void* (*volatile const vMemset)(void*, int, size_t) = memset;
-    static char* (*volatile const vStrchr)(const char*, int) = strchr;
-    // strchrnul is overloaded in bionic's C++ declarations and not in glibc's (the host test build): a lambda fits both.
+    static char* (*volatile const vStpcpy)(char*, const char*) = stpcpy;
+    static const char* (*volatile const vStrchr)(const char*, int) = [](const char* p, int c) -> const char* {
+        return strchr(p, c);
+    };
     static const char* (*volatile const vStrchrnul)(const char*, int) = [](const char* p, int c) -> const char* {
         return strchrnul(p, c);
     };
     static int (*volatile const vStrcmp)(const char*, const char*) = strcmp;
+    static char* (*volatile const vStrcpy)(char*, const char*) = strcpy;
     static size_t (*volatile const vStrlen)(const char*) = strlen;
     static int (*volatile const vStrncmp)(const char*, const char*, size_t) = strncmp;
     static size_t (*volatile const vStrnlen)(const char*, size_t) = strnlen;
-    static char* (*volatile const vStrrchr)(const char*, int) = strrchr;
+    static const char* (*volatile const vStrrchr)(const char*, int) = [](const char* p, int c) -> const char* {
+        return strrchr(p, c);
+    };
+    static size_t (*volatile const vWcslen)(const wchar_t*) = wcslen;
+    static const wchar_t* (*volatile const vWmemchr)(const wchar_t*, wchar_t, size_t) = [](const wchar_t* p, wchar_t c,
+                                                                                           size_t n) -> const wchar_t* {
+        return wmemchr(p, c, n);
+    };
     static int (*volatile const vGetpagesize)() = getpagesize;
-    char a[32] = "warm up the string functions";
-    char b[32];
-    vMemset(b, 0, sizeof(b));
-    vMemcpy(b, a, 8);
-    vMemmove(b + 1, b, 8);
-    size_t n = vStrlen(a) + vStrnlen(a, sizeof(a)) + static_cast<size_t>(vMemcmp(a, b, 4)) +
-               static_cast<size_t>(vStrcmp(a, b)) + static_cast<size_t>(vStrncmp(a, b, 4)) +
-               static_cast<size_t>(vGetpagesize());
-    n += vMemchr(a, 'u', sizeof(a)) != nullptr;
-    n += vStrchr(a, 'u') != nullptr;
-    n += vStrchrnul(a, 'u') != nullptr;
-    n += vStrrchr(a, 'u') != nullptr;
-    a[0] = static_cast<char>(n);
+    const char a[] = "warm up the string functions";  // 28 characters
+    const wchar_t wa[] = L"warm";
+    char b[64];
+    bool ok = vMemset(b, 0, sizeof(b)) == b;
+    ok &= vMemcpy(b, a, sizeof(a)) == b && vMemcmp(a, b, sizeof(a)) == 0 && vStrcmp(a, b) == 0;
+    ok &= vMemmove(b + 1, b, 8) == b + 1 && vStrncmp(a, b, 1) == 0 && vStrncmp(a, b, 4) != 0;
+    ok &= vStrcpy(b, a) == b && vStpcpy(b, a) == b + 28 && vStrlen(b) == 28 && vStrnlen(b, 4) == 4;
+    ok &= vMemchr(a, 'u', sizeof(a)) == a + 5 && vMemrchr(a, 'u', sizeof(a)) == a + 20;
+    ok &= vStrchr(a, 'u') == a + 5 && vStrchrnul(a, '!') == a + 28 && vStrrchr(a, 'u') == a + 20;
+    ok &= vWcslen(wa) == 4 && vWmemchr(wa, L'r', 4) == wa + 2 && vGetpagesize() > 0;
+    return ok;
 }
 
-void warm_up() {
-    warm_up_libc();
+// The program is linked with BTI (Android.bp, the platform's bti-report=error) and the kernel guards its code pages
+// when the CPU has BTI. Checked once, so the marking cannot get lost unseen: on a CPU with BTI the page that holds
+// this function must be guarded ("bt" in its VmFlags in /proc/self/smaps), else the broker does not serve. True
+// without BTI in the CPU, and on other architectures.
+bool bti_as_built() {
+#if defined(__aarch64__) && !defined(DECODER_HOST_TEST)
+    if ((getauxval(AT_HWCAP2) & (1ul << 17)) == 0) return true;  // HWCAP2_BTI
+    const uintptr_t self = reinterpret_cast<uintptr_t>(&bti_as_built);
+    int fd = open("/proc/self/smaps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    static char buf[256 << 10];
+    size_t n = 0;
+    for (ssize_t k; n < sizeof(buf) - 1 && (k = read(fd, buf + n, sizeof(buf) - 1 - n)) > 0;) n += static_cast<size_t>(k);
+    close(fd);
+    buf[n] = 0;
+    bool inside = false;
+    for (char* line = buf; line != nullptr && *line != 0;) {
+        char* next = strchr(line, '\n');
+        if (next != nullptr) *next++ = 0;
+        unsigned long lo, hi;
+        char dash;
+        if (sscanf(line, "%lx%c%lx", &lo, &dash, &hi) == 3 && dash == '-') {
+            inside = self >= lo && self < hi;
+        } else if (inside && strncmp(line, "VmFlags:", 8) == 0) {
+            return strstr(line, " bt") != nullptr;
+        }
+        line = next;
+    }
+    return false;
+#else
+    return true;
+#endif
+}
+
+// The warm-ups before the zygote forks, all with built-in images. A warm-up that fails means a library no longer
+// sets itself up as expected, and a worker might then be the first to do it: the broker does not serve (fail closed).
+bool warm_up() {
+    if (!warm_up_libc()) return false;
     Sink sink = {-1, static_cast<uint8_t*>(malloc(kStripeBytes)), 0};
-    if (sink.buf == nullptr) return;
-    uint32_t w, h;
-    decode_png(kWarmupPng, sizeof(kWarmupPng), 5, 3, &sink, false, &w, &h);
-    decode_jpeg(kWarmupJpeg, sizeof(kWarmupJpeg), 5, 3, &sink, false, &w, &h);
+    if (sink.buf == nullptr) return false;
+    uint32_t w = 0, h = 0;
+    bool ok = decode_png(kWarmupPng, sizeof(kWarmupPng), 5, 3, &sink, false, &w, &h);
+    ok &= decode_jpeg(kWarmupJpeg, sizeof(kWarmupJpeg), 5, 3, &sink, false, &w, &h);
     free(sink.buf);
-    warm_up_webp();
-    warm_up_heif();
+    return ok && warm_up_webp() && warm_up_heif();
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -923,12 +1002,61 @@ void warm_up() {
 // worker ever inherits another request's file, pixels or metadata from the broker's memory. A worker gets its file
 // as a memory file mapped read-only, and its output pipe.
 
+// Memory, from /proc/meminfo (the broker, and a worker before its lockdown). The arena is mapped as large as the VM's
+// memory (never below kArenaDefault, never above 1 GiB). What a worker may really use is decided when it starts: the
+// memory the VM has free then (MemAvailable, which already leaves out the request's memory file), less a margin for
+// what the worker touches outside the arena (its stack, its copies of the broker's pages, page tables, the kernel's
+// own reserve). So a file that needs more than the VM has is refused cleanly, and the kernel's out-of-memory killer
+// never decides it.
+constexpr uint64_t kWorkerMargin = 16u << 20;
+
+#ifdef DECODER_HOST_TEST
+// The host test program pretends to be a VM of DECODER_VM_RAM_MIB (default 160), with what the arm64 test VM had
+// free at that size after the broker's start (kHostVmUsed, measured: MemTotal 141 MiB, MemAvailable 119 MiB).
+constexpr uint64_t kHostVmUsed = 41u << 20;
+
+uint64_t meminfo(const char* key) {
+    const char* mib = getenv("DECODER_VM_RAM_MIB");
+    uint64_t total = (mib != nullptr ? static_cast<uint64_t>(atoi(mib)) : 160u) << 20;
+    if (strcmp(key, "MemTotal") == 0) return total;
+    return total > kHostVmUsed ? total - kHostVmUsed : 0;
+}
+#else
+uint64_t meminfo(const char* key) {
+    int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    size_t k = strlen(key);
+    for (const char* line = buf; line != nullptr && *line != 0;) {
+        if (strncmp(line, key, k) == 0 && line[k] == ':') return strtoull(line + k + 1, nullptr, 10) << 10;
+        line = strchr(line, '\n');
+        if (line != nullptr) line++;
+    }
+    return 0;
+}
+#endif
+
+size_t arena_bytes_for(uint64_t ram) {
+    return static_cast<size_t>(std::clamp<uint64_t>(ram, kArenaDefault, 1ull << 30));
+}
+
+// What a worker starting now may grow its arena to. 0 when the VM's memory cannot be read.
+size_t worker_memory() {
+    uint64_t avail = meminfo("MemAvailable");
+    return avail > kWorkerMargin ? static_cast<size_t>(std::min<uint64_t>(avail - kWorkerMargin, SIZE_MAX)) : 0;
+}
+
 // Worker exit codes. A signal (seccomp's kill, the CPU limit, the broker's kill at the wall deadline) or an exit code
 // other than these counts as internal: not a verdict on the file.
 constexpr int kExitOk = 0;
 constexpr int kExitDecodeFailed = 3;
 constexpr int kExitLockdown = 4;
 constexpr int kExitUnsupported = 6;  // a valid file of a kind the VM does not decode
+constexpr int kExitBusy = 7;         // the VM's free memory could not be read: not the file's fault
 
 [[noreturn]] void worker_exit(int code) {
     syscall(__NR_exit, code);
@@ -991,6 +1119,8 @@ int lockdown(int out, int in = -1) {
         close(statm);
     }
     if (vmBytes == 0) worker_exit(kExitLockdown);
+    size_t memory = worker_memory();
+    if (memory == 0) worker_exit(kExitBusy);
     // Only the output pipe stays open, as fd 0, and a streamed input as fd 1.
     if (in == 0) {
         in = dup(in);  // out's place: move it away first
@@ -1026,7 +1156,25 @@ int lockdown(int out, int in = -1) {
         worker_exit(kExitLockdown);
     }
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) worker_exit(kExitLockdown);
-    arena_enter_worker();
+    arena_enter_worker(memory);
+#if defined(DECODER_TEST_HOOKS) && !defined(DECODER_HOST_TEST)
+    if (gSeccompLog) {
+        // Test runs only (--log-seccomp): strict mode's four system calls are allowed, every other one is logged by
+        // the kernel (audit type 1326) and allowed, so one run lists every stray system call instead of the first.
+        sock_filter f[] = {
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_read, 4, 0),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_write, 3, 0),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit, 2, 0),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigreturn, 1, 0),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_LOG),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        };
+        sock_fprog prog = {static_cast<unsigned short>(sizeof(f) / sizeof(f[0])), f};
+        if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) != 0) return errno;
+        return 0;
+    }
+#endif
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0) != 0) return errno;
     return 0;
 }
@@ -1155,6 +1303,7 @@ struct ZygoteRequest {
 struct ZygoteReply {
     int32_t kind;  // 1: started (value is the pid), 2: ended (value is the wait status), 3: fork failed
     int32_t value;
+    int32_t cpuMs;  // ended: the worker's CPU time
 };
 
 int gZygote = -1;  // the broker's end of the zygote socket
@@ -1194,13 +1343,16 @@ pid_t gZygotePid = -1;
         }
         close(fds[0]);
         close(fds[1]);
-        ZygoteReply started = {pid > 0 ? 1 : 3, static_cast<int32_t>(pid)};
+        ZygoteReply started = {pid > 0 ? 1 : 3, static_cast<int32_t>(pid), 0};
         if (!write_all(sock, &started, sizeof(started))) _exit(1);
         if (pid < 0) continue;
         int status = 0;
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        rusage ru = {};
+        while (wait4(pid, &status, 0, &ru) < 0 && errno == EINTR) {
         }
-        ZygoteReply ended = {2, status};
+        int64_t cpu = (static_cast<int64_t>(ru.ru_utime.tv_sec) + ru.ru_stime.tv_sec) * 1000 +
+                      (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000;
+        ZygoteReply ended = {2, status, static_cast<int32_t>(std::min<int64_t>(cpu, INT32_MAX))};
         if (!write_all(sock, &ended, sizeof(ended))) _exit(1);
     }
 }
@@ -1258,13 +1410,32 @@ constexpr int kZygoteMs = 10000;
     _exit(1);  // PID 1 ends: the VM stops, Android answers "unavailable" and starts it again
 }
 
-// How a worker ended.
-enum class Ended { kClean, kDecodeFailed, kUnsupported, kInternal };
+// How a worker ended. kBusy: stopped for a reason outside the file (see kBusy in proto.h).
+enum class Ended { kClean, kDecodeFailed, kUnsupported, kBusy, kInternal };
+
+// The kernel's count of out-of-memory kills so far (/proc/vmstat).
+uint64_t oom_kills() {
+#ifdef DECODER_HOST_TEST
+    return 0;
+#else
+    int fd = open("/proc/vmstat", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    static char buf[16384];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    const char* p = strstr(buf, "\noom_kill ");
+    return p != nullptr ? strtoull(p + 10, nullptr, 10) : 0;
+#endif
+}
 
 struct Worker {
     pid_t pid = -1;
     int pipe = -1;
     int64_t deadline = 0;
+    int64_t started = 0;      // when the broker started it
+    uint64_t oomBefore = 0;   // oom_kills() then
     // What a streaming worker wrote while the broker was still passing it the file: kept in a memory file, read
     // before the pipe.
     int bufFd = -1;
@@ -1275,6 +1446,8 @@ struct Worker {
 // Ends the current worker, at once with kill, else after it exits on its own (a grace period, then killed anyway).
 Ended end_worker(Worker* w, bool kill) {
     if (w->pid < 0) return Ended::kInternal;
+    const int64_t started = w->started;
+    const uint64_t oomBefore = w->oomBefore;
     ZygoteReply ended = {};
     ssize_t n = 0;
     if (!kill) n = read_full(gZygote, &ended, sizeof(ended), now_ms() + 2000, 2000);
@@ -1291,11 +1464,33 @@ Ended end_worker(Worker* w, bool kill) {
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitOk) return Ended::kClean;
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitDecodeFailed) return Ended::kDecodeFailed;
     if (WIFEXITED(status) && WEXITSTATUS(status) == kExitUnsupported) return Ended::kUnsupported;
-    return Ended::kInternal;  // a signal (seccomp, CPU limit, our kill), the lockdown, anything else
+    if (WIFEXITED(status) && WEXITSTATUS(status) == kExitBusy) return Ended::kBusy;
+    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) {
+        // Killed, not by the file: the kernel's out-of-memory killer took it, or the broker ended a worker that sat
+        // at its idle or wall limit having had less than half the time on a CPU (the VM was starved, a file that
+        // makes a worker spin uses the CPU and is killed by the CPU limit or counts as the file's). seccomp's kill
+        // and the CPU limit stay internal: a strike when the same file does it twice.
+        uint64_t elapsed = static_cast<uint64_t>(std::max<int64_t>(0, now_ms() - started));
+        if (oom_kills() > oomBefore) return Ended::kBusy;
+        if (elapsed + 1000 >= static_cast<uint64_t>(kIdleMs) && static_cast<uint64_t>(ended.cpuMs) * 2 < elapsed) {
+            return Ended::kBusy;
+        }
+    }
+    return Ended::kInternal;  // a signal (seccomp, CPU limit, a crash), the lockdown, anything else
 }
 
 int32_t status_of(Ended e) {
-    return e == Ended::kDecodeFailed ? kInvalid : e == Ended::kUnsupported ? kUnsupported : kInternal;
+    switch (e) {
+        case Ended::kDecodeFailed: return kInvalid;
+        case Ended::kUnsupported: return kUnsupported;
+        case Ended::kBusy: return kBusy;
+        default: return kInternal;
+    }
+}
+
+// The trailer's verdict for a worker that ended after its pixels were promised: never UNSUPPORTED there.
+int32_t late_status(Ended e) {
+    return e == Ended::kUnsupported ? kInvalid : status_of(e);
 }
 
 // A worker's output, the part kept while the file was streaming first, then the pipe. Like read_full.
@@ -1459,7 +1654,9 @@ bool start_worker(const Request& rq, uint32_t format, int input, uint32_t len, b
     }
     w->pid = started.value;
     w->pipe = fds[0];
-    w->deadline = now_ms() + kWorkerWallMs;
+    w->started = now_ms();
+    w->deadline = w->started + kWorkerWallMs;
+    w->oomBefore = oom_kills();
     return true;
 }
 
@@ -1546,7 +1743,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
         if (got != static_cast<ssize_t>(want) || !premultiplied(gStripe, want)) {
             bool bad = got == static_cast<ssize_t>(want);
             Ended e = end_worker(w, true);
-            verdict = bad || e == Ended::kDecodeFailed ? kInvalid : kInternal;
+            verdict = bad ? kInvalid : late_status(e);
             wipe(gStripe, sizeof(gStripe));
             while (left > 0) {
                 size_t k = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), left));
@@ -1565,7 +1762,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
     uint8_t extra;
     ssize_t more = worker_read(w, &extra, 1, w->deadline, kIdleMs);
     Ended e = end_worker(w, more != 0);
-    verdict = more != 0 ? kInvalid : e == Ended::kClean ? kOk : status_of(e);
+    verdict = more != 0 ? kInvalid : e == Ended::kClean ? kOk : late_status(e);
     return send_end(c, verdict);
 }
 
@@ -1714,56 +1911,76 @@ int listen_host(int argc, char** argv) {
 #endif
 }
 
-// The VM's memory. Test builds may pretend to be a VM of DECODER_VM_RAM_MIB (the host program by default 160, the VM's
-// own size, the device test program when the kernel command line sets it).
-uint64_t vm_ram() {
-#ifdef DECODER_TEST_HOOKS
-    const char* mib = getenv("DECODER_VM_RAM_MIB");
-    if (mib != nullptr) return static_cast<uint64_t>(atoi(mib)) << 20;
-#endif
-#ifdef DECODER_HOST_TEST
-    return 160ull << 20;
-#else
-    struct sysinfo si;
-    if (sysinfo(&si) != 0) return 0;
-    return static_cast<uint64_t>(si.totalram) * si.mem_unit;
-#endif
-}
-
-// The arena: the VM's memory less what the kernel, the broker, the zygote and one request's buffered file (a memory
-// file of at most kMaxBufferedBytes, or a streamed thumbnail's early output, never both) take. Never below
-// kArenaDefault, never above 1 GiB. In a VM of 160 MiB that is 96 MiB.
-constexpr uint64_t kVmReserve = 64u << 20;
-
-size_t arena_bytes_for(uint64_t ram) {
-    uint64_t a = ram > kVmReserve ? ram - kVmReserve : 0;
-    return static_cast<size_t>(std::clamp<uint64_t>(a, kArenaDefault, 1ull << 30));
-}
-
 #ifdef DECODER_TEST_HOOKS
 // Test builds only (the host program, and the device test program booted as /init with these arguments): "--bench W H
 // FILE...". Each file is decoded into a W x H thumbnail (0 0: its header only) by a forked worker under
 // the real lockdown, strict seccomp included. Prints the wall time from fork to exit and the arena's peak, the most of
 // it the decoders touched.
-int bench(int argc, char** argv) {
-    uint32_t bw = static_cast<uint32_t>(atoi(argv[2])), bh = static_cast<uint32_t>(atoi(argv[3]));
+// Test builds: the VM's memory as the broker sees it, and what a worker starting now would get.
+void print_memory(const char* who) {
+    printf("%s memory total %llu MiB, available %llu MiB, arena mapped %zu MiB, a worker now %zu MiB", who,
+           static_cast<unsigned long long>(meminfo("MemTotal") >> 20),
+           static_cast<unsigned long long>(meminfo("MemAvailable") >> 20), arena_limit() >> 20, worker_memory() >> 20);
 #if defined(__aarch64__)
     // Whether this CPU enforces BTI (HWCAP2_BTI, bit 17): then a stray indirect branch kills a worker.
-    printf("bench cpu bti %d, arena %zu MiB\n", (getauxval(AT_HWCAP2) & (1ul << 17)) != 0, arena_limit() >> 20);
-#else
-    printf("bench arena %zu MiB\n", arena_limit() >> 20);
+    printf(", cpu bti %d", (getauxval(AT_HWCAP2) & (1ul << 17)) != 0);
 #endif
+    printf("%s\n", gSeccompLog ? ", seccomp log only" : "");
+    fflush(stdout);
+}
+
+int bench(int argc, char** argv) {
+    uint32_t bw = static_cast<uint32_t>(atoi(argv[2])), bh = static_cast<uint32_t>(atoi(argv[3]));
+    print_memory("bench");
+#ifndef DECODER_HOST_TEST
+    if (gSeccompLog) {
+        // The control: a worker that makes one forbidden system call (getppid) must show as one logged call.
+        int fds[2];
+        if (pipe2(fds, O_CLOEXEC) == 0) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                close(fds[0]);
+                if (lockdown(fds[1]) != 0) worker_exit(kExitLockdown);
+                syscall(__NR_getppid);
+                worker_exit(kExitOk);
+            }
+            close(fds[1]);
+            int status = 0;
+            if (pid > 0) waitpid(pid, &status, 0);
+            close(fds[0]);
+            printf("bench seccomp log control: getppid (%d) logged, worker exit 0x%x\n", __NR_getppid, status);
+        }
+    }
+#endif
+    // A folder stands for every file in it (a fuzzing corpus).
+    std::vector<std::string> paths;
     for (int i = 4; i < argc; i++) {
-        int fd = open(argv[i], O_RDONLY | O_CLOEXEC);
+        struct stat st;
+        DIR* dir = stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode) ? opendir(argv[i]) : nullptr;
+        if (dir == nullptr) {
+            paths.push_back(argv[i]);
+            continue;
+        }
+        std::vector<std::string> names;
+        for (dirent* e; (e = readdir(dir)) != nullptr;) {
+            if (e->d_name[0] != '.') names.push_back(std::string(argv[i]) + "/" + e->d_name);
+        }
+        closedir(dir);
+        std::sort(names.begin(), names.end());
+        paths.insert(paths.end(), names.begin(), names.end());
+    }
+    for (const std::string& path : paths) {
+        const char* name = path.c_str();
+        int fd = open(name, O_RDONLY | O_CLOEXEC);
         struct stat st;
         if (fd < 0 || fstat(fd, &st) != 0) {
-            printf("bench %s: cannot read\n", argv[i]);
+            printf("bench %s: cannot read\n", name);
             continue;
         }
         size_t size = static_cast<size_t>(st.st_size);
         void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
-        if (map == MAP_FAILED) continue;
+        if (size == 0 || map == MAP_FAILED) continue;
         const uint8_t* data = static_cast<const uint8_t*>(map);
         uint32_t format = detect_format(data, std::min(size, kMagicBytes), size);
         int fds[2];
@@ -1796,10 +2013,10 @@ int bench(int argc, char** argv) {
         int64_t ms = now_ms() - t0;
         munmap(map, size);
         if (n != static_cast<ssize_t>(sizeof(msg))) {
-            printf("bench %s format %u: worker died (status 0x%x) after %lld ms\n", argv[i], format, status,
+            printf("bench %s format %u: worker died (status 0x%x) after %lld ms\n", name, format, status,
                    static_cast<long long>(ms));
         } else {
-            printf("bench %s format %u %ux%u: %s in %lld ms, arena peak %.1f MiB\n", argv[i], format, bw, bh,
+            printf("bench %s format %u %ux%u: %s in %lld ms, arena peak %.1f MiB\n", name, format, bw, bh,
                    msg[0] ? "ok" : msg[2] ? "unsupported" : "refused", static_cast<long long>(ms), msg[1] / 1024.0);
         }
         fflush(stdout);
@@ -1810,19 +2027,91 @@ int bench(int argc, char** argv) {
 
 }  // namespace
 
+#if defined(DECODER_TEST_HOOKS) && !defined(DECODER_HOST_TEST)
+// Test runs only (the device test program in the arm64 test VM, which has no vsock): the broker serves one virtio
+// serial port (found by its name) instead, with the zygote, the memory files, the pump and the workers as in
+// the product. A host side that is not connected reads as the end of the stream: the broker waits and tries again.
+int serve_port(const char* name) {
+    // The port by its name (qemu's virtserialport name=...), through sysfs, as a device node made here.
+    int devErr = mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, nullptr) == 0 ? 0 : errno;
+    mkdir("/sys", 0755);
+    int sysErr = mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, nullptr) == 0 ? 0 : errno;
+    print_memory("serve");
+    int c = -1;
+    for (int tries = 0; tries < 100 && c < 0; tries++) {
+        DIR* d = opendir("/sys/class/virtio-ports");
+        for (dirent* e; d != nullptr && c < 0 && (e = readdir(d)) != nullptr;) {
+            if (e->d_name[0] == '.') continue;
+            char path[256], buf[64] = {};
+            snprintf(path, sizeof(path), "/sys/class/virtio-ports/%s/name", e->d_name);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd < 0) continue;
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            if (n <= 0 || strncmp(buf, name, strlen(name)) != 0 || (buf[strlen(name)] != '\n' && buf[strlen(name)] != 0)) {
+                continue;
+            }
+            snprintf(path, sizeof(path), "/sys/class/virtio-ports/%s/dev", e->d_name);
+            fd = open(path, O_RDONLY | O_CLOEXEC);
+            memset(buf, 0, sizeof(buf));
+            n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+            if (fd >= 0) close(fd);
+            unsigned major = 0, minor = 0;
+            if (n <= 0 || sscanf(buf, "%u:%u", &major, &minor) != 2) continue;
+            unlink("/dev/decoder-port");
+            if (mknod("/dev/decoder-port", S_IFCHR | 0600, makedev(major, minor)) == 0) {
+                c = open("/dev/decoder-port", O_RDWR | O_CLOEXEC);
+            }
+        }
+        if (d != nullptr) closedir(d);
+        if (c < 0) usleep(100000);
+    }
+    if (c < 0) {
+        printf("serve: no virtio port named %s (devtmpfs %d, sysfs %d)\n", name, devErr, sysErr);
+        return 1;
+    }
+    printf("serve: ready on port %s\n", name);
+    fflush(stdout);
+    for (;;) {
+        while (serve_one(c)) {
+        }
+        usleep(100000);
+    }
+}
+#endif
+
 int main(int argc, char** argv) {
     setup();
-    size_t arenaBytes = arena_bytes_for(vm_ram());
+    size_t arenaBytes = arena_bytes_for(meminfo("MemTotal"));
     void* arena = mmap(nullptr, arenaBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (arena == MAP_FAILED) return 1;
     arena_setup(static_cast<uint8_t*>(arena), arenaBytes);
-    warm_up();
+#ifdef DECODER_TEST_HOOKS
+    if (argc >= 2 && strcmp(argv[1], "--log-seccomp") == 0) {
+        gSeccompLog = true;
+        argv[1] = argv[0];
+        argv++;
+        argc--;
+    }
+#endif
+    // A library that no longer sets itself up in the warm-up, or a program whose BTI marking is lost: no service.
+    if (!warm_up()) {
+        printf("decoder: warm-up failed\n");
+        return 1;
+    }
+    if (!bti_as_built()) {
+        printf("decoder: code pages not BTI guarded\n");
+        return 1;
+    }
 #ifdef DECODER_TEST_HOOKS
     if (argc >= 4 && strcmp(argv[1], "--bench") == 0) return bench(argc, argv);
 #endif
     // No seccomp, no service: Android sees a VM that never answers and fails closed.
     if (!lockdown_works()) return 1;
     if (!start_zygote()) return 1;
+#if defined(DECODER_TEST_HOOKS) && !defined(DECODER_HOST_TEST)
+    if (argc >= 3 && strcmp(argv[1], "--serve-port") == 0) return serve_port(argv[2]);
+#endif
     int ls = listen_host(argc, argv);
     if (ls < 0) return 1;
     for (;;) {

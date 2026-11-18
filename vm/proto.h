@@ -20,7 +20,8 @@
 //
 //   request:  Request header, then inputLen bytes of the file.
 //   reply:    Reply header, then payloadLen bytes, then an End trailer. A worker that fails after the header was
-//             sent makes the broker close the connection instead of sending the trailer.
+//             sent: the broker keeps the promised length with zeros and the trailer carries the verdict (INVALID,
+//             INTERNAL or BUSY). A trailer after pixels is never UNSUPPORTED.
 
 #pragma once
 
@@ -47,7 +48,9 @@ enum Status : int32_t {
     kOk = 0,
     kUnsupported = 2,  // not a format the VM decodes, or a kind of it the VM does not decode (a 10-bit HEIF)
     kInvalid = 3,      // broken or hostile file, or a limit was hit
-    kInternal = 4,     // the broker itself failed (no pipe, no fork)
+    kInternal = 4,     // the worker died (seccomp's kill, a crash, the CPU limit) or the broker failed (no pipe, no fork)
+    kBusy = 5,         // the worker was stopped for a reason outside the file: the VM ran out of memory, or the worker
+                       // got too little CPU before the wall deadline. Never a verdict on the file: try again later.
 };
 
 // The contract's FORMAT_* values (IDecodeService.aidl).

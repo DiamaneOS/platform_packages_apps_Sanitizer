@@ -32,19 +32,22 @@ namespace decoder {
 // realloc, free and the aligned forms), comes from one fixed arena with a real free list, so a decoder that frees
 // and allocates again per tile or frame stays within it. In the broker (the warm-up) it is the C library's heap.
 //
-// The arena is the VM's memory less what the kernel, the broker and one request's buffered file need (decoder_vm.cpp,
-// arena_bytes_for). A worker starts with kArenaDefault of it and a decoder that knows from the declared size that it
-// needs more (a large single HEVC image, a large progressive JPEG) asks for it with arena_allow, up to the whole arena.
+// The arena is mapped as large as the VM's memory (decoder_vm.cpp, arena_bytes_for), and each worker may grow into it
+// only as far as the memory the VM has free when that worker starts, less a margin (worker_memory): so a worker is
+// refused memory cleanly instead of being killed by the kernel. A worker starts with kArenaDefault (or less, when less
+// is free) and a decoder that knows from the declared size that it needs more (a large single HEVC image, a large
+// progressive JPEG) asks for it with arena_allow.
 
 constexpr size_t kArenaDefault = 64u << 20;
 
 void arena_setup(uint8_t* base, size_t size);
-// Lets this worker use up to n bytes of the arena in all (never more than the arena). True when that much is allowed.
+// Lets this worker use up to n bytes of the arena in all (never more than its memory). True when that much is allowed.
 bool arena_allow(size_t n);
 // True when another n bytes fit, asking for them when they do not fit the current allowance.
 bool arena_room(size_t n);
-size_t arena_limit();  // the whole arena
-void arena_enter_worker();  // from now on malloc and friends use the arena, which starts empty
+size_t arena_limit();  // the whole arena, in a worker what it may grow to
+// From now on malloc and friends use the arena, which starts empty, and this worker may grow to memory bytes of it.
+void arena_enter_worker(size_t memory);
 bool arena_in_worker();
 void* arena_alloc(size_t n);
 void* arena_calloc(size_t n, size_t k);
@@ -125,7 +128,7 @@ bool decode_dng(const uint8_t*, size_t, uint32_t, uint32_t, Sink*, bool, uint32_
 
 // Warm-ups that the broker runs before it forks: libraries that check the CPU through /proc or set up their tables
 // once per process do it here, never in a worker.
-void warm_up_webp();
-void warm_up_heif();
+bool warm_up_webp();  // false when a warm-up image did not decode
+bool warm_up_heif();
 
 }  // namespace decoder

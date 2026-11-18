@@ -182,13 +182,15 @@ bool decode_webp(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
                            : decode_still(data, size, f, maxW, maxH, sink);
 }
 
-void warm_up_webp() {
+bool warm_up_webp() {
     uint8_t out[16 * 16 * 4];
+    bool ok = true;
     for (const auto& img : {std::make_pair(kWarmupWebpLossy, sizeof(kWarmupWebpLossy)),
                             std::make_pair(kWarmupWebpLossless, sizeof(kWarmupWebpLossless))}) {
-        decode_into(img.first, img.second, 16, 16, 16, 16, out);
-        decode_into(img.first, img.second, 16, 16, 5, 3, out);
+        ok &= decode_into(img.first, img.second, 16, 16, 16, 16, out);
+        ok &= decode_into(img.first, img.second, 16, 16, 5, 3, out);
     }
+    return ok;
 }
 
 }  // namespace decoder

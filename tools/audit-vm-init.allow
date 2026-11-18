@@ -1,0 +1,94 @@
+# audit-vm-init.allow: the known callers of first-use system calls in the decoder VM program (tools/audit-vm-init.sh),
+# "TARGET CALLER" with mangled names, grouped by why a worker never makes that call. A new caller fails the audit
+# until it is understood and added here with its reason.
+
+# Warmed up in the broker before the zygote forks any worker (vm/decoder_vm.cpp warm_up_libc and warm_up, fmt_heif.cpp
+# warm_up_heif): bionic's string function dispatch, getpagesize, zlib's CPU check (the PNG warm-up), dav1d's set-up
+# and its 12-bit transform tables (the 12-bit AVIF warm-up). scudo is the broker's own heap, set up at start: a
+# worker allocates from its arena only (malloc and the rest are wrapped).
+__cxa_guard_acquire _Z9page_sizev
+__cxa_guard_acquire getpagesize
+__cxa_guard_acquire memchr
+__cxa_guard_acquire memcmp
+__cxa_guard_acquire memcpy
+__cxa_guard_acquire memmove
+__cxa_guard_acquire memrchr
+__cxa_guard_acquire memset
+__cxa_guard_acquire stpcpy
+__cxa_guard_acquire strchr
+__cxa_guard_acquire strchrnul
+__cxa_guard_acquire strcmp
+__cxa_guard_acquire strcpy
+__cxa_guard_acquire strlen
+__cxa_guard_acquire strncmp
+__cxa_guard_acquire strnlen
+__cxa_guard_acquire strrchr
+__cxa_guard_acquire wcslen
+__cxa_guard_acquire wmemchr
+clock_gettime _ZN5scudo16getMonotonicTimeEv
+clock_gettime _ZN5scudo20getMonotonicTimeFastEv
+gettid _ZN5scudo11getThreadIDEv
+pthread_once _ZN5scudo18TSDRegistrySharedTINS_9AllocatorINS_19AndroidNormalConfigEXadL_Z21scudo_malloc_postinitEEEELj8ELj2EE10initThreadEPS3_
+pthread_once adler32_z
+pthread_once cpu_check_features
+pthread_once crc32
+pthread_once crc32_z
+pthread_once dav1d_init_last_nonzero_col_from_eob_tables
+pthread_once dav1d_itx_dsp_init_16bpc
+pthread_once dav1d_open
+sched_getaffinity _ZN5scudo15getNumberOfCPUsEv
+
+# The broker, the zygote and process start only, never after a worker's lockdown: the broker's clock and I/O loops,
+# fork (the zygote), libc's start-up, its exit handlers and its internal allocator.
+__cxa_guard_acquire _Z21__libc_init_mte_stackPv
+__cxa_guard_acquire _Z22__free_temp_bionic_tlsP10bionic_tls
+__cxa_guard_acquire _Z26__allocate_temp_bionic_tlsv
+__cxa_guard_acquire _Z29stack_mte_ringbuffer_allocatemPKc
+__cxa_guard_acquire _ZL16__real_libc_initR19KernelArgumentBlockPvPFiiPPcS3_EPK17structors_array_tP10bionic_tcb
+__cxa_guard_acquire _ZN12_GLOBAL__N_111AtexitArray12set_writableEbmm
+__cxa_guard_acquire _ZN12_GLOBAL__N_111AtexitArray17page_end_of_indexEm
+__cxa_guard_acquire _ZN15BionicAllocator14get_chunk_sizeEPv
+__cxa_guard_acquire _ZN15BionicAllocator4freeEPv
+__cxa_guard_acquire _ZN26BionicSmallObjectAllocator4freeEPv
+__cxa_guard_acquire _ZN26BionicSmallObjectAllocator9free_pageEP22small_object_page_info
+__cxa_guard_acquire _ZN26BionicSmallObjectAllocatorC2Ejm
+__cxa_guard_acquire __cxa_atexit
+__rt_sigprocmask _Z17__init_static_tlsPv
+clock_gettime _ZN12_GLOBAL__N_110end_workerEPNS_6WorkerEb
+clock_gettime _ZN12_GLOBAL__N_110pump_inputEiPKhmmiPNS_6WorkerE
+clock_gettime _ZN12_GLOBAL__N_110read_inputEiPKhmj
+clock_gettime _ZN12_GLOBAL__N_112start_workerERKN7decoder7RequestEjijbPNS_6WorkerE
+clock_gettime _ZN12_GLOBAL__N_113discard_inputEim
+clock_gettime _ZN12_GLOBAL__N_16now_msEv
+clock_gettime _ZN12_GLOBAL__N_19read_fullEiPvmli
+clock_gettime _ZN12_GLOBAL__N_19serve_oneEi
+clock_gettime main
+gettid fork
+
+# Threads: nothing in the program starts one, and a worker has RLIMIT_NPROC 0.
+__cxa_guard_acquire _Z25__allocate_thread_mappingmm
+__cxa_guard_acquire _ZL15__pthread_startPv
+__cxa_guard_acquire pthread_create
+__cxa_guard_acquire pthread_exit
+__rt_sigprocmask _ZL15__pthread_startPv
+__rt_sigprocmask pthread_create
+__rt_sigprocmask pthread_exit
+__rt_sigprocmask timer_create
+
+# Fatal and logging paths: a worker that gets here is failing already, and its kill is a strike as before.
+__cxa_guard_acquire android_unsafe_frame_pointer_chase
+__rt_sigprocmask sigprocmask64
+clock_gettime _Z33monotonic_time_from_realtime_timeR8timespecRKS_
+clock_gettime _Z33realtime_time_from_monotonic_timeR8timespecRKS_
+clock_gettime async_safe_write_log
+gettid async_safe_write_log
+
+# Not reached from a worker: the log-only seccomp run of the test program over the format table and the fuzzing
+# corpora logs no system call from them. piex's CR3 reader: a CR3 file starts with an ftyp box, which goes to the HEIF
+# reader, never to piex.
+__cxa_guard_acquire _Z23__libc_arc4random_readyv
+__cxa_guard_acquire _ZL16__sysconf_cachesv
+__cxa_guard_acquire _ZN4piex12_GLOBAL__N_113ProcessStreamEPNS_15StreamInterfaceERKNSt3__15arrayIcLm4EEEPNS0_11ProcessDataE
+__cxa_guard_acquire _ZN4piex17Cr3GetPreviewDataEPNS_15StreamInterfaceEPNS_16PreviewImageDataE
+__cxa_guard_acquire get_avphys_pages
+__cxa_guard_acquire get_phys_pages
