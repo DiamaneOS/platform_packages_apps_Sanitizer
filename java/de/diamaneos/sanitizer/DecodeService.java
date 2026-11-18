@@ -66,6 +66,13 @@ public final class DecodeService extends Service {
     private Decoder mDecoder;
     private final SecureRandom mRandom = new SecureRandom();
     private final Map<Long, Held> mHandles = new HashMap<>();
+    // Expires handles when they are due, not only on the next call: a caller that died leaves nothing held.
+    private final android.os.Handler mExpiry = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable mExpireTask = () -> {
+        synchronized (mHandles) {
+            expire();
+        }
+    };
 
     private static final class Held {
         final int uid;
@@ -141,6 +148,7 @@ public final class DecodeService extends Service {
                 return failed;
             }
             Decoder.Request r = new Decoder.Request(op, a, b, in.data, in.len, in.reserved, lane, waiting, deadline);
+            r.user = Binder.getCallingUid() / 100000; // the Android user (UserHandle.PER_USER_RANGE)
             r.source = in.source;
             r.digest = in.digest;
             in = null; // the request owns the bytes now, and drops them when the VM's reply begins
@@ -308,6 +316,7 @@ public final class DecodeService extends Service {
             synchronized (mHandles) {
                 Held h = mHandles.get(handle);
                 if (h != null && h.uid == Binder.getCallingUid()) drop(handle, h);
+                expire();
             }
         }
 
@@ -353,6 +362,7 @@ public final class DecodeService extends Service {
             } while (handle == 0 || mHandles.containsKey(handle));
             mHandles.put(handle, new Held(uid, a.pixels, a.width, a.height, t.stripeRows,
                     SystemClock.uptimeMillis() + IDecodeService.HANDLE_TIMEOUT_MILLIS));
+            mExpiry.postDelayed(mExpireTask, IDecodeService.HANDLE_TIMEOUT_MILLIS + 100);
             t.handle = handle;
             if (DecodeChecks.check(t, maxWidth, maxHeight) != null) {
                 drop(handle, mHandles.get(handle));
@@ -407,6 +417,7 @@ public final class DecodeService extends Service {
         m.instanceId = v.instanceId;
         m.originalDocumentId = v.originalDocumentId;
         m.specialFormat = v.specialFormat;
+        DecodeChecks.dropFutureDate(m, System.currentTimeMillis());
         if (DecodeChecks.check(m, System.currentTimeMillis()) != null) {
             Decoder.Request bad = new Decoder.Request(GuestLink.OP_METADATA, 0, 0, null, 0, 0, "", false, 0);
             bad.status = GuestLink.INVALID;

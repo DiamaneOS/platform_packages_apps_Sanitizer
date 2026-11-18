@@ -43,7 +43,6 @@ public final class DecoderApp extends Application implements DecoderProvider {
     private static final String PERMISSION = "de.diamaneos.sanitizer.permission.DECODE";
     private static final String[] CALLERS = {
         "com.android.providers.media.module",
-        "com.google.android.providers.media.module",
         "com.android.systemui",
     };
 

@@ -53,6 +53,11 @@ public final class HealthProvider extends ContentProvider {
         Decoder.Request ping = call(d, GuestLink.OP_PING, 0, 0, null, 60000);
         ok &= line(pw, "vm start", ping.status == GuestLink.OK, (SystemClock.uptimeMillis() - t0) + " ms"
                 + (ping.status == GuestLink.OK || d.vm().lastError().isEmpty() ? "" : ": " + d.vm().lastError()));
+        // The vCPUs the VM really has (its ping counts them): two for the two lanes, through our VM framework's
+        // count. A framework without it (a rebase that lost vm-vcpus) shows here instead of passing unseen.
+        int online = ping.answer != null ? ping.answer.extra : 0;
+        ok &= line(pw, "vcpus", !d.vm().lanes() || online == GuestVm.LANE_VCPUS,
+                online + " online, asked " + d.vm().cpus());
         Decoder.Request png = call(d, GuestLink.OP_THUMBNAIL, 5, 3, HealthImages.PNG, 30000);
         ok &= line(pw, "png thumbnail", png.status == GuestLink.OK && png.answer != null
                 && png.answer.width == 3 && png.answer.height == 3, describe(png));

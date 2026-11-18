@@ -24,8 +24,9 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Checked VM answers by the content of the file: SHA-256 of the bytes plus the operation and its arguments. Asking
- * again for the same file costs nothing, whoever asks. Only answers that passed every check are stored, and only
+ * Checked VM answers by the content of the file: SHA-256 of the bytes plus the operation, its arguments and the
+ * Android user who asked. Asking again for the same file costs nothing. Per user, so the time an answer takes does not
+ * tell one user (or profile) what another one decoded lately. Only answers that passed every check are stored, and only
  * clean answers (OK, UNSUPPORTED, INVALID), never "unavailable". Bounded in bytes, least recently used out first.
  */
 final class ResultCache {
@@ -34,25 +35,26 @@ final class ResultCache {
 
     private static final class Key {
         final byte[] digest;
-        final int op, a, b;
+        final int op, a, b, user;
 
-        Key(byte[] digest, int op, int a, int b) {
+        Key(byte[] digest, int op, int a, int b, int user) {
             this.digest = digest;
             this.op = op;
             this.a = a;
             this.b = b;
+            this.user = user;
         }
 
         @Override
         public boolean equals(Object o) {
             if (!(o instanceof Key)) return false;
             Key k = (Key) o;
-            return op == k.op && a == k.a && b == k.b && Arrays.equals(digest, k.digest);
+            return op == k.op && a == k.a && b == k.b && user == k.user && Arrays.equals(digest, k.digest);
         }
 
         @Override
         public int hashCode() {
-            return Arrays.hashCode(digest) * 31 + op * 7 + a * 3 + b;
+            return Arrays.hashCode(digest) * 31 + op * 7 + a * 3 + b + user * 1009;
         }
     }
 
@@ -69,8 +71,8 @@ final class ResultCache {
         }
     }
 
-    static Object key(byte[] digest, int op, int a, int b) {
-        return new Key(digest, op, a, b);
+    static Object key(byte[] digest, int op, int a, int b, int user) {
+        return new Key(digest, op, a, b, user);
     }
 
     synchronized GuestLink.Answer get(Object key) {

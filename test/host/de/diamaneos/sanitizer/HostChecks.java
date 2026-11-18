@@ -229,7 +229,6 @@ public final class HostChecks {
             if (m.description.length() >= GuestLink.TEXT_CHARS || m.documentId.length() >= GuestLink.ID_CHARS) {
                 return "text length";
             }
-            if (m.dateTakenMillis > System.currentTimeMillis() + 86400000L) return "future date";
         } else {
             if (a.extra != 0 && !(a.extra == 1 && GuestLink.mayBeAnimated(a.format))) {
                 return "animated";
@@ -343,9 +342,18 @@ public final class HostChecks {
                 meta(1, 4, 3, 90, -1, "A\u001bcamera", ""), end(0))), GuestLink.OP_METADATA);
         expectRefused("meta line separator", (in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(1, 4, 3, 90, -1, "Aâ\u0080¨camera", ""), end(0))), GuestLink.OP_METADATA);
-        expectRefused("meta future date", (in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
+        // A date in the future is the file's or the phone clock's matter, not a broken link: the record is accepted
+        // (DecodeChecks.dropFutureDate drops the date later). A date outside 1900 to 9999 is still a break.
+        Object future = stub((in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(3, 4, 3, 90, System.currentTimeMillis() + 3 * 86400000L, "", ""), end(0))),
-                GuestLink.OP_METADATA);
+                GuestLink.OP_METADATA, 2, 1, 2000);
+        if (future instanceof GuestLink.Answer && ((GuestLink.Answer) future).meta != null) {
+            pass("stub meta future date accepted", "");
+        } else {
+            fail("stub meta future date accepted", String.valueOf(future));
+        }
+        expectRefused("meta year 10000", (in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
+                meta(3, 4, 3, 90, 253402300799999L + 3 * 86400000L, "", ""), end(0))), GuestLink.OP_METADATA);
         expectRefused("meta unterminated id", (in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(1, 4, 3, 90, -1, "", "a".repeat(128)), end(0))), GuestLink.OP_METADATA);
         expectRefused("meta size mismatch", (in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
@@ -472,7 +480,9 @@ public final class HostChecks {
                 "91 90 254:50 /media/0/Android/data /storage/emulated/0/Android/data rw - f2fs /dev/block/dm-50 rw",
                 "95 1 8:1 / /mnt/media_rw/ABCD rw - vfat /dev/block/vold/public:8,1 rw",
                 "96 1 254:60 / /mnt/a rw - ext4 /dev/block/dm-60 rw",
-                "97 1 254:60 / /mnt/b rw - fuseblk /dev/block/dm-60 rw");
+                "97 1 254:60 / /mnt/b rw - fuseblk /dev/block/dm-60 rw",
+                "98 1 179:65 / /mnt/media_rw/1234-5678 rw - ext4 /dev/block/vold/public:179,65 rw",
+                "99 1 8:17 / /mnt/x rw - f2fs /dev/block/vold/public:8,17 rw");
         Object[][] cases = {
             {254, 50, true},   // /data, also bind-mounted under the FUSE tree
             {254, 0, true},    // the system partition
@@ -480,6 +490,8 @@ public final class HostChecks {
             {8, 1, false},     // a USB drive (vfat)
             {254, 60, false},  // one device, one mount of it not local
             {0, 1, false},     // not in the table (an internal mount, a memory file)
+            {179, 65, false},  // an SD card formatted ext4: removable, never local
+            {8, 17, false},    // a USB drive formatted f2fs, from vold's public volumes
         };
         int bad = 0;
         for (Object[] c : cases) {
@@ -609,6 +621,24 @@ public final class HostChecks {
         s2.offer(bg);
         s2.offer(fg);
         ok &= s2.take() == fg;
+        // Aging: a steady stream of waiting jobs lets one background job through after every WAITING_BURST.
+        Scheduler s4 = new Scheduler();
+        Scheduler.Job slowBg = new Scheduler.Job("scan", false, Long.MAX_VALUE) {
+            @Override void run() {}
+        };
+        s4.offer(slowBg);
+        int servedBefore = -1;
+        for (int i = 0; i < 2 * Scheduler.WAITING_BURST && servedBefore < 0; i++) {
+            s4.offer(new Scheduler.Job("app" + (i % 3), true, Long.MAX_VALUE) {
+                @Override void run() {}
+            });
+            s4.offer(new Scheduler.Job("app" + (i % 3), true, Long.MAX_VALUE) {
+                @Override void run() {}
+            });
+            if (s4.take() == slowBg) servedBefore = i;
+        }
+        check("scheduler: background work ages past a stream of waiting jobs",
+                servedBefore == Scheduler.WAITING_BURST, "background served at take " + servedBefore);
         // The total cap: many lanes fill the queue to MAX_TOTAL and no further.
         Scheduler s3 = new Scheduler();
         int total = 0;
@@ -635,7 +665,7 @@ public final class HostChecks {
         ResultCache c = new ResultCache();
         GuestLink.Answer big = new GuestLink.Answer();
         big.pixels = new byte[ResultCache.MAX_ENTRY_BYTES + 1];
-        Object kBig = ResultCache.key(new byte[32], 3, 1, 1);
+        Object kBig = ResultCache.key(new byte[32], 3, 1, 1, 0);
         c.put(kBig, big);
         boolean ok = c.get(kBig) == null;
         int stored = 0;
@@ -644,17 +674,17 @@ public final class HostChecks {
             a.pixels = new byte[1 << 20];
             byte[] d = new byte[32];
             d[0] = (byte) i;
-            c.put(ResultCache.key(d, 3, 1, 1), a);
+            c.put(ResultCache.key(d, 3, 1, 1, 0), a);
         }
         for (int i = 0; i < 40; i++) {
             byte[] d = new byte[32];
             d[0] = (byte) i;
-            if (c.get(ResultCache.key(d, 3, 1, 1)) != null) stored++;
+            if (c.get(ResultCache.key(d, 3, 1, 1, 0)) != null) stored++;
         }
         ok &= stored > 0 && stored * ((1 << 20) + 1024L) <= ResultCache.MAX_BYTES;
         byte[] d = new byte[32];
         d[0] = 39;
-        ok &= c.get(ResultCache.key(d, 3, 1, 1)) != null && c.get(ResultCache.key(d, 3, 2, 1)) == null;
+        ok &= c.get(ResultCache.key(d, 3, 1, 1, 0)) != null && c.get(ResultCache.key(d, 3, 2, 1, 0)) == null;
         if (ok) pass("result cache", stored + " of 40 one-MiB answers kept, oversize refused, keys exact");
         else fail("result cache", "stored " + stored);
     }
@@ -793,11 +823,36 @@ public final class HostChecks {
                 if (next instanceof IOException) throw (IOException) next;
                 mRunning = true;
             }
+            if (generationOnRead && next instanceof FailingChannel) {
+                FakeVm self = this;
+                FailingChannel f = (FailingChannel) next;
+                return new GuestLink(new GuestLink.Channel() {
+                    @Override public int read(byte[] b, int off, int len, long deadline) throws IOException {
+                        self.generation++; // another request stopped and started the VM meanwhile
+                        return f.read(b, off, len, deadline);
+                    }
+
+                    @Override public void write(byte[] b, int off, int len, long deadline) {}
+
+                    @Override public void close() {}
+                });
+            }
             return new GuestLink(next instanceof byte[] ? new FakeChannel((byte[]) next) : (GuestLink.Channel) next);
         }
 
         @Override public boolean lanes() {
             return lanes;
+        }
+
+        volatile int generation = 1;
+        boolean generationOnRead; // the next failing read happens while another request restarts the VM
+
+        @Override public int generation() {
+            return generation;
+        }
+
+        @Override public String cpus() {
+            return lanes ? "2" : "1";
         }
 
         @Override public synchronized void stop() {
@@ -824,6 +879,25 @@ public final class HostChecks {
         @Override public boolean heldDown() {
             return held;
         }
+    }
+
+    /** A link whose reads fail: with an OutOfMemoryError (the service's own heap) or past its deadline. */
+    static final class FailingChannel implements GuestLink.Channel {
+        final boolean outOfMemory;
+
+        FailingChannel(boolean outOfMemory) {
+            this.outOfMemory = outOfMemory;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len, long deadline) throws IOException {
+            if (outOfMemory) throw new OutOfMemoryError("service heap");
+            throw new java.io.InterruptedIOException("deadline");
+        }
+
+        @Override public void write(byte[] b, int off, int len, long deadline) {}
+
+        @Override public void close() {}
     }
 
     /** A big lane that holds its reply until released: a large decode in progress. */
@@ -1101,6 +1175,73 @@ public final class HostChecks {
         check("decoder: small files pass a held big lane", smallOk == 20 && bigWaiting && bigOne[0] != null
                 && bigOne[0].status == GuestLink.OK, smallOk + " small in " + smallMs + " ms while the big lane waited");
 
+        // The service's own heap fails while it reads a reply: the connection goes, the VM stays, no strike.
+        vm = new FakeVm();
+        vm.script.add(new FailingChannel(true));
+        vm.script.add(new FailingChannel(true));
+        vm.always = probeOk();
+        d = new Decoder(vm, c);
+        Decoder.Request o1 = probe(d, new byte[] {40}, "a");
+        Decoder.Request o2 = probe(d, new byte[] {40}, "a");
+        Decoder.Request o3 = probe(d, new byte[] {40}, "a");
+        check("decoder: the service's out of memory is no VM restart and no strike", o1.status == Decoder.UNAVAILABLE
+                && o2.status == Decoder.UNAVAILABLE && o3.status == GuestLink.OK && vm.stops == 0,
+                o1.status + " " + o2.status + " " + o3.status + ", stops " + vm.stops);
+
+        // A deadline missed on the big lane while the small lane still answers: a slow VM, not a broken one.
+        vm = new FakeVm();
+        vm.lanes = true;
+        vm.script.add(new FailingChannel(false));
+        vm.always = probeOk();
+        vm.smallAlways = cat(reply(GuestLink.REPLY_MAGIC, 0, 0, 0, 0, 0, 0), end(0));
+        d = new Decoder(vm, c);
+        Decoder.Request laneSlow = probe(d, new byte[GuestLink.SMALL_INPUT_BYTES + 1], "a");
+        Decoder.Request late2 = probe(d, new byte[GuestLink.SMALL_INPUT_BYTES + 1], "a");
+        check("decoder: a slow lane with the other lane alive is no restart and no strike",
+                laneSlow.status == Decoder.UNAVAILABLE && vm.stops == 0 && late2.status == GuestLink.OK,
+                laneSlow.status + " " + late2.status + ", stops " + vm.stops + ", drops " + vm.drops);
+
+        // A request whose VM another request stopped meanwhile only lost its connection: no strike.
+        vm = new FakeVm();
+        vm.script.add(new FailingChannel(false));
+        vm.script.add(new FailingChannel(false));
+        vm.always = probeOk();
+        vm.generationOnRead = true;
+        d = new Decoder(vm, c);
+        Decoder.Request lost1 = probe(d, new byte[] {41}, "a");
+        clock.addAndGet(Decoder.BACKOFF_MIN + 1);
+        Decoder.Request lost2 = probe(d, new byte[] {41}, "a");
+        Decoder.Request lost3 = probe(d, new byte[] {41}, "a");
+        check("decoder: a VM stopped by another request strikes no file", lost1.status == Decoder.UNAVAILABLE
+                && lost2.status == Decoder.UNAVAILABLE && lost3.status == GuestLink.OK,
+                lost1.status + " " + lost2.status + " " + lost3.status);
+
+        // A late answer is cached: the caller gave up, the next request finds it without the VM.
+        vm = new FakeVm();
+        HeldChannel late = new HeldChannel(probeOk());
+        vm.script.add(late);
+        d = new Decoder(vm, c);
+        byte[] lf = {42};
+        if (!d.reserve("a", lf.length)) throw new IllegalStateException("budget");
+        Thread giveUp = new Thread(() -> {
+            try {
+                Thread.sleep(200);
+                clock.addAndGet(10); // the caller's deadline passes, then the VM answers
+                Thread.sleep(200);
+            } catch (InterruptedException ignored) {
+                // done
+            }
+            late.release.countDown();
+        });
+        giveUp.start();
+        Decoder.Request quick = d.run(new Decoder.Request(GuestLink.OP_PROBE, 0, 0, lf, lf.length, lf.length, "a",
+                false, clock.get() + 5));
+        giveUp.join();
+        Thread.sleep(300); // the worker thread settles the answer
+        Decoder.Request again = probe(d, lf, "a");
+        boolean fromCache = quick.status == Decoder.UNAVAILABLE && again.status == GuestLink.OK && vm.links == 1;
+        check("decoder: a late answer is cached", fromCache, "first " + quick.status + ", links " + vm.links);
+
         // A VM that does not start: backoff, no link attempt until it ends.
         vm = new FakeVm();
         vm.always = new IOException("VM start: refused");
@@ -1120,7 +1261,8 @@ public final class HostChecks {
         GuestLink link = new GuestLink(new UnixChannel(socket));
         long t;
         GuestLink.Answer ping = link.ping(now() + 5000);
-        if (ping.status == GuestLink.OK) pass("broker ping", ""); else fail("broker ping", show(ping));
+        if (ping.status == GuestLink.OK && ping.extra >= 1) pass("broker ping", ping.extra + " CPUs online");
+        else fail("broker ping", show(ping));
 
         byte[] seed = file(images, "exif-seed.jpg");
         t = now();
@@ -1229,6 +1371,54 @@ public final class HostChecks {
         GuestLink.Answer p2 = again.ping(now() + 5000);
         if (p2.status == 0) pass("broker second connection", ""); else fail("broker second connection", show(p2));
         again.close();
+        smallLaneChecks(socket + ".small", images);
+    }
+
+    /**
+     * The real small lane (the host program's second broker, at the socket path and ".small"): icons are answered
+     * there, and everything too large or too slow for it is answered BIG_LANE, never as a verdict on the file.
+     */
+    static void smallLaneChecks(String socket, java.io.File images) throws Exception {
+        GuestLink small = new GuestLink(new UnixChannel(socket));
+        GuestLink.Answer ping = small.ping(now() + 5000);
+        if (ping.status == GuestLink.OK) pass("small lane ping", ""); else fail("small lane ping", show(ping));
+        byte[] icon = file(images, "test-rgba.png");
+        GuestLink.Answer a = small.thumbnail(icon, icon.length, 64, 64, now() + 10000);
+        if (a.status == GuestLink.OK && a.width == 64 && broken(a, GuestLink.OP_THUMBNAIL, 64, 64) == null) {
+            pass("small lane icon", show(a));
+        } else {
+            fail("small lane icon", show(a));
+        }
+        byte[] large = file(images, "photo50.jpg");
+        a = small.thumbnail(large, large.length, 64, 64, now() + 10000);
+        if (large.length > GuestLink.SMALL_INPUT_BYTES && a.status == GuestLink.BIG_LANE) {
+            pass("small lane: input above 1 MiB goes to the big lane", large.length + " bytes");
+        } else {
+            fail("small lane: input above 1 MiB goes to the big lane", large.length + " bytes, " + show(a));
+        }
+        byte[] wide = file(images, "gen/heic-single2mp.heic");
+        a = small.thumbnail(wide, wide.length, 64, 64, now() + 10000);
+        if (a.status == GuestLink.BIG_LANE) pass("small lane: header above 1 MP goes to the big lane", "");
+        else fail("small lane: header above 1 MP goes to the big lane", show(a));
+        // 1024x768 HEVC: below 1 MP, but the decoder needs more than the small arena.
+        byte[] heic = file(images, "gen/heic-singlegray.heic");
+        a = small.thumbnail(heic, heic.length, 64, 64, now() + 10000);
+        if (a.status == GuestLink.BIG_LANE) pass("small lane: arena short goes to the big lane", "");
+        else fail("small lane: arena short goes to the big lane", show(a));
+        // A worker that spins: the small lane's CPU limit ends it within seconds, and the big lane takes it.
+        long t = now();
+        a = small.hook(3, now() + 15000);
+        long ms = now() - t;
+        if (a.status == GuestLink.BIG_LANE && ms < 4500) pass("small lane: a slow worker goes to the big lane", ms + " ms");
+        else fail("small lane: a slow worker goes to the big lane", show(a) + ", " + ms + " ms");
+        // seccomp's kill stays a kill there too (no detour through the big lane).
+        a = small.hook(1, now() + 15000);
+        if (a.status == GuestLink.INTERNAL) pass("small lane lockdown kills open", "");
+        else fail("small lane lockdown kills open", show(a));
+        a = small.thumbnail(icon, icon.length, 64, 64, now() + 10000);
+        if (a.status == GuestLink.OK) pass("small lane answers after the limits", "");
+        else fail("small lane answers after the limits", show(a));
+        small.close();
     }
 
     /**

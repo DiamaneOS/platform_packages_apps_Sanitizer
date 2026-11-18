@@ -52,8 +52,12 @@ final class Decoder implements GuestLink.Budget {
     /** Not a VM status: the VM could not answer in time, try again later. */
     static final int UNAVAILABLE = -1;
 
-    // The VM ends a worker after 30 s of wall time. Its answer then still has to cross the link.
-    static final long CALL_BUDGET_MILLIS = 45000;
+    // Starting the VM and connecting: its own deadline.
+    static final long LINK_BUDGET_MILLIS = 30000;
+    // The call, once the link is up: longer than the VM's own worst case for an honest request. A worker runs at most
+    // 30 s of wall time, and the broker starts one more worker after a BUSY only when the first ended within 5 s and
+    // waits at most 6 s for memory first (41 s), then the answer crosses the link.
+    static final long CALL_BUDGET_MILLIS = 60000;
     // Restart backoff after a failed start or a broken link: 1 s doubling to 5 minutes, never giving up.
     static final long BACKOFF_MIN = 1000;
     static final long BACKOFF_MAX = 300000;
@@ -73,6 +77,9 @@ final class Decoder implements GuestLink.Budget {
 
     /** The VM as the decoder needs it (GuestVm, a fake one in the host checks). */
     interface Vm {
+        /** Counts the VM's starts: a request that sees it change knows another request stopped the VM. */
+        int generation();
+
         /**
          * A working link to the big or the small lane, starting the VM when needed. Throws when it does not come up
          * within the deadline.
@@ -91,6 +98,9 @@ final class Decoder implements GuestLink.Budget {
 
         /** Whether the VM has the small lane. */
         boolean lanes();
+
+        /** The vCPUs the VM was started with: a count, or how they were chosen. */
+        String cpus();
 
         /** Why the last start failed, or "". */
         String lastError();
@@ -126,6 +136,10 @@ final class Decoder implements GuestLink.Budget {
         }
     };
     private final Object mStartLock = new Object();
+    // Per lane ([0] big, [1] small): held while the lane's thread talks to the VM, and when it last heard from it.
+    private final java.util.concurrent.locks.ReentrantLock[] mLaneLock = {
+        new java.util.concurrent.locks.ReentrantLock(), new java.util.concurrent.locks.ReentrantLock()};
+    private final long[] mLastHeard = new long[2];
     private long mBackoff = BACKOFF_MIN; // guarded by mStartLock, like mNextStart
     private long mNextStart;
 
@@ -227,7 +241,10 @@ final class Decoder implements GuestLink.Budget {
     static final class Request extends Scheduler.Job {
         final int op, a, b;
         volatile byte[] file; // dropped with its budget once the VM's big lane replies
+        int user; // the calling Android user: answers are cached per user (ResultCache)
         long queuedAt; // when it was queued, for the timing log
+        Object cacheKey; // the result cache's key and the file's digest, set when the request is not a ping
+        String digestHex;
         volatile boolean bigLane; // the small lane sent it on: it goes to the big lane
         final int len;
         private long mInput; // budget held for the file, given back once the reply begins or the request ends
@@ -275,7 +292,9 @@ final class Decoder implements GuestLink.Budget {
         if (r.op != GuestLink.OP_PING && r.op != GuestLink.OP_HOOK) {
             byte[] d = r.source != null ? r.digest : ResultCache.digest(r.file, r.len);
             digest = hex(d);
-            key = ResultCache.key(d, r.op, r.a, r.b);
+            key = ResultCache.key(d, r.op, r.a, r.b, r.user);
+            r.cacheKey = key;
+            r.digestHex = digest;
             GuestLink.Answer hit = mCache.get(key);
             if (hit != null) {
                 release(r.lane, r.takeInput());
@@ -293,21 +312,29 @@ final class Decoder implements GuestLink.Budget {
             closeSource(r);
             return r;
         }
+        boolean done = false;
         try {
-            if (!r.await(mClock)) return r; // UNAVAILABLE: the queue was too slow
+            done = r.await(mClock);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return r;
         }
-        // A streamed file is cached only when what was sent is what was hashed before: a file that changed in
-        // between gets its answer, but never under the old content's key.
+        if (done) return r;
+        // Given up: the caller gets UNAVAILABLE and nothing it could read half written. The worker thread may still
+        // finish the request, and its answer is cached then (settle).
+        return new Request(r.op, r.a, r.b, null, r.len, 0, r.lane, r.userWaiting, r.deadline);
+    }
+
+    // When the VM is done with a request, whether its caller still waits or not: a late answer is cached, so the next
+    // request for the file finds it instead of doing the work again. A streamed file is cached only when what was sent
+    // is what was hashed before: a file that changed in between gets its answer, never under the old content's key.
+    private void settle(Request r) {
+        if (r.cacheKey == null) return;
         boolean sameFile = r.source == null || java.util.Arrays.equals(r.digest, r.sentDigest);
-        if (key != null && r.answer != null && r.status != UNAVAILABLE && sameFile) {
-            mCache.put(key, r.answer);
-        } else if (digest != null && r.died && sameFile) {
-            strike(digest, key, r);
+        if (r.answer != null && r.status != UNAVAILABLE && sameFile) {
+            mCache.put(r.cacheKey, r.answer);
+        } else if (r.died && sameFile) {
+            strike(r.digestHex, r.cacheKey, r);
         }
-        return r;
     }
 
     private void strike(String digest, Object key, Request r) {
@@ -360,6 +387,7 @@ final class Decoder implements GuestLink.Budget {
                 }
                 if (!onward) {
                     if (r.source != null) r.sentDigest = r.source.sentDigest();
+                    settle(r);
                     closeSource(r);
                     releaseInput(r);
                     GuestLink.Answer a = r.answer;
@@ -380,6 +408,39 @@ final class Decoder implements GuestLink.Budget {
     }
 
     private void handle(Request r, boolean small) {
+        mLaneLock[small ? 1 : 0].lock();
+        try {
+            handleLocked(r, small);
+        } finally {
+            mLaneLock[small ? 1 : 0].unlock();
+        }
+    }
+
+    /**
+     * Whether the VM still answers on the other lane: then a deadline missed on this lane means a slow VM, not a
+     * broken one. An idle other lane is pinged on its own connection, a busy one counts when it heard from the VM in
+     * the last 10 s.
+     */
+    private boolean otherLaneAlive(boolean small) {
+        if (!mVm.lanes()) return false;
+        int other = small ? 0 : 1;
+        if (mLaneLock[other].tryLock()) {
+            try {
+                long deadline = mClock.now() + 3000;
+                mVm.link(!small, deadline).ping(deadline);
+                return true;
+            } catch (IOException e) {
+                return false;
+            } finally {
+                mLaneLock[other].unlock();
+            }
+        }
+        synchronized (mLastHeard) {
+            return mClock.now() - mLastHeard[other] < 10000;
+        }
+    }
+
+    private void handleLocked(Request r, boolean small) {
         if (mVm.heldDown()) {
             // A test holds the VM down (debuggable builds only): it stays stopped, every request is unavailable and
             // nothing is decoded anywhere else. No backoff, so it comes back as soon as the hold ends.
@@ -390,17 +451,19 @@ final class Decoder implements GuestLink.Budget {
         synchronized (mStartLock) {
             if (now < mNextStart && !mVm.isRunning()) return; // backing off: UNAVAILABLE
         }
-        long budget = now + CALL_BUDGET_MILLIS;
         for (int attempt = 0; ; attempt++) {
             GuestLink link;
             try {
-                link = mVm.link(small, budget);
+                link = mVm.link(small, mClock.now() + LINK_BUDGET_MILLIS);
             } catch (IOException e) {
                 Log.w(TAG, "VM not available: " + e.getMessage());
                 mVm.stop();
                 backOff();
                 return;
             }
+            // The call's budget starts once the link is up: a slow VM start never eats into the decode's time.
+            long budget = mClock.now() + CALL_BUDGET_MILLIS;
+            int generation = mVm.generation();
             boolean reused = mVm.lastLinkReused(small);
             // The big lane's reply ends the input's use: no second attempt follows. A small-lane reply may still send
             // the request on to the big lane, so its (small) input stays until the request ends.
@@ -409,6 +472,9 @@ final class Decoder implements GuestLink.Budget {
                 GuestLink.Answer a = call(link, r, budget);
                 synchronized (mStartLock) {
                     mBackoff = BACKOFF_MIN;
+                }
+                synchronized (mLastHeard) {
+                    mLastHeard[small ? 1 : 0] = mClock.now();
                 }
                 if (a.status == GuestLink.BIG_LANE) {
                     // Too large for the small lane, decided in the VM. Not an answer: the big lane gets it.
@@ -434,8 +500,28 @@ final class Decoder implements GuestLink.Budget {
                 Log.w(TAG, "source failed while sending: " + e.getMessage());
                 r.status = UNAVAILABLE;
                 return;
+            } catch (GuestLink.HostFailureException e) {
+                // This service failed (its own heap), not the VM and not the file: the connection is gone, nothing
+                // else changes.
+                Log.w(TAG, "service failed during the call: " + e.getMessage());
+                mVm.dropLink(small);
+                r.status = UNAVAILABLE;
+                return;
             } catch (IOException e) {
-                if (attempt == 0 && reused && !link.replied() && mClock.now() < budget) {
+                if (mVm.generation() != generation || !mVm.isRunning()) {
+                    // Another request stopped the VM meanwhile: this one only lost its connection. No strike.
+                    r.status = UNAVAILABLE;
+                    return;
+                }
+                if (link.timedOut() && otherLaneAlive(small)) {
+                    // Past the deadline while the other lane still answers: the VM is slow, not broken. This
+                    // connection goes (the broker sees it closed when its worker is done), the VM stays, no strike.
+                    Log.w(TAG, "VM slow on this lane, the other lane answers: " + e.getMessage());
+                    mVm.dropLink(small);
+                    r.status = UNAVAILABLE;
+                    return;
+                }
+                if (attempt == 0 && reused && !link.replied() && !link.timedOut()) {
                     // A connection kept from earlier that died meanwhile, before it said anything: connect again
                     // once before calling the VM broken.
                     Log.i(TAG, "kept VM connection was dead, connecting again: " + e.getMessage());

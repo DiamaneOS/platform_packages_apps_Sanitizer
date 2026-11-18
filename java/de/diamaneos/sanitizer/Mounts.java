@@ -39,7 +39,8 @@ final class Mounts {
     /**
      * Every mount of device major:minor (field 3 of a mountinfo line) has a local file system type, and there is at
      * least one. Not found, or any mount of it of another type (FUSE passes a device of its own, never this one):
-     * false.
+     * false. A removable drive (an SD card or USB drive vold mounts as a public volume, from /dev/block/vold/public:
+     * at /mnt/media_rw/) is never local, whatever its file system: it can stall or go away mid-read.
      */
     static boolean localDevice(int major, int minor, String mountinfo) {
         String want = major + ":" + minor;
@@ -55,6 +56,8 @@ final class Mounts {
                 }
             }
             if (dash < 0 || dash + 1 >= fields.length) return false;
+            String source = dash + 2 < fields.length ? fields[dash + 2] : "";
+            if (source.startsWith("/dev/block/vold/public:") || fields[4].startsWith("/mnt/media_rw/")) return false;
             boolean local = false;
             for (String t : LOCAL) local |= t.equals(fields[dash + 1]);
             if (!local) return false;

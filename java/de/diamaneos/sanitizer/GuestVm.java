@@ -77,6 +77,7 @@ final class GuestVm implements Decoder.Vm {
     // asks for the single lane (DebugBuild.SINGLE_LANE).
     private final boolean mLanes = !DebugBuild.singleLaneForTest();
     static final int LANE_VCPUS = 2;
+    private volatile String mCpus = "not started";
     private volatile String mLastError = "";
 
     GuestVm(Context context, File kernel, File initrd, long memoryBytes) {
@@ -216,6 +217,8 @@ final class GuestVm implements Decoder.Vm {
         }
     }
 
+    // The hidden raw VM API by reflection. Our Virtualization makes the same calls directly in a twin compiled with
+    // the virt APEX (guest/decoder_vm/apitwin), so an upstream change breaks the build: keep the two in step.
     private VirtualMachineConfig rawConfig(File kernel, File initrd) throws ReflectiveOperationException {
         String p = "android.system.virtualmachine.VirtualMachineCustomImageConfig";
         Class<?> imageConfig = Class.forName(p);
@@ -242,9 +245,10 @@ final class GuestVm implements Decoder.Vm {
                 builderClass.getMethod("setCpuCount", int.class).invoke(b, LANE_VCPUS);
                 counted = true;
             } catch (NoSuchMethodException e) {
-                Log.w(TAG, "no vCPU count in this VM framework, one vCPU per host CPU");
+                Log.e(TAG, "no vCPU count in this VM framework (vm-vcpus missing), one vCPU per host CPU");
             }
         }
+        mCpus = counted ? String.valueOf(LANE_VCPUS) : mLanes ? "one per host CPU (no count in the framework)" : "1";
         Object image = builderClass.getMethod("build").invoke(b);
 
         VirtualMachineConfig.Builder vb = new VirtualMachineConfig.Builder(mContext);
@@ -285,6 +289,17 @@ final class GuestVm implements Decoder.Vm {
         int lane = small ? 1 : 0;
         if (mLinks[lane] != null) mLinks[lane].close();
         mLinks[lane] = null;
+    }
+
+    @Override
+    public String cpus() {
+        return mCpus;
+    }
+
+    /** Counts the VM's starts. */
+    @Override
+    public int generation() {
+        return mGeneration;
     }
 
     /** Whether this VM has the small lane (two lanes, two vCPUs or more). */

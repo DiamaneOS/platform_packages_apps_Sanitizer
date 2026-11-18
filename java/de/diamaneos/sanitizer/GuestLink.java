@@ -62,6 +62,7 @@ final class GuestLink implements Closeable {
     static final int BUSY = 5;
     // Small lane only: the file is too large for that lane. Not a verdict: the request goes to the big lane.
     static final int BIG_LANE = 6;
+    static final int MAX_VM_CPUS = 1024; // a ping's CPU count above this breaks the contract
 
     // The contract's FORMAT_* values (IDecodeService), all of which the VM reads.
     static final int FORMAT_JPEG = 1;
@@ -146,6 +147,16 @@ final class GuestLink implements Closeable {
         }
     }
 
+    /**
+     * The service itself failed during the call (its own heap ran out while it took the reply): not the VM's fault and
+     * not the file's. The connection is closed, nothing more.
+     */
+    static final class HostFailureException extends IOException {
+        HostFailureException(String message) {
+            super(message);
+        }
+    }
+
     /** A clean answer: a status, and for OK the checked values. */
     static final class Answer {
         int status;
@@ -198,6 +209,7 @@ final class GuestLink implements Closeable {
     private final Channel mChannel;
     private boolean mBroken;
     private boolean mReplied; // the last call read at least one byte of a reply
+    private boolean mTimedOut; // the last call failed because its deadline passed, not because of what it read
     private Budget mBudget;
     private String mLane = "";
     private Runnable mOnReply;
@@ -281,9 +293,15 @@ final class GuestLink implements Closeable {
         return mReplied;
     }
 
+    /** Whether the last call failed on its deadline (the VM was slow or gone), not on what the VM sent. */
+    boolean timedOut() {
+        return mTimedOut;
+    }
+
     private Answer call(int op, int arg0, int arg1, Source src, long deadline, boolean unused) throws IOException {
         if (mBroken) throw new ProtocolException("link already broken");
         mReplied = false;
+        mTimedOut = false;
         long len = src.length();
         if (len < 0 || len > MAX_INPUT_BYTES) throw new IllegalArgumentException("input length");
         long held = 0; // pixel budget reserved here and not handed over with an answer
@@ -330,7 +348,9 @@ final class GuestLink implements Closeable {
             }
             switch (op) {
                 case OP_PING:
-                    check(a.format == 0 && a.width == 0 && a.height == 0 && a.extra == 0 && payload == 0, "ping");
+                    // extra: the CPUs the VM has online (0 when it could not count them).
+                    check(a.format == 0 && a.width == 0 && a.height == 0 && a.extra >= 0 && a.extra <= MAX_VM_CPUS
+                            && payload == 0, "ping");
                     break;
                 case OP_PROBE:
                     checkFormat(a.format);
@@ -399,6 +419,8 @@ final class GuestLink implements Closeable {
             // Anything at all, out of memory included, leaves the link in an unknown state: it is not used again.
             close();
             if (e instanceof SourceFailedException) throw (SourceFailedException) e;
+            if (e instanceof Error) throw new HostFailureException(e.getClass().getSimpleName() + ": " + e.getMessage());
+            mTimedOut = e instanceof java.io.InterruptedIOException;
             if (e instanceof ProtocolException) throw (ProtocolException) e;
             if (e instanceof IllegalArgumentException) throw (IllegalArgumentException) e;
             throw new ProtocolException(e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -509,8 +531,9 @@ final class GuestLink implements Closeable {
                         || format == FORMAT_WEBP || format == FORMAT_HEIF || format == FORMAT_AVIF))
                 || (m.specialFormat == SPECIAL_ANIMATED_WEBP && format == FORMAT_WEBP), "special format");
         if ((flags & HAS_DATE) != 0) {
-            check(m.dateTakenMillis >= MIN_DATE && m.dateTakenMillis <= MAX_DATE
-                    && m.dateTakenMillis <= System.currentTimeMillis() + 86400000L, "date");
+            // Only the record's range: a date in the future is a fact about the file or this phone's clock, not
+            // about the link (DecodeChecks.dropFutureDate drops it later).
+            check(m.dateTakenMillis >= MIN_DATE && m.dateTakenMillis <= MAX_DATE, "date");
         } else {
             check(m.dateTakenMillis == -1 && (flags & OFFSET_KNOWN) == 0, "date without flag");
         }

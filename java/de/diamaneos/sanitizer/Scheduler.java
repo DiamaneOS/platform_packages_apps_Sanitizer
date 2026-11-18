@@ -25,7 +25,7 @@ import java.util.Map;
 /**
  * The VM works on one file at a time. Requests queue in lanes, one lane per package that supplied the bytes, so a
  * flood from one app only lengthens its own lane. Lanes take turns. Requests a user waits on (an open file, thumbnails
- * on screen) go before every background request. Each lane and the whole queue have caps: a full queue answers at
+ * on screen) go before background requests, but after WAITING_BURST of them in a row one background request goes. Each lane and the whole queue have caps: a full queue answers at
  * once with "unavailable", which callers treat as fail closed and ask again later.
  *
  * <p>Thread-safe. Jobs are taken by one worker thread with {@link #take}.
@@ -75,6 +75,10 @@ final class Scheduler {
     private final LinkedHashMap<String, ArrayDeque<Job>> mBackground = new LinkedHashMap<>();
     private final Map<String, Integer> mPerLane = new HashMap<>();
     private int mTotal;
+    // Waiting jobs served in a row while background jobs wait. After WAITING_BURST of them one background job goes
+    // first, so background work (scan sizes, special formats) is never starved by a steady stream of waiting ones.
+    static final int WAITING_BURST = 4;
+    private int mWaitingInRow;
 
     Scheduler() {
     }
@@ -96,9 +100,14 @@ final class Scheduler {
      */
     synchronized Job take() throws InterruptedException {
         for (;;) {
-            Job job = next(mWaiting);
+            Job job = null;
+            if (mWaitingInRow >= WAITING_BURST) job = next(mBackground);
+            if (job == null) job = next(mWaiting);
             if (job == null) job = next(mBackground);
-            if (job != null) return job;
+            if (job != null) {
+                mWaitingInRow = job.userWaiting ? mWaitingInRow + 1 : 0;
+                return job;
+            }
             wait();
         }
     }

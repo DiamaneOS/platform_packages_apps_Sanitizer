@@ -302,10 +302,16 @@ public class SelfTestActivity extends Activity {
                 end(E, 0))), GuestLink.OP_THUMBNAIL);
         expectRefused("animated JPEG", fd -> writeAll(fd, cat(reply(R, 0, 1, 5, 5, 1, 0), end(E, 0))),
                 GuestLink.OP_PROBE);
-        expectRefused("date in the future", fd -> writeAll(fd, cat(reply(R, 0, 1, 4, 3, 0, 1024),
+        // A date in the future is accepted on the link (the service drops the date, DecodeChecks.dropFutureDate).
+        Object future = stub(fd -> writeAll(fd, cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(b -> b.putInt(8, GuestLink.HAS_ORIENTATION | GuestLink.HAS_DATE)
                         .putLong(32, System.currentTimeMillis() + 3L * 86400000L)), end(E, 0))),
-                GuestLink.OP_METADATA);
+                GuestLink.OP_METADATA, 2000);
+        if (future instanceof GuestLink.Answer && ((GuestLink.Answer) future).meta != null) {
+            pass("stub date in the future accepted", "");
+        } else {
+            fail("stub date in the future accepted", String.valueOf(future));
+        }
         expectRefused("line separator in text", fd -> writeAll(fd, cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(b -> b.put(48, (byte) 0xe2).put(49, (byte) 0x80).put(50, (byte) 0xa8)), end(E, 0))),
                 GuestLink.OP_METADATA);
