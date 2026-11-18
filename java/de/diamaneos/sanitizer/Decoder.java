@@ -45,6 +45,9 @@ import java.util.Map;
  */
 final class Decoder implements GuestLink.Budget {
     private static final String TAG = "DecoderService";
+    private static final String TAG_TIMING = "DecoderTiming";
+    // A line per request (lane, queue wait, VM time, status): set on debuggable builds by the application.
+    static volatile boolean sTimingLog;
 
     /** Not a VM status: the VM could not answer in time, try again later. */
     static final int UNAVAILABLE = -1;
@@ -70,18 +73,24 @@ final class Decoder implements GuestLink.Budget {
 
     /** The VM as the decoder needs it (GuestVm, a fake one in the host checks). */
     interface Vm {
-        /** A working link, starting the VM when needed. Throws when it does not come up within the deadline. */
-        GuestLink link(long deadline) throws IOException;
+        /**
+         * A working link to the big or the small lane, starting the VM when needed. Throws when it does not come up
+         * within the deadline.
+         */
+        GuestLink link(boolean small, long deadline) throws IOException;
 
         void stop();
 
         boolean isRunning();
 
-        /** Whether the last link() handed back a connection made earlier. */
-        boolean lastLinkReused();
+        /** Whether the last link() of that lane handed back a connection made earlier. */
+        boolean lastLinkReused(boolean small);
 
-        /** Drops the connection but keeps the VM. */
-        void dropLink();
+        /** Drops the lane's connection but keeps the VM. */
+        void dropLink(boolean small);
+
+        /** Whether the VM has the small lane. */
+        boolean lanes();
 
         /** Why the last start failed, or "". */
         String lastError();
@@ -98,7 +107,11 @@ final class Decoder implements GuestLink.Budget {
 
     private final Vm mVm;
     private final Scheduler.Clock mClock;
+    // Two lanes into the VM, each with its own queue and thread, so small files never wait behind a large decode:
+    // a file of at most GuestLink.SMALL_INPUT_BYTES goes to the small lane first, which sends it on to the big lane
+    // when the VM finds it too large there (BIG_LANE). Urgent requests go first within each queue.
     private final Scheduler mScheduler = new Scheduler();
+    private final Scheduler mSmall = new Scheduler();
     private final ResultCache mCache = new ResultCache();
     private final Object mLock = new Object();
     private long mHeld;
@@ -112,7 +125,8 @@ final class Decoder implements GuestLink.Budget {
             return size() > 256;
         }
     };
-    private long mBackoff = BACKOFF_MIN;
+    private final Object mStartLock = new Object();
+    private long mBackoff = BACKOFF_MIN; // guarded by mStartLock, like mNextStart
     private long mNextStart;
 
     Decoder(Vm vm) {
@@ -123,9 +137,14 @@ final class Decoder implements GuestLink.Budget {
     Decoder(Vm vm, Scheduler.Clock clock) {
         mVm = vm;
         mClock = clock;
-        Thread t = new Thread(this::loop, "decoder-vm");
+        Thread t = new Thread(() -> loop(mScheduler, false), "decoder-vm");
         t.setDaemon(true);
         t.start();
+        if (vm.lanes()) {
+            Thread small = new Thread(() -> loop(mSmall, true), "decoder-vm-small");
+            small.setDaemon(true);
+            small.start();
+        }
     }
 
     Vm vm() {
@@ -207,7 +226,9 @@ final class Decoder implements GuestLink.Budget {
     /** One request to the VM, with its answer once done. */
     static final class Request extends Scheduler.Job {
         final int op, a, b;
-        volatile byte[] file; // dropped with its budget once the VM's reply begins
+        volatile byte[] file; // dropped with its budget once the VM's big lane replies
+        long queuedAt; // when it was queued, for the timing log
+        volatile boolean bigLane; // the small lane sent it on: it goes to the big lane
         final int len;
         private long mInput; // budget held for the file, given back once the reply begins or the request ends
         // A large regular file streamed to the VM instead of file, and its SHA-256 read beforehand. Closed when the
@@ -264,7 +285,10 @@ final class Decoder implements GuestLink.Budget {
                 return r;
             }
         }
-        if (!mScheduler.offer(r)) {
+        r.queuedAt = mClock.now();
+        boolean small = mVm.lanes() && r.op != GuestLink.OP_PING && r.op != GuestLink.OP_HOOK && r.source == null
+                && r.len <= GuestLink.SMALL_INPUT_BYTES;
+        if (!(small ? mSmall : mScheduler).offer(r)) {
             release(r.lane, r.takeInput());
             closeSource(r);
             return r;
@@ -302,32 +326,49 @@ final class Decoder implements GuestLink.Budget {
         }
     }
 
-    private void loop() {
+    private void loop(Scheduler queue, boolean small) {
         for (;;) {
             Scheduler.Job job;
             try {
-                job = mScheduler.take();
+                job = queue.take();
             } catch (InterruptedException e) {
                 return;
             }
             Request r = (Request) job;
+            long started = mClock.now();
             try {
-                if (r.deadline > mClock.now()) handle(r);
+                if (r.deadline > started) handle(r, small);
             } catch (Throwable t) {
                 // Out of memory included: this request is unavailable, the service stays up.
                 Log.e(TAG, "request failed", t);
                 r.status = UNAVAILABLE;
                 r.answer = null;
+                r.bigLane = false;
             } finally {
-                if (r.source != null) r.sentDigest = r.source.sentDigest();
-                closeSource(r);
-                releaseInput(r);
-                GuestLink.Answer a = r.answer;
-                if (a != null && a.reserved > 0) {
-                    release(r.lane, a.reserved);
-                    a.reserved = 0;
+                if (sTimingLog) {
+                    Log.i(TAG_TIMING, (small ? "small" : "big") + " caller " + r.lane + " op " + r.op + " urgent "
+                            + r.userWaiting + " bytes " + r.len + " wait " + (started - r.queuedAt) + " ms vm "
+                            + (mClock.now() - started) + " ms status " + r.status + (r.bigLane ? " to big lane" : ""));
                 }
-                r.finish();
+                boolean onward = false;
+                if (r.bigLane) {
+                    // The small lane found it too large: on to the big lane, input and all, still waited on.
+                    r.bigLane = false;
+                    r.queuedAt = mClock.now();
+                    onward = mScheduler.offer(r);
+                    if (!onward) r.status = UNAVAILABLE;
+                }
+                if (!onward) {
+                    if (r.source != null) r.sentDigest = r.source.sentDigest();
+                    closeSource(r);
+                    releaseInput(r);
+                    GuestLink.Answer a = r.answer;
+                    if (a != null && a.reserved > 0) {
+                        release(r.lane, a.reserved);
+                        a.reserved = 0;
+                    }
+                    r.finish();
+                }
             }
         }
     }
@@ -338,7 +379,7 @@ final class Decoder implements GuestLink.Budget {
         r.file = null;
     }
 
-    private void handle(Request r) {
+    private void handle(Request r, boolean small) {
         if (mVm.heldDown()) {
             // A test holds the VM down (debuggable builds only): it stays stopped, every request is unavailable and
             // nothing is decoded anywhere else. No backoff, so it comes back as soon as the hold ends.
@@ -346,23 +387,36 @@ final class Decoder implements GuestLink.Budget {
             return;
         }
         long now = mClock.now();
-        if (now < mNextStart && !mVm.isRunning()) return; // backing off: UNAVAILABLE
+        synchronized (mStartLock) {
+            if (now < mNextStart && !mVm.isRunning()) return; // backing off: UNAVAILABLE
+        }
         long budget = now + CALL_BUDGET_MILLIS;
         for (int attempt = 0; ; attempt++) {
             GuestLink link;
             try {
-                link = mVm.link(budget);
+                link = mVm.link(small, budget);
             } catch (IOException e) {
                 Log.w(TAG, "VM not available: " + e.getMessage());
                 mVm.stop();
                 backOff();
                 return;
             }
-            boolean reused = mVm.lastLinkReused();
-            link.setBudget(this, r.lane, () -> releaseInput(r));
+            boolean reused = mVm.lastLinkReused(small);
+            // The big lane's reply ends the input's use: no second attempt follows. A small-lane reply may still send
+            // the request on to the big lane, so its (small) input stays until the request ends.
+            link.setBudget(this, r.lane, small ? null : () -> releaseInput(r));
             try {
                 GuestLink.Answer a = call(link, r, budget);
-                mBackoff = BACKOFF_MIN;
+                synchronized (mStartLock) {
+                    mBackoff = BACKOFF_MIN;
+                }
+                if (a.status == GuestLink.BIG_LANE) {
+                    // Too large for the small lane, decided in the VM. Not an answer: the big lane gets it.
+                    if (!small) throw new GuestLink.ProtocolException("BIG_LANE from the big lane");
+                    if (r.source != null) r.source.rewind();
+                    r.bigLane = true;
+                    return;
+                }
                 if (a.status == GuestLink.INTERNAL || a.status == GuestLink.BUSY) {
                     // A worker died: no verdict on the file, not cached, counted towards a strike. The service had no
                     // memory for the pixels, or the VM stopped the worker for a reason outside the file (BUSY): just
@@ -385,7 +439,7 @@ final class Decoder implements GuestLink.Budget {
                     // A connection kept from earlier that died meanwhile, before it said anything: connect again
                     // once before calling the VM broken.
                     Log.i(TAG, "kept VM connection was dead, connecting again: " + e.getMessage());
-                    mVm.dropLink();
+                    mVm.dropLink(small);
                     if (r.source != null) r.source.rewind();
                     continue;
                 }
@@ -427,8 +481,10 @@ final class Decoder implements GuestLink.Budget {
     }
 
     private void backOff() {
-        mNextStart = mClock.now() + mBackoff;
-        mBackoff = Math.min(mBackoff * 2, BACKOFF_MAX);
+        synchronized (mStartLock) {
+            mNextStart = mClock.now() + mBackoff;
+            mBackoff = Math.min(mBackoff * 2, BACKOFF_MAX);
+        }
     }
 
     private static String hex(byte[] b) {

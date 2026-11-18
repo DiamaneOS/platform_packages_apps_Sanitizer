@@ -31,14 +31,14 @@ public final class DecoderApp extends Application implements DecoderProvider {
     static final File VM_INITRD = new File("/apex/com.android.virt/etc/decoder_vm_initrd.img");
 
     /**
-     * The VM's memory. A worker may use what the VM has free when it starts, less a margin (vm/decoder_vm.cpp,
-     * worker_memory), so no size can make a worker run out: a file that needs more is refused. Measured in the arm64
-     * test VM (qemu, the same kernel and program): at 160 MiB the kernel shows 141 MiB, 119 MiB free after the
-     * broker's start, so a worker gets about 103 MiB, about 71 MiB beside a 32 MiB file. A 12 MP single-image HEIC
-     * needs about 296 MiB. A protected VM keeps a little more for itself than qemu, so these are upper bounds until
-     * a phone run measures them. 160 MiB until the VM memory plan decides.
+     * The VM's memory, 288 MiB (the user's decision, 2026-11-18). A worker may use what the VM has free when it starts,
+     * less a margin (vm/decoder_vm.cpp, worker_memory), so no size can make a worker run out: a file that needs more is
+     * refused. Measured in the arm64 test VM (qemu, the same kernel and program): at 288 MiB the kernel shows 266 MiB
+     * (the arena's mapping) and 241 MiB free after the broker's start, so a worker gets about 233 MiB, enough for a
+     * 12 MP single-image HEIC (222 MiB) and a 50 MP progressive JPEG at the box's scale (144 MiB). A protected VM
+     * keeps a little more for itself than qemu: a phone run gives the real figures.
      */
-    static final long VM_MEMORY_BYTES = 160L << 20;
+    static final long VM_MEMORY_BYTES = 288L << 20;
 
     private static final String PERMISSION = "de.diamaneos.sanitizer.permission.DECODE";
     private static final String[] CALLERS = {
@@ -57,7 +57,10 @@ public final class DecoderApp extends Application implements DecoderProvider {
 
     @Override
     public synchronized Decoder decoder() {
-        if (mDecoder == null) mDecoder = new Decoder(new GuestVm(this, VM_KERNEL, VM_INITRD, VM_MEMORY_BYTES));
+        if (mDecoder == null) {
+            Decoder.sTimingLog = DebugBuild.timingLog();
+            mDecoder = new Decoder(new GuestVm(this, VM_KERNEL, VM_INITRD, VM_MEMORY_BYTES));
+        }
         return mDecoder;
     }
 

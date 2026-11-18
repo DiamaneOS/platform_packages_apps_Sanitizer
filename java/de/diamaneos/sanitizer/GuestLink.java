@@ -37,6 +37,10 @@ import java.nio.charset.StandardCharsets;
  */
 final class GuestLink implements Closeable {
     static final int PORT = 5685;
+    // The small lane beside it (vm/proto.h kSmallPort): files of at most SMALL_INPUT_BYTES whose header declares at
+    // most a megapixel, decided in the VM. Anything else it answers BIG_LANE.
+    static final int SMALL_PORT = 5686;
+    static final int SMALL_INPUT_BYTES = 1 << 20;
 
     static final int REQUEST_MAGIC = 0x31305144; // "DQ01"
     static final int REPLY_MAGIC = 0x31305344; // "DS01"
@@ -56,6 +60,8 @@ final class GuestLink implements Closeable {
     // The worker was stopped for a reason outside the file (the VM ran out of memory, the worker got too little CPU):
     // never a verdict on the file, never a strike. Only on the link: callers see "unavailable".
     static final int BUSY = 5;
+    // Small lane only: the file is too large for that lane. Not a verdict: the request goes to the big lane.
+    static final int BIG_LANE = 6;
 
     // The contract's FORMAT_* values (IDecodeService), all of which the VM reads.
     static final int FORMAT_JPEG = 1;
@@ -315,8 +321,8 @@ final class GuestLink implements Closeable {
                 r.run();
             }
             if (a.status != OK) {
-                check(a.status == UNSUPPORTED || a.status == INVALID || a.status == INTERNAL || a.status == BUSY,
-                        "status");
+                check(a.status == UNSUPPORTED || a.status == INVALID || a.status == INTERNAL || a.status == BUSY
+                        || a.status == BIG_LANE, "status");
                 check(a.format == 0 && a.width == 0 && a.height == 0 && a.extra == 0 && payload == 0,
                         "failure with values");
                 readEnd(a.status, deadline);
@@ -362,12 +368,12 @@ final class GuestLink implements Closeable {
                     held = mBudget != null ? payload : 0;
                     byte[] pixels = readExact(payload, deadline).array();
                     // A worker that failed after its header: the VM kept the length with zeros and its trailer says
-                    // INVALID (the file), INTERNAL (the worker died) or BUSY (not the file). A clean answer, not a
-                    // broken link. Never UNSUPPORTED after pixels.
+                    // INVALID (the file), INTERNAL (the worker died), BUSY (not the file) or, from the small lane,
+                    // BIG_LANE. A clean answer, not a broken link. Never UNSUPPORTED after pixels.
                     ByteBuffer e = readExact(END_BYTES, deadline);
                     check(e.getInt() == END_MAGIC, "end");
                     int endStatus = e.getInt();
-                    if (endStatus == INVALID || endStatus == INTERNAL || endStatus == BUSY) {
+                    if (endStatus == INVALID || endStatus == INTERNAL || endStatus == BUSY || endStatus == BIG_LANE) {
                         Answer bad = new Answer();
                         bad.status = endStatus;
                         return bad;

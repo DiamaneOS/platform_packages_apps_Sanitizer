@@ -61,7 +61,8 @@ final class GuestVm implements Decoder.Vm {
     private final Executor mCallbacks = Executors.newSingleThreadExecutor();
 
     private VirtualMachine mVm;
-    private GuestLink mLink;
+    // A kept connection per lane: [0] the big lane, [1] the small lane.
+    private final GuestLink[] mLinks = new GuestLink[2];
     private volatile boolean mStopped = true;
     // Counts starts. Each start's callbacks carry its number, so a late callback of an instance stopped earlier never
     // marks the current one stopped.
@@ -71,7 +72,10 @@ final class GuestVm implements Decoder.Vm {
 
     // The test app's VM (images from /data/local/tmp on a debuggable build). The product's takes system_file only.
     private final boolean mTest;
-    private boolean mLastReused;
+    private final boolean[] mLastReused = new boolean[2];
+    // Two lanes (the small one beside the big one) and two vCPUs or more for them, unless a debuggable build's test
+    // asks for the single lane (DebugBuild.SINGLE_LANE).
+    private final boolean mLanes = !DebugBuild.singleLaneForTest();
     private volatile String mLastError = "";
 
     GuestVm(Context context, File kernel, File initrd, long memoryBytes) {
@@ -108,20 +112,22 @@ final class GuestVm implements Decoder.Vm {
      * not come up in time: the caller fails closed and the scheduler starts again with backoff.
      */
     @Override
-    public synchronized GuestLink link(long deadline) throws IOException {
-        mLastReused = mLink != null && !mLink.isBroken() && !mStopped;
-        if (mLastReused) return mLink;
-        if (mLink != null) mLink.close();
-        mLink = null;
+    public synchronized GuestLink link(boolean small, long deadline) throws IOException {
+        int lane = small ? 1 : 0;
+        GuestLink kept = mLinks[lane];
+        mLastReused[lane] = kept != null && !kept.isBroken() && !mStopped;
+        if (mLastReused[lane]) return kept;
+        if (kept != null) kept.close();
+        mLinks[lane] = null;
         if (mVm == null || mStopped) start();
         IOException last = null;
         while (SystemClock.uptimeMillis() < deadline) {
             try {
-                ParcelFileDescriptor pfd = mVm.connectVsock(GuestLink.PORT);
+                ParcelFileDescriptor pfd = mVm.connectVsock(small ? GuestLink.SMALL_PORT : GuestLink.PORT);
                 GuestLink link = new GuestLink(FdChannel.nonBlocking(pfd));
                 link.ping(Math.min(deadline, SystemClock.uptimeMillis() + 2000));
                 if (mReadyAt == 0) mReadyAt = SystemClock.uptimeMillis();
-                mLink = link;
+                mLinks[lane] = link;
                 return link;
             } catch (Exception e) {
                 last = e instanceof IOException ? (IOException) e : new IOException(e);
@@ -135,8 +141,10 @@ final class GuestVm implements Decoder.Vm {
     /** Stops the VM. The next link() starts it again. */
     @Override
     public synchronized void stop() {
-        if (mLink != null) mLink.close();
-        mLink = null;
+        for (int i = 0; i < mLinks.length; i++) {
+            if (mLinks[i] != null) mLinks[i].close();
+            mLinks[i] = null;
+        }
         if (mVm != null) {
             try {
                 mVm.stop();
@@ -230,9 +238,13 @@ final class GuestVm implements Decoder.Vm {
         VirtualMachineConfig.Builder vb = new VirtualMachineConfig.Builder(mContext);
         Method set = VirtualMachineConfig.Builder.class.getMethod("setCustomImageConfig", imageConfig);
         set.invoke(vb, image);
+        // Two lanes need two vCPUs. The VM framework offers one vCPU or one per host CPU (MATCH_HOST), no count in
+        // between: the lanes use two of them, the rest stay idle (a halted vCPU costs no CPU time).
         return vb.setProtectedVm(true)
                 .setDebugLevel(VirtualMachineConfig.DEBUG_LEVEL_NONE)
                 .setMemoryBytes(mMemoryBytes)
+                .setCpuTopology(mLanes ? VirtualMachineConfig.CPU_TOPOLOGY_MATCH_HOST
+                                       : VirtualMachineConfig.CPU_TOPOLOGY_ONE_CPU)
                 .build();
     }
 
@@ -252,15 +264,22 @@ final class GuestVm implements Decoder.Vm {
 
     /** Whether the last link() handed back a connection made earlier (which may have died meanwhile). */
     @Override
-    public synchronized boolean lastLinkReused() {
-        return mLastReused;
+    public synchronized boolean lastLinkReused(boolean small) {
+        return mLastReused[small ? 1 : 0];
     }
 
-    /** Drops the connection but keeps the VM: the next link() connects again. */
+    /** Drops the lane's connection but keeps the VM: the next link() connects again. */
     @Override
-    public synchronized void dropLink() {
-        if (mLink != null) mLink.close();
-        mLink = null;
+    public synchronized void dropLink(boolean small) {
+        int lane = small ? 1 : 0;
+        if (mLinks[lane] != null) mLinks[lane].close();
+        mLinks[lane] = null;
+    }
+
+    /** Whether this VM has the small lane (two lanes, two vCPUs or more). */
+    @Override
+    public boolean lanes() {
+        return mLanes;
     }
 
     /** Text as it may be printed: control characters become spaces, at most 2000 characters. */

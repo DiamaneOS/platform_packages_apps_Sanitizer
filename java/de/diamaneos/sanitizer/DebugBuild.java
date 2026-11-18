@@ -41,6 +41,20 @@ final class DebugBuild {
     // adb shell setprop debug.diamaneos.decoder.down_until $(($(adb shell date +%s) + 60)) holds it for a minute.
     static final String DOWN_UNTIL = "debug.diamaneos.decoder.down_until";
 
+    // A test compares the old single lane with the two lanes: "1" here (set before the service starts) gives one lane
+    // and one vCPU. Debuggable builds only.
+    static final String SINGLE_LANE = "debug.diamaneos.decoder.single_lane";
+
+    /** Debuggable builds only: whether a test asked for the single lane. Never on a user build. */
+    static boolean singleLaneForTest() {
+        return debuggable() && SystemProperties.getBoolean(SINGLE_LANE, false);
+    }
+
+    /** Debuggable builds only: timing lines per request in the log (lane, queue wait, VM time). */
+    static boolean timingLog() {
+        return debuggable();
+    }
+
     /** Debuggable builds only: whether a test holds the decoder VM down now. Never on a user build. */
     static boolean vmHeldDown() {
         if (!debuggable()) return false;
