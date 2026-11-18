@@ -76,6 +76,7 @@ final class GuestVm implements Decoder.Vm {
     // Two lanes (the small one beside the big one) and two vCPUs or more for them, unless a debuggable build's test
     // asks for the single lane (DebugBuild.SINGLE_LANE).
     private final boolean mLanes = !DebugBuild.singleLaneForTest();
+    static final int LANE_VCPUS = 2;
     private volatile String mLastError = "";
 
     GuestVm(Context context, File kernel, File initrd, long memoryBytes) {
@@ -233,18 +234,28 @@ final class GuestVm implements Decoder.Vm {
                 .newInstance("vm-instance", instance.getPath(), true, null);
         diskClass.getMethod("addPartition", partitionClass).invoke(disk, partition);
         builderClass.getMethod("addDisk", diskClass).invoke(b, disk);
+        // Two lanes need exactly two vCPUs: our Virtualization (vm-vcpus) lets a raw VM ask for a count, checked
+        // against the host's CPUs by the VM manager. Without it, one vCPU per host CPU (MATCH_HOST) below.
+        boolean counted = false;
+        if (mLanes) {
+            try {
+                builderClass.getMethod("setCpuCount", int.class).invoke(b, LANE_VCPUS);
+                counted = true;
+            } catch (NoSuchMethodException e) {
+                Log.w(TAG, "no vCPU count in this VM framework, one vCPU per host CPU");
+            }
+        }
         Object image = builderClass.getMethod("build").invoke(b);
 
         VirtualMachineConfig.Builder vb = new VirtualMachineConfig.Builder(mContext);
         Method set = VirtualMachineConfig.Builder.class.getMethod("setCustomImageConfig", imageConfig);
         set.invoke(vb, image);
-        // Two lanes need two vCPUs. The VM framework offers one vCPU or one per host CPU (MATCH_HOST), no count in
-        // between: the lanes use two of them, the rest stay idle (a halted vCPU costs no CPU time).
+        // The custom image's vCPU count, when set, takes the place of this topology.
         return vb.setProtectedVm(true)
                 .setDebugLevel(VirtualMachineConfig.DEBUG_LEVEL_NONE)
                 .setMemoryBytes(mMemoryBytes)
-                .setCpuTopology(mLanes ? VirtualMachineConfig.CPU_TOPOLOGY_MATCH_HOST
-                                       : VirtualMachineConfig.CPU_TOPOLOGY_ONE_CPU)
+                .setCpuTopology(mLanes && !counted ? VirtualMachineConfig.CPU_TOPOLOGY_MATCH_HOST
+                                                   : VirtualMachineConfig.CPU_TOPOLOGY_ONE_CPU)
                 .build();
     }
 
