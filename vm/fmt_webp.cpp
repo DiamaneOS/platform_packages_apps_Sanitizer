@@ -51,7 +51,7 @@ uint64_t decoder_bytes(uint32_t w, uint32_t h, int format, bool alpha) {
 }
 
 bool fits(uint64_t bytes) {
-    return bytes + kSlack <= arena_left();
+    return arena_room(bytes + kSlack);
 }
 
 // Decodes data into rgba (premultiplied, external memory), scaled to ow x oh when that differs from w x h.

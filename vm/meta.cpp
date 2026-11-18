@@ -296,8 +296,13 @@ bool dms_e7(const uint32_t* v, char ref, char pos, char neg, int64_t limit, int3
     return true;
 }
 
+// Orientations 2, 4, 5 and 7 mirror the image: mirrored left to right first, then turned. The record carries the turn
+// (as ExifInterface.getRotationDegrees), the worker applies the mirror to the pixels.
+bool sMirror = false;
+
 void finish_exif(Meta* m, const ExifState& st) {
     if (st.haveOrientation) {
+        sMirror = st.orientation == 2 || st.orientation == 4 || st.orientation == 5 || st.orientation == 7;
         // As ExifInterface.getRotationDegrees: mirrored orientations take the rotation of their pair.
         switch (st.orientation) {
             case 1: case 2: m->orientation = 0; break;
@@ -369,6 +374,9 @@ void xmp_value(Span x, const char* key, char* dst) {
 }
 
 void read_xmp(Span x, Meta* m) {
+    // Three identifiers and a marker sit in the packet's head: never search more than 1 MiB (a crafted block of a
+    // whole file's size would cost seconds of CPU).
+    if (x.n > (1u << 20)) x.n = 1u << 20;
     xmp_value(x, "xmpMM:DocumentID", m->documentId);
     xmp_value(x, "xmpMM:InstanceID", m->instanceId);
     xmp_value(x, "xmpMM:OriginalDocumentID", m->originalDocumentId);
@@ -472,17 +480,20 @@ void read_xmp_block(const uint8_t* data, size_t size, Meta* m) {
     read_xmp({data, size}, m);
 }
 
-void read_metadata(const uint8_t* data, size_t size, uint32_t format, Meta* m) {
+void read_metadata(const uint8_t* data, size_t size, uint32_t format, Meta* m, bool* mirror) {
     Span s = {data, size};
+    sMirror = false;
+    bool heifMirror = false;
     switch (format) {
         case kFormatJpeg: read_jpeg(s, m); break;
         case kFormatPng: read_png(s, m); break;
         case kFormatWebp: read_webp(s, m); break;
         case kFormatGif: m->specialFormat = kSpecialGif; break;
-        case kFormatHeif: case kFormatAvif: heif_metadata(data, size, m); break;
+        case kFormatHeif: case kFormatAvif: heif_metadata(data, size, m, &heifMirror); break;
         case kFormatDng: read_exif_block(data, size, m); break;
         default: break;  // BMP, ICO and WBMP carry no metadata MediaProvider reads
     }
+    if (mirror != nullptr) *mirror = format == kFormatHeif || format == kFormatAvif ? heifMirror : sMirror;
 }
 
 bool png_is_animated(const uint8_t* data, size_t size) {

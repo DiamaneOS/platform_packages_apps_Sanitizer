@@ -102,17 +102,21 @@ cc_defaults {
         "-Wl,--wrap=aligned_alloc",
         "-Wl,--wrap=malloc_usable_size",
     ],
+    target: {
+        android_arm64: {
+            // bionic's setjmp saves the signal mask, a system call a worker may not make (vm/decoder_vm.cpp).
+            ldflags: ["-Wl,--wrap=setjmp"],
+        },
+    },
 }
 
 // The decoder VM's whole userspace: one static program, /init of a raw protected VM. Built for the device, never
-// installed on it: it goes into the VM's initramfs. libhevc's arm64 assembly has no BTI landing pads (its module
-// carries no_bti, like Android's own software HEVC codec), so the whole program is linked without BTI enforcement.
+// installed on it: it goes into the VM's initramfs. Linked with the platform's BTI check: every object carries the
+// BTI property, so the kernel enforces BTI for all of the program. libhevc's arm64 assembly has no landing pads and
+// stays out of the link (vm/fmt_heif.cpp defines the one function that would pull it in).
 cc_defaults {
     name: "decoder_vm_defaults",
-    defaults: [
-        "decoder_vm_common",
-        "no_bti",
-    ],
+    defaults: ["decoder_vm_common"],
     static_executable: true,
     stl: "libc++_static",
     installable: false,

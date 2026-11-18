@@ -27,6 +27,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <new>
 
 #include "image.h"
@@ -50,7 +51,8 @@ struct Links {
 };
 
 uint8_t* gBase = nullptr;
-size_t gCap = 0;
+size_t gLimit = 0;  // the mapping: a worker can never go beyond it
+size_t gCap = 0;    // what this worker may use now (arena_allow raises it)
 size_t gTop = 0;       // everything from here on was never handed out since the worker started
 size_t gLast = kNone;  // offset of the block that ends at gTop
 size_t gInUse = 0;
@@ -193,7 +195,7 @@ void* take(size_t n) {
 
 bool in_arena(const void* p) {
     const uint8_t* q = static_cast<const uint8_t*>(p);
-    return gBase != nullptr && q >= gBase + kHdr && q < gBase + gCap;
+    return gBase != nullptr && q >= gBase + kHdr && q < gBase + gLimit;
 }
 
 // A pointer the worker may free: inside the arena, at a block start that is in use. Anything else (a broker
@@ -209,10 +211,28 @@ Block* owned(void* p) {
 
 void arena_setup(uint8_t* base, size_t size) {
     gBase = base;
-    gCap = size & ~static_cast<size_t>(15);
+    gLimit = size & ~static_cast<size_t>(15);
+    gCap = std::min(kArenaDefault, gLimit);
+}
+
+bool arena_allow(size_t n) {
+    n = (n + 15) & ~static_cast<size_t>(15);
+    if (n > gCap) gCap = std::min(n, gLimit);
+    return n <= gCap;
+}
+
+bool arena_room(size_t n) {
+    if (!gWorker) return n <= kArenaDefault;
+    if (n <= gCap - gInUse) return true;
+    return n <= gLimit - gInUse && arena_allow(gInUse + n);
+}
+
+size_t arena_limit() {
+    return gLimit;
 }
 
 void arena_enter_worker() {
+    gCap = std::min(kArenaDefault, gLimit);
     gTop = 0;
     gLast = kNone;
     gInUse = 0;
@@ -226,7 +246,7 @@ bool arena_in_worker() {
 }
 
 size_t arena_left() {
-    return gWorker ? gCap - gInUse : kArenaBytes;
+    return gWorker ? gCap - gInUse : kArenaDefault;
 }
 
 size_t arena_peak() {

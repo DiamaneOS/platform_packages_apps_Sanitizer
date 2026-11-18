@@ -32,6 +32,7 @@
 
 #include <errno.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -46,6 +47,14 @@
 #include "ivd.h"
 #include "meta.h"
 #include "warmup_formats.h"
+
+#if defined(__aarch64__)
+// libhevc's arm64 assembly has no BTI landing pads. Its ARMv8 function table (ihevcd_function_selector_av8.c) is the
+// only thing that refers to it, so defining the table's setup here keeps the table and all the assembly out of the
+// link, and the program keeps BTI. Every arm64 processor choice gets the C routines.
+extern "C" void ihevcd_init_function_ptr_noneon(void* codec);
+extern "C" void ihevcd_init_function_ptr_av8(void* codec) { ihevcd_init_function_ptr_noneon(codec); }
+#endif
 
 namespace decoder {
 namespace {
@@ -63,6 +72,10 @@ constexpr uint32_t kMaxGridColumns = 64;  // a row of tiles is held at once
 constexpr uint64_t kMaxCodedPixels = 16u << 20;  // one coded image: a tile or a whole image
 constexpr uint64_t kMaxGridPixels = 256u << 20;  // all tiles of a grid together
 constexpr size_t kSlack = 4u << 20;              // decoder state, scaler and stripe buffer, besides what is counted
+// Measured (decoder_vm_hosttest --bench): what the decoders hold per pixel of one coded image, besides its picture.
+// libhevc: 208.5 MiB for a 12 MP single image, about 14.4 bytes a pixel besides the two pictures.
+constexpr uint64_t kHevcBytesPerPixel = 16;
+constexpr uint64_t kAv1BytesPerPixel = 3;
 
 constexpr uint32_t fourcc(const char* s) {
     return static_cast<uint32_t>(s[0]) << 24 | static_cast<uint32_t>(s[1]) << 16 | static_cast<uint32_t>(s[2]) << 8 |
@@ -213,6 +226,7 @@ struct File {
     uint32_t boxes;
     Item* items;
     uint32_t nItems;
+    uint16_t* index;  // item id -> position + 1, open addressing (kIndexSlots), so a lookup costs one or a few probes
     Prop* props;
     uint32_t nProps;
     Extent* extents;
@@ -227,11 +241,25 @@ struct File {
     uint32_t nTracks;
 };
 
+constexpr uint32_t kIndexSlots = 8192;  // twice kMaxItems, a power of two
+
+uint32_t slot_of(uint32_t id) {
+    return (id * 0x9e3779b1u) >> 19;  // the top 13 bits
+}
+
 Item* find_item(File* f, uint32_t id) {
-    for (uint32_t i = 0; i < f->nItems; i++) {
-        if (f->items[i].id == id) return &f->items[i];
+    for (uint32_t s = slot_of(id), n = 0; n < kIndexSlots; s = (s + 1) & (kIndexSlots - 1), n++) {
+        uint16_t v = f->index[s];
+        if (v == 0) return nullptr;
+        if (f->items[v - 1].id == id) return &f->items[v - 1];
     }
     return nullptr;
+}
+
+void index_item(File* f, uint32_t pos) {
+    uint32_t s = slot_of(f->items[pos].id);
+    while (f->index[s] != 0) s = (s + 1) & (kIndexSlots - 1);
+    f->index[s] = static_cast<uint16_t>(pos + 1);
 }
 
 const Prop* item_prop(const File* f, const Item* it, uint32_t type) {
@@ -263,11 +291,12 @@ bool parse_iinf(File* f, Span body) {
         Span content = {nullptr, 0};
         if (type == fourcc("mime")) content = e.cstr();
         if (e.bad || id == 0 || find_item(f, id) != nullptr) return false;
-        Item& it = f->items[f->nItems++];
+        Item& it = f->items[f->nItems];
         memset(&it, 0, sizeof(it));
         it.id = id;
         it.type = protection != 0 ? 0 : type;  // protected items are never decoded
         it.contentType = content;
+        index_item(f, f->nItems++);
     }
     return !w.bad;
 }
@@ -317,6 +346,7 @@ bool parse_iprp(File* f, Span body, uint32_t depth) {
     BoxWalker w = {body, 0, &f->boxes, false, false, false};
     Box b;
     bool ipco = false;
+    uint32_t ipmas = 0;
     while (w.next(&b)) {
         if (b.type == fourcc("ipco")) {
             if (ipco) return false;
@@ -329,6 +359,8 @@ bool parse_iprp(File* f, Span body, uint32_t depth) {
             }
             if (pw.bad) return false;
         } else if (b.type == fourcc("ipma")) {
+            // One per version and flags combination at most (ISO/IEC 23008-12): two in practice.
+            if (++ipmas > 2) return false;
             Reader r = {b.body, 0, false};
             uint32_t version = r.u8();
             uint32_t flags = static_cast<uint32_t>(r.un(3));
@@ -550,7 +582,11 @@ bool parse_file(const uint8_t* data, size_t size, File* f) {
     f->props = static_cast<Prop*>(arena_alloc(sizeof(Prop) * kMaxProps));
     f->extents = static_cast<Extent*>(arena_alloc(sizeof(Extent) * kMaxItems * 4));
     f->refs = static_cast<Ref*>(arena_alloc(sizeof(Ref) * kMaxRefs));
-    if (f->items == nullptr || f->props == nullptr || f->extents == nullptr || f->refs == nullptr) return false;
+    f->index = static_cast<uint16_t*>(arena_calloc(kIndexSlots, sizeof(uint16_t)));
+    if (f->items == nullptr || f->props == nullptr || f->extents == nullptr || f->refs == nullptr ||
+        f->index == nullptr) {
+        return false;
+    }
     BoxWalker w = {f->data, 0, &f->boxes, true, false, false};
     Box b;
     bool ftyp = false, meta = false, moov = false;
@@ -650,7 +686,9 @@ void transform_of(const File* f, const Item* it, bool* flip, uint32_t* deg) {
             r = (r + 360 - 90 * (p.body.p[0] & 3)) % 360;  // irot turns anticlockwise
         } else if (p.type == fourcc("imir")) {
             fl = !fl;
-            r = (p.body.p[0] & 1) == 0 ? (360 - r) % 360 : (540 - r) % 360;  // axis 1: top to bottom
+            // axis 0 exchanges top and bottom (a mirror and a half turn), axis 1 left and right, as libheif and libavif
+            // read it (ISO/IEC 23008-12:2022).
+            r = (p.body.p[0] & 1) == 0 ? (540 - r) % 360 : (360 - r) % 360;
         }
     }
     *flip = fl;
@@ -885,6 +923,20 @@ bool hevc_open(Hevc* d, uint32_t w, uint32_t h, uint32_t cols, bool mono) {
     cip.u4_size = sizeof(cip);
     cop.u4_size = sizeof(cop);
     if (!hevc_ctl(d->codec, &cip, &cop)) return false;
+    // libhevc's C code only (on arm64 its assembly is not even linked, see ihevcd_init_function_ptr_av8 above).
+    ihevcd_cxa_ctl_set_processor_ip_t pip = {};
+    ihevcd_cxa_ctl_set_processor_op_t pop = {};
+    pip.e_cmd = IVD_CMD_VIDEO_CTL;
+    pip.e_sub_cmd = static_cast<IVD_CONTROL_API_COMMAND_TYPE_T>(IHEVCD_CXA_CMD_CTL_SET_PROCESSOR);
+#if defined(__aarch64__)
+    pip.u4_arch = ARCH_ARM_NONEON;
+#else
+    pip.u4_arch = getenv("DECODER_HEVC_SIMD") != nullptr ? ARCH_X86_SSE42 : ARCH_X86_GENERIC;  // host measurements
+#endif
+    pip.u4_soc = SOC_GENERIC;
+    pip.u4_size = sizeof(pip);
+    pop.u4_size = sizeof(pop);
+    if (!hevc_ctl(d->codec, &pip, &pop)) return false;
     size_t ysize = static_cast<size_t>(w) * h, csize = static_cast<size_t>((w + 1) / 2) * ((h + 1) / 2);
     for (uint32_t c = 0; c < cols; c++) {
         d->out[c] = static_cast<uint8_t*>(arena_alloc(ysize + 2 * csize));
@@ -1288,7 +1340,13 @@ bool decode_tile(const File* f, const Layer& l, Decoder* d, uint32_t index, uint
 // ---------------------------------------------------------------------------------------------------------------
 // The image to show.
 
+// The clean aperture (clap): the part of the image that is shown, in the image's own coordinates.
+struct Crop {
+    uint32_t x, y, w, h;
+};
+
 struct Plan {
+    Crop crop;
     Layer color, alpha;
     bool hasAlpha, premultiplied;
     bool flip;
@@ -1318,6 +1376,41 @@ const Track* color_track(const File* f) {
 
 // Picks what to show: the primary item, else the first sample of the first picture track. Sizes only (no item
 // data) when headerOnly.
+// clap of item it, as libavif and libheif read it: an integer rectangle inside w x h, listed before any irot or imir
+// (the crop applies to the image as stored). None: the whole image. False for a clap this reader cannot apply (not
+// whole pixels, outside the image, after a turn): the image is not decoded (UNSUPPORTED).
+bool crop_of(const File* f, const Item* it, uint32_t w, uint32_t h, Crop* c) {
+    *c = {0, 0, w, h};
+    const Prop* clap = nullptr;
+    bool turned = false;
+    for (uint32_t i = 0; i < it->nAssoc; i++) {
+        const Prop& p = f->props[it->assoc[i] - 1];
+        if (p.type == fourcc("irot") || p.type == fourcc("imir")) turned = true;
+        if (p.type == fourcc("clap")) {
+            if (turned || clap != nullptr) return false;
+            clap = &p;
+        }
+    }
+    if (clap == nullptr) return true;
+    Reader r = {clap->body, 0, false};
+    uint32_t wn = r.u32(), wd = r.u32(), hn = r.u32(), hd = r.u32();
+    int32_t xn = static_cast<int32_t>(r.u32());
+    uint32_t xd = r.u32();
+    int32_t yn = static_cast<int32_t>(r.u32());
+    uint32_t yd = r.u32();
+    if (r.bad || wd == 0 || hd == 0 || xd == 0 || yd == 0 || wn % wd != 0 || hn % hd != 0) return false;
+    int64_t cw = wn / wd, ch = hn / hd;
+    if (cw < 1 || ch < 1 || cw > w || ch > h) return false;
+    // The crop's left edge: horizOff + (w - cw) / 2, which must be a whole pixel. Likewise the top edge.
+    int64_t xnum = 2 * static_cast<int64_t>(xn) + (static_cast<int64_t>(w) - cw) * xd, xden = 2 * static_cast<int64_t>(xd);
+    int64_t ynum = 2 * static_cast<int64_t>(yn) + (static_cast<int64_t>(h) - ch) * yd, yden = 2 * static_cast<int64_t>(yd);
+    if (xnum % xden != 0 || ynum % yden != 0) return false;
+    int64_t x = xnum / xden, y = ynum / yden;
+    if (x < 0 || y < 0 || x + cw > w || y + ch > h) return false;
+    *c = {static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(cw), static_cast<uint32_t>(ch)};
+    return true;
+}
+
 bool make_plan(File* f, Plan* plan, bool headerOnly) {
     memset(plan, 0, sizeof(*plan));
     const Track* track = color_track(f);
@@ -1327,12 +1420,24 @@ bool make_plan(File* f, Plan* plan, bool headerOnly) {
         if (it == nullptr) return false;
         transform_of(f, it, &plan->flip, &plan->degrees);
         if (headerOnly) {
-            // The stored size: ispe, which every image item carries.
+            // The stored size: ispe, which every image item carries, after the crop (clap).
             plan->color.rows = plan->color.cols = 1;
-            if (ispe(f, it, &plan->color.outW, &plan->color.outH)) return true;
-            return layer_from_item(f, it, &plan->color);  // a grid without ispe: its own header
+            if (!ispe(f, it, &plan->color.outW, &plan->color.outH) && !layer_from_item(f, it, &plan->color)) {
+                return false;  // a grid without ispe: its own header
+            }
+            if (!crop_of(f, it, plan->color.outW, plan->color.outH, &plan->crop)) {
+                gOutcome.unsupported = true;
+                return false;
+            }
+            plan->color.outW = plan->crop.w;
+            plan->color.outH = plan->crop.h;
+            return true;
         }
         if (!layer_from_item(f, it, &plan->color)) return false;
+        if (!crop_of(f, it, plan->color.outW, plan->color.outH, &plan->crop)) {
+            gOutcome.unsupported = true;
+            return false;
+        }
         for (uint32_t i = 0; i < f->nRefs; i++) {
             const Ref& r = f->refs[i];
             Item* a = r.type == fourcc("auxl") && r.to == it->id ? find_item(f, r.from) : nullptr;
@@ -1347,6 +1452,7 @@ bool make_plan(File* f, Plan* plan, bool headerOnly) {
     } else {
         if (track == nullptr) return false;
         if (!layer_from_track(*track, &plan->color)) return false;
+        plan->crop = {0, 0, plan->color.outW, plan->color.outH};
         plan->color.sample = {nullptr, 0};
         if (headerOnly) return true;
         auto sample_of = [&](const Track& t, Span* s) {
@@ -1379,9 +1485,14 @@ bool decode_plan(const File* f, Plan* plan, uint32_t maxW, uint32_t maxH, Sink* 
     Layer& a = plan->alpha;
     // Memory, checked before any decoder exists: the pictures of one row of tiles and one more the decoder works in,
     // the row and the scaler. What the decoders take beyond that is bounded by the arena itself.
-    uint64_t perTile = static_cast<uint64_t>(c.tileW) * c.tileH * 3 / 2;
+    uint64_t px = static_cast<uint64_t>(c.tileW) * c.tileH;
+    uint64_t perTile = px * 3 / 2;
     uint64_t need = perTile * (c.cols + 1) * (plan->hasAlpha ? 2 : 1) + static_cast<uint64_t>(c.outW) * 4 * 6 + kSlack;
-    if (need > arena_left()) return false;
+    // The decoders' own state per coded image: libhevc keeps whole-picture tables of about kHevcBytesPerPixel, dav1d
+    // its picture pool. Sized from the declared size, so the worker asks for this much of the arena before it starts
+    // (a 12 MP single image is not a grid and needs far more than the default).
+    need += px * (c.codec == kHevc ? kHevcBytesPerPixel : kAv1BytesPerPixel) * (plan->hasAlpha ? 2 : 1);
+    if (!arena_room(need)) return false;
     Decoder dc = {}, da = {};
     struct Closer {
         Decoder *a, *b;
@@ -1395,7 +1506,8 @@ bool decode_plan(const File* f, Plan* plan, uint32_t maxW, uint32_t maxH, Sink* 
     Pic* pics = static_cast<Pic*>(arena_alloc(sizeof(Pic) * c.cols * 2));
     if (row == nullptr || pics == nullptr) return false;
     Scaler scaler = {};
-    if (!start_output(&scaler, c.outW, c.outH, maxW, maxH, sink)) return false;
+    const Crop& cr = plan->crop;
+    if (!start_output(&scaler, cr.w, cr.h, maxW, maxH, sink)) return false;
     scaler.premultiplied = plan->premultiplied;
     Coeffs k = {};
     bool alphaFull = true;
@@ -1415,6 +1527,8 @@ bool decode_plan(const File* f, Plan* plan, uint32_t maxW, uint32_t maxH, Sink* 
             }
         }
         for (uint32_t y = 0; y < c.tileH && ty * c.tileH + y < c.outH; y++) {
+            uint32_t gy = ty * c.tileH + y;
+            if (gy < cr.y || gy >= cr.y + cr.h) continue;  // outside the clean aperture
             for (uint32_t tx = 0; tx < c.cols; tx++) {
                 uint32_t x0 = tx * c.tileW;
                 if (x0 >= c.outW) break;
@@ -1428,11 +1542,7 @@ bool decode_plan(const File* f, Plan* plan, uint32_t maxW, uint32_t maxH, Sink* 
                     for (int ch = 0; ch < 3; ch++) px[ch] = std::min(px[ch], px[3]);
                 }
             }
-            if (plan->flip) {
-                uint32_t* p = reinterpret_cast<uint32_t*>(row);
-                std::reverse(p, p + c.outW);
-            }
-            if (!scaler_push(&scaler, row)) return false;
+            if (!scaler_push(&scaler, row + static_cast<size_t>(cr.x) * 4)) return false;
         }
     }
     bool done = scaler_done(&scaler);
@@ -1458,6 +1568,7 @@ struct Holder {
             arena_free(f->props);
             arena_free(f->extents);
             arena_free(f->refs);
+            arena_free(f->index);
             arena_free(f);
         }
     }
@@ -1490,7 +1601,7 @@ bool decode_heif(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
     return decode_plan(f, plan, maxW, maxH, sink);
 }
 
-void heif_metadata(const uint8_t* data, size_t size, Meta* m) {
+void heif_metadata(const uint8_t* data, size_t size, Meta* m, bool* mirror) {
     Holder h = {new_file(), nullptr};
     File* f = h.f;
     if (f == nullptr || !parse_file(data, size, f)) return;
@@ -1537,14 +1648,20 @@ void heif_metadata(const uint8_t* data, size_t size, Meta* m) {
         transform_of(f, primary, &flip, &deg);
         m->orientation = static_cast<int32_t>(deg);
         m->flags |= kHasOrientation;
+        if (mirror != nullptr) *mirror = flip;
     }
 }
 
 void warm_up_heif() {
-    // dav1d reads /proc/cpuinfo once, when its first decoder opens. A real decode also sets up its tables.
+    // dav1d reads /proc/cpuinfo once, when its first decoder opens. A real decode also sets up its tables, and a
+    // 12-bit frame the tables of the C transforms (a pthread_once, whose first run in a worker was a futex call that
+    // killed it: 12-bit AVIF on arm64, found in the arm64 test run).
     Sink sink = {-1, static_cast<uint8_t*>(arena_alloc(kStripeBytes)), 0};
     uint32_t w, h;
-    if (sink.buf != nullptr) decode_heif(kWarmupAvif, sizeof(kWarmupAvif), 8, 8, &sink, false, &w, &h);
+    if (sink.buf != nullptr) {
+        decode_heif(kWarmupAvif, sizeof(kWarmupAvif), 8, 8, &sink, false, &w, &h);
+        decode_heif(kWarmupAvif12, sizeof(kWarmupAvif12), 8, 8, &sink, false, &w, &h);
+    }
     arena_free(sink.buf);
 }
 

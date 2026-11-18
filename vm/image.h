@@ -31,10 +31,19 @@ namespace decoder {
 // Memory (arena.cpp). In a worker every allocation, the libraries' malloc included (the link wraps malloc, calloc,
 // realloc, free and the aligned forms), comes from one fixed arena with a real free list, so a decoder that frees
 // and allocates again per tile or frame stays within it. In the broker (the warm-up) it is the C library's heap.
+//
+// The arena is the VM's memory less what the kernel, the broker and one request's buffered file need (decoder_vm.cpp,
+// arena_bytes_for). A worker starts with kArenaDefault of it and a decoder that knows from the declared size that it
+// needs more (a large single HEVC image, a large progressive JPEG) asks for it with arena_allow, up to the whole arena.
 
-constexpr size_t kArenaBytes = 64u << 20;
+constexpr size_t kArenaDefault = 64u << 20;
 
 void arena_setup(uint8_t* base, size_t size);
+// Lets this worker use up to n bytes of the arena in all (never more than the arena). True when that much is allowed.
+bool arena_allow(size_t n);
+// True when another n bytes fit, asking for them when they do not fit the current allowance.
+bool arena_room(size_t n);
+size_t arena_limit();  // the whole arena
 void arena_enter_worker();  // from now on malloc and friends use the arena, which starts empty
 bool arena_in_worker();
 void* arena_alloc(size_t n);
@@ -61,6 +70,8 @@ bool sink_put(Sink* s, const uint8_t* p, size_t n);
 // The worker's thumbnail header to the broker: "DSR2", width, height, gRotation.
 bool sink_header(Sink* s, uint32_t w, uint32_t h);
 extern uint32_t gRotation;
+// The image is mirrored left to right before its turn (EXIF 2, 4, 5, 7, HEIF imir): scaler_push reverses each row.
+extern bool gFlip;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Scaling (decoder_vm.cpp): rows in, one at a time, straight RGBA unless premultiplied is set, premultiplied RGBA out,

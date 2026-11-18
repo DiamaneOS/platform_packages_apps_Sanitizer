@@ -40,6 +40,10 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#endif
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -262,6 +266,7 @@ uint32_t le32(const uint8_t* b) {
 }
 
 uint32_t gRotation = 0;
+bool gFlip = false;
 
 bool sink_header(Sink* s, uint32_t w, uint32_t h) {
     uint8_t hdr[16] = {'D', 'S', 'R', '2'};
@@ -340,6 +345,10 @@ bool scaler_emit(Scaler* s) {
 
 bool scaler_push(Scaler* s, uint8_t* row) {
     if (s->y >= s->ih) return false;
+    if (gFlip) {
+        uint32_t* px = reinterpret_cast<uint32_t*>(row);
+        std::reverse(px, px + s->iw);
+    }
     if (!s->premultiplied) premultiply(row, s->iw);
     if (s->hrow == nullptr) {  // same size
         s->y++;
@@ -419,6 +428,22 @@ size_t src_read(Src* s, uint8_t* out, size_t n) {
 // ---------------------------------------------------------------------------------------------------------------
 // PNG through libpng's row API. Every allocation goes through the arena, errors jump back without signal masks
 // (_setjmp, _longjmp), since saving or restoring a mask is a system call.
+
+// libpng also sets a jump point of its own while it builds its read struct (png_create_read_struct calls setjmp).
+// bionic's setjmp saves the signal mask with rt_sigprocmask, which strict seccomp answers by killing the worker: every
+// PNG died on arm64 (found on the phone, reproduced in the VM program's arm64 test run). The device link sends every
+// setjmp call here (Android.bp, --wrap=setjmp), a plain branch to _setjmp: the same jump buffer, the caller's own
+// return address and stack, no mask. longjmp restores a mask only when the buffer says one was saved.
+#if defined(__aarch64__) && defined(__BIONIC__)
+__asm__(
+    ".text\n"
+    ".globl __wrap_setjmp\n"
+    ".type __wrap_setjmp, %function\n"
+    "__wrap_setjmp:\n"
+    "    bti c\n"
+    "    b _setjmp\n"
+    ".size __wrap_setjmp, . - __wrap_setjmp\n");
+#endif
 
 void png_read_input(png_structp png, png_bytep out, size_t n) {
     Src* in = static_cast<Src*>(png_get_io_ptr(png));
@@ -510,7 +535,7 @@ bool decode_png_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool head
         }
     } else {
         // Interlaced: the passes fill the whole image, so it needs room in the arena for all of it.
-        if (static_cast<uint64_t>(stride) * h > arena_left()) png_error(png, "interlaced image too large");
+        if (!arena_room(static_cast<uint64_t>(stride) * h + (1u << 20))) png_error(png, "interlaced image too large");
         pixels = static_cast<uint8_t*>(png_malloc(png, stride * h));
         for (int pass = 0; pass < passes; pass++) {
             for (uint32_t y = 0; y < h; y++) png_read_row(png, pixels + stride * y, nullptr);
@@ -640,9 +665,18 @@ bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool hea
         jpeg_destroy_decompress(&cinfo);
         return true;
     }
+    if (cinfo.data_precision != 8) {  // 12-bit JPEG: libjpeg-turbo reads it only through another API
+        gOutcome.unsupported = true;
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
     uint32_t ow, oh;
     fit_box(cinfo.image_width, cinfo.image_height, maxW, maxH, &ow, &oh);
-    cinfo.out_color_space = JCS_EXT_RGBA;
+    // CMYK and YCCK (print and Photoshop files) come out as CMYK and are turned into RGB here, as Skia does: a file
+    // with Adobe's marker stores its inks inverted.
+    bool cmyk = cinfo.jpeg_color_space == JCS_CMYK || cinfo.jpeg_color_space == JCS_YCCK;
+    bool inverted = cinfo.saw_Adobe_marker;
+    cinfo.out_color_space = cmyk ? JCS_CMYK : JCS_EXT_RGBA;
     cinfo.scale_num = 1;
     cinfo.scale_denom = 1;
     jpeg_calc_output_dimensions(&cinfo);
@@ -655,29 +689,32 @@ bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool hea
             break;
         }
     }
-    // A progressive (multi-scan) image keeps all its coefficients until the last scan. When they fit the arena they
-    // stay there. When not, it is decoded at 1/8 from its DC values, which the backing store keeps 2 bytes a block,
-    // and the thumbnail is at most an eighth of the image on each side.
-    size_t room = arena_left() - std::min(arena_left(), kJpegSlack);
+    // A progressive (multi-scan) image keeps all its coefficients until the last scan, at any scale (every scan
+    // refines coefficients the 1/2 and 1/4 transforms read, so none can be dropped). When they fit the arena, the
+    // worker asks for that much and decodes at the scale the box needs. When not even the whole arena holds them, it
+    // decodes at 1/8 from DC values alone (DC scans are separate, so that is exact), which the backing store keeps 2
+    // bytes a block, and the thumbnail is at most an eighth of the image on each side.
+    uint64_t coef = 0;
     if (jpeg_has_multiple_scans(&cinfo)) {
-        uint64_t coef = 0;
         for (int c = 0; c < cinfo.num_components; c++) {
             const jpeg_component_info& comp = cinfo.comp_info[c];
             coef += static_cast<uint64_t>(comp.width_in_blocks + comp.h_samp_factor) *
                     (comp.height_in_blocks + comp.v_samp_factor) * sizeof(JBLOCK);
         }
-        if (coef > room) {
-            if (coef / sizeof(JBLOCK) * sizeof(int16_t) > room / 2) {
-                jpeg_destroy_decompress(&cinfo);
-                return false;
-            }
-            gJpegDcOnly = true;
-            cinfo.scale_denom = 8;
-            cinfo.do_block_smoothing = FALSE;
-            jpeg_calc_output_dimensions(&cinfo);
-            fit_box(cinfo.output_width, cinfo.output_height, maxW, maxH, &ow, &oh);
-            room = kJpegSlack;  // the band of full blocks in memory, the rest goes to the DC store
+        arena_room(coef + kJpegSlack);
+    }
+    size_t room = arena_left() - std::min(arena_left(), kJpegSlack);
+    if (coef > room) {
+        if (coef / sizeof(JBLOCK) * sizeof(int16_t) > room / 2) {
+            jpeg_destroy_decompress(&cinfo);
+            return false;
         }
+        gJpegDcOnly = true;
+        cinfo.scale_denom = 8;
+        cinfo.do_block_smoothing = FALSE;
+        jpeg_calc_output_dimensions(&cinfo);
+        fit_box(cinfo.output_width, cinfo.output_height, maxW, maxH, &ow, &oh);
+        room = kJpegSlack;  // the band of full blocks in memory, the rest goes to the DC store
     }
     cinfo.mem->max_memory_to_use = static_cast<long>(room);
     jpeg_start_decompress(&cinfo);
@@ -688,7 +725,28 @@ bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool hea
     JSAMPARRAY row = (*cinfo.mem->alloc_sarray)(reinterpret_cast<j_common_ptr>(&cinfo), JPOOL_IMAGE,
                                                cinfo.output_width * 4, 1);
     while (cinfo.output_scanline < cinfo.output_height) {
-        if (jpeg_read_scanlines(&cinfo, row, 1) != 1 || !scaler_push(&scaler, row[0])) {
+        if (jpeg_read_scanlines(&cinfo, row, 1) != 1) {
+            scaler_free(&scaler);
+            jpeg_destroy_decompress(&cinfo);
+            return false;
+        }
+        if (cmyk) {
+            uint8_t* p = row[0];
+            for (JDIMENSION x = 0; x < cinfo.output_width; x++, p += 4) {
+                uint32_t c = p[0], m = p[1], y = p[2], k = p[3];
+                if (!inverted) {
+                    c = 255 - c;
+                    m = 255 - m;
+                    y = 255 - y;
+                    k = 255 - k;
+                }
+                p[0] = static_cast<uint8_t>((c * k + 127) / 255);
+                p[1] = static_cast<uint8_t>((m * k + 127) / 255);
+                p[2] = static_cast<uint8_t>((y * k + 127) / 255);
+                p[3] = 255;
+            }
+        }
+        if (!scaler_push(&scaler, row[0])) {
             scaler_free(&scaler);
             jpeg_destroy_decompress(&cinfo);
             return false;
@@ -812,7 +870,44 @@ bool may_be_animated(uint32_t format) {
 
 #include "warmup_images.h"
 
+// The static bionic of the VM program picks the implementation of each string function (memcpy, strlen and the rest)
+// on its first call, behind a C++ static guard, and a guard's first use asks for the thread id (gettid): a system
+// call, so a worker that made the first call of one was killed (GIF, WBMP and DNG on arm64, found in the arm64 test
+// run). Each is called once here, through volatile pointers the compiler cannot replace with inline code.
+void warm_up_libc() {
+    static void* (*volatile const vMemchr)(const void*, int, size_t) = memchr;
+    static int (*volatile const vMemcmp)(const void*, const void*, size_t) = memcmp;
+    static void* (*volatile const vMemcpy)(void*, const void*, size_t) = memcpy;
+    static void* (*volatile const vMemmove)(void*, const void*, size_t) = memmove;
+    static void* (*volatile const vMemset)(void*, int, size_t) = memset;
+    static char* (*volatile const vStrchr)(const char*, int) = strchr;
+    // strchrnul is overloaded in bionic's C++ declarations and not in glibc's (the host test build): a lambda fits both.
+    static const char* (*volatile const vStrchrnul)(const char*, int) = [](const char* p, int c) -> const char* {
+        return strchrnul(p, c);
+    };
+    static int (*volatile const vStrcmp)(const char*, const char*) = strcmp;
+    static size_t (*volatile const vStrlen)(const char*) = strlen;
+    static int (*volatile const vStrncmp)(const char*, const char*, size_t) = strncmp;
+    static size_t (*volatile const vStrnlen)(const char*, size_t) = strnlen;
+    static char* (*volatile const vStrrchr)(const char*, int) = strrchr;
+    static int (*volatile const vGetpagesize)() = getpagesize;
+    char a[32] = "warm up the string functions";
+    char b[32];
+    vMemset(b, 0, sizeof(b));
+    vMemcpy(b, a, 8);
+    vMemmove(b + 1, b, 8);
+    size_t n = vStrlen(a) + vStrnlen(a, sizeof(a)) + static_cast<size_t>(vMemcmp(a, b, 4)) +
+               static_cast<size_t>(vStrcmp(a, b)) + static_cast<size_t>(vStrncmp(a, b, 4)) +
+               static_cast<size_t>(vGetpagesize());
+    n += vMemchr(a, 'u', sizeof(a)) != nullptr;
+    n += vStrchr(a, 'u') != nullptr;
+    n += vStrchrnul(a, 'u') != nullptr;
+    n += vStrrchr(a, 'u') != nullptr;
+    a[0] = static_cast<char>(n);
+}
+
 void warm_up() {
+    warm_up_libc();
     Sink sink = {-1, static_cast<uint8_t*>(malloc(kStripeBytes)), 0};
     if (sink.buf == nullptr) return;
     uint32_t w, h;
@@ -1033,9 +1128,12 @@ constexpr size_t kPrefixBytes = 1u << 20;
         if (!decode(0, 0, true, &m->width, &m->height)) worker_exit(failed());
         worker_exit(write_all(0, m, sizeof(*m)) ? kExitOk : kExitDecodeFailed);
     }
-    // Thumbnail: the rotation comes from the file's EXIF orientation, read first.
-    read_metadata(data, size, format, m);
+    // Thumbnail: the rotation and the mirror come from the file's orientation (EXIF, or HEIF's irot and imir), read
+    // first.
+    bool mirror = false;
+    read_metadata(data, size, format, m, &mirror);
     gRotation = m->orientation > 0 ? static_cast<uint32_t>(m->orientation) : 0;
+    gFlip = mirror;
     // The box is for the image as shown. Turned by 90 or 270 degrees, the stored image fits it the other way round.
     bool turned = gRotation == 90 || gRotation == 270;
     uint32_t w, h;
@@ -1473,6 +1571,14 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
 
 // One request. Returns false when the connection must end (the host's stream is broken).
 bool serve_one(int c) {
+    // Between requests the link may stay quiet as long as Android has nothing to decode: no idle limit until the
+    // next request begins, then its header and file have kHostReadMs.
+    for (;;) {
+        pollfd p = {c, POLLIN, 0};
+        int r = poll(&p, 1, -1);
+        if (r > 0) break;
+        if (r < 0 && errno != EINTR) return false;
+    }
     Request rq;
     if (read_full(c, &rq, sizeof(rq), now_ms() + kHostReadMs, kHostReadMs) != static_cast<ssize_t>(sizeof(rq))) {
         return false;
@@ -1498,10 +1604,11 @@ bool serve_one(int c) {
     bool hook = false;
 #endif
     if (rq.op != kOpPing && rq.op != kOpProbe && rq.op != kOpThumbnail && rq.op != kOpMetadata && !hook) return false;
-    // JPEG and PNG thumbnails and records stream: the file goes to the worker as it arrives and is never held whole.
-    // Everything else is read into a memory file first, at most kMaxBufferedBytes.
-    bool streamed = !hook && (format == kFormatJpeg || format == kFormatPng) &&
-                    (rq.op == kOpThumbnail || rq.op == kOpMetadata);
+    // A JPEG or PNG thumbnail of a file larger than kMaxBufferedBytes streams: the file goes to the worker as it
+    // arrives and is never held whole. Everything else is read into a memory file first, at most kMaxBufferedBytes,
+    // so its metadata is read from the whole file.
+    bool streamed = !hook && (format == kFormatJpeg || format == kFormatPng) && rq.op == kOpThumbnail &&
+                    rq.inputLen > kMaxBufferedBytes;
     int32_t refuse = -1;
     if (rq.op == kOpPing) {
         refuse = kOk;
@@ -1607,12 +1714,45 @@ int listen_host(int argc, char** argv) {
 #endif
 }
 
+// The VM's memory. Test builds may pretend to be a VM of DECODER_VM_RAM_MIB (the host program by default 160, the VM's
+// own size, the device test program when the kernel command line sets it).
+uint64_t vm_ram() {
+#ifdef DECODER_TEST_HOOKS
+    const char* mib = getenv("DECODER_VM_RAM_MIB");
+    if (mib != nullptr) return static_cast<uint64_t>(atoi(mib)) << 20;
+#endif
 #ifdef DECODER_HOST_TEST
-// Host test builds only: "--bench W H FILE...". Each file is decoded into a W x H thumbnail by a forked worker under
+    return 160ull << 20;
+#else
+    struct sysinfo si;
+    if (sysinfo(&si) != 0) return 0;
+    return static_cast<uint64_t>(si.totalram) * si.mem_unit;
+#endif
+}
+
+// The arena: the VM's memory less what the kernel, the broker, the zygote and one request's buffered file (a memory
+// file of at most kMaxBufferedBytes, or a streamed thumbnail's early output, never both) take. Never below
+// kArenaDefault, never above 1 GiB. In a VM of 160 MiB that is 96 MiB.
+constexpr uint64_t kVmReserve = 64u << 20;
+
+size_t arena_bytes_for(uint64_t ram) {
+    uint64_t a = ram > kVmReserve ? ram - kVmReserve : 0;
+    return static_cast<size_t>(std::clamp<uint64_t>(a, kArenaDefault, 1ull << 30));
+}
+
+#ifdef DECODER_TEST_HOOKS
+// Test builds only (the host program, and the device test program booted as /init with these arguments): "--bench W H
+// FILE...". Each file is decoded into a W x H thumbnail (0 0: its header only) by a forked worker under
 // the real lockdown, strict seccomp included. Prints the wall time from fork to exit and the arena's peak, the most of
 // it the decoders touched.
 int bench(int argc, char** argv) {
     uint32_t bw = static_cast<uint32_t>(atoi(argv[2])), bh = static_cast<uint32_t>(atoi(argv[3]));
+#if defined(__aarch64__)
+    // Whether this CPU enforces BTI (HWCAP2_BTI, bit 17): then a stray indirect branch kills a worker.
+    printf("bench cpu bti %d, arena %zu MiB\n", (getauxval(AT_HWCAP2) & (1ul << 17)) != 0, arena_limit() >> 20);
+#else
+    printf("bench arena %zu MiB\n", arena_limit() >> 20);
+#endif
     for (int i = 4; i < argc; i++) {
         int fd = open(argv[i], O_RDONLY | O_CLOEXEC);
         struct stat st;
@@ -1635,7 +1775,14 @@ int bench(int argc, char** argv) {
             if (lockdown(fds[1]) != 0) worker_exit(kExitLockdown);
             Sink sink = {-1, static_cast<uint8_t*>(arena_alloc(kStripeBytes)), 0};
             uint32_t w = 0, h = 0;
-            bool ok = decode_any(format, data, size, bw, bh, &sink, false, &w, &h);
+            // As the worker does: the metadata first (EXIF, XMP, HEIF properties), then the pixels, or with a 0 x 0
+            // box the header only (a probe).
+            Meta* m = static_cast<Meta*>(arena_calloc(1, sizeof(Meta)));
+            bool mirror = false;
+            if (m != nullptr) read_metadata(data, size, format, m, &mirror);
+            gRotation = m != nullptr && m->orientation > 0 ? static_cast<uint32_t>(m->orientation) : 0;
+            gFlip = mirror;
+            bool ok = decode_any(format, data, size, bw, bh, &sink, bw == 0 || bh == 0, &w, &h);
             uint32_t msg[3] = {ok ? 1u : 0u, static_cast<uint32_t>(arena_peak() >> 10), gOutcome.unsupported};
             (void)!write(0, msg, sizeof(msg));
             worker_exit(0);
@@ -1665,11 +1812,12 @@ int bench(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     setup();
-    void* arena = mmap(nullptr, kArenaBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    size_t arenaBytes = arena_bytes_for(vm_ram());
+    void* arena = mmap(nullptr, arenaBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (arena == MAP_FAILED) return 1;
-    arena_setup(static_cast<uint8_t*>(arena), kArenaBytes);
+    arena_setup(static_cast<uint8_t*>(arena), arenaBytes);
     warm_up();
-#ifdef DECODER_HOST_TEST
+#ifdef DECODER_TEST_HOOKS
     if (argc >= 4 && strcmp(argv[1], "--bench") == 0) return bench(argc, argv);
 #endif
     // No seccomp, no service: Android sees a VM that never answers and fails closed.
