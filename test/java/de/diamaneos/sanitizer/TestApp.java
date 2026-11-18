@@ -44,7 +44,7 @@ public final class TestApp extends Application implements DecoderProvider {
         if (mDecoder == null) {
             File dir = testImages();
             mDecoder = new Decoder(new GuestVm(this, new File(dir, "kernel"), new File(dir, "initrd.img"),
-                    DecoderApp.VM_MEMORY_BYTES));
+                    DecoderApp.VM_MEMORY_BYTES, true));
         }
         return mDecoder;
     }

@@ -371,8 +371,14 @@ public final class HostChecks {
         };
         int bad = 0;
         for (Object[] c : cases) {
-            if (VmImages.labelAllowed((String) c[0]) != (Boolean) c[1]) bad++;
+            if (VmImages.virtmgrAllows((String) c[0]) != (Boolean) c[1]) bad++;
         }
+        // The product takes system_file alone, the self-test also shell_data_file.
+        if (!VmImages.labelAllowed("u:object_r:system_file:s0", false)) bad++;
+        if (VmImages.labelAllowed("u:object_r:shell_data_file:s0", false)) bad++;
+        if (VmImages.labelAllowed("u:object_r:apk_data_file:s0", false)) bad++;
+        if (!VmImages.labelAllowed("u:object_r:shell_data_file:s0", true)) bad++;
+        if (VmImages.labelAllowed("u:object_r:app_data_file:s0:c512,c768", true)) bad++;
         if (bad == 0) pass("VM image labels as the VM manager takes them", cases.length + " labels");
         else fail("VM image labels as the VM manager takes them", bad + " wrong");
     }
@@ -447,37 +453,45 @@ public final class HostChecks {
             }
             link.close();
             vm.join(5000);
-            if (r instanceof IOException && dropped) {
-                pass("source ending early drops the link", String.valueOf(r));
+            // A failure of the caller's file, told apart from a broken VM: the connection is closed, nothing more.
+            if (r instanceof GuestLink.SourceFailedException && dropped) {
+                pass("source ending early is a source failure and drops the connection", String.valueOf(r));
             } else {
-                fail("source ending early drops the link", r + " dropped " + dropped);
+                fail("source ending early is a source failure and drops the connection", r + " dropped " + dropped);
             }
         }
     }
 
-    // Which files the service may stream: only those off FUSE, by the deepest mount holding them.
+    // Which files the service may stream: only those whose own device the mount table names as local, every mount
+    // of it local. Unknown devices, FUSE, vfat and mixed devices are not streamed.
     static void mountChecks() {
         String mi = String.join("\n",
                 "1 0 254:0 / / ro,relatime - erofs /dev/block/dm-0 ro",
-                "40 1 259:9 / /data rw,nosuid,nodev - f2fs /dev/block/dm-50 rw",
+                "40 1 254:50 / /data rw,nosuid,nodev - f2fs /dev/block/dm-50 rw",
                 "90 40 0:44 / /storage/emulated rw,nosuid,nodev - fuse /dev/fuse rw,user_id=0",
-                "91 90 259:9 /media/0/Android/data /storage/emulated/0/Android/data rw - f2fs /dev/block/dm-50 rw",
-                "92 1 0:45 / /mnt/with\\040space rw - fuse.sshfs x rw");
+                "91 90 254:50 /media/0/Android/data /storage/emulated/0/Android/data rw - f2fs /dev/block/dm-50 rw",
+                "95 1 8:1 / /mnt/media_rw/ABCD rw - vfat /dev/block/vold/public:8,1 rw",
+                "96 1 254:60 / /mnt/a rw - ext4 /dev/block/dm-60 rw",
+                "97 1 254:60 / /mnt/b rw - fuseblk /dev/block/dm-60 rw");
         Object[][] cases = {
-            {"/data/media/0/DCIM/a.jpg", false},
-            {"/storage/emulated/0/DCIM/a.jpg", true},
-            {"/storage/emulated/0/Android/data/x/a.jpg", false},
-            {"/storage/emulatedX/a.jpg", false},
-            {"/mnt/with space/a.jpg", true},
-            {"/memfd:vmdecode (deleted)", false},
-            {"pipe:[1234]", false},
+            {254, 50, true},   // /data, also bind-mounted under the FUSE tree
+            {254, 0, true},    // the system partition
+            {0, 44, false},    // the FUSE mount itself
+            {8, 1, false},     // a USB drive (vfat)
+            {254, 60, false},  // one device, one mount of it not local
+            {0, 1, false},     // not in the table (an internal mount, a memory file)
         };
         int bad = 0;
         for (Object[] c : cases) {
-            if (Mounts.isFuse((String) c[0], mi) != (Boolean) c[1]) bad++;
+            if (Mounts.localDevice((Integer) c[0], (Integer) c[1], mi) != (Boolean) c[2]) bad++;
         }
-        if (bad == 0) pass("FUSE check by mount table", cases.length + " paths");
-        else fail("FUSE check by mount table", bad + " wrong");
+        // dev_t encoding: major 254, minor 50, and a large minor.
+        long dev = (254L << 8) | 50;
+        if (Mounts.major(dev) != 254 || Mounts.minor(dev) != 50) bad++;
+        long big = ((300L & 0xff) | ((300L & ~0xffL) << 12)) | (7L << 8);
+        if (Mounts.major(big) != 7 || Mounts.minor(big) != 300) bad++;
+        if (bad == 0) pass("local device check by mount table", cases.length + " devices, dev_t decoding");
+        else fail("local device check by mount table", bad + " wrong");
     }
 
     // The fuzzing server: random replies, then mutations of valid ones.
@@ -867,7 +881,9 @@ public final class HostChecks {
             a = link.probe(f, Math.min(f.length, 1 << 20), now() + 45000);
             opCode = GuestLink.OP_PROBE;
         } else if (op.equals("meta")) {
-            a = link.metadata(f, f.length, now() + 45000);
+            // As the service sends it: a file above the buffered cap goes as its head only.
+            int len = f.length > GuestLink.MAX_BUFFERED_BYTES ? 1 << 20 : f.length;
+            a = link.metadata(f, len, now() + 45000);
             opCode = GuestLink.OP_METADATA;
         } else {
             a = link.thumbnail(f, f.length, bw, bh, now() + 45000);

@@ -384,7 +384,7 @@ public class SelfTestActivity extends Activity {
         java.util.Arrays.sort(files);
         for (long mib : new long[] {96, 128, 160}) {
             GuestVm vm = new GuestVm(this, new File(source, "kernel"), new File(source, "initrd.img"),
-                    mib << 20);
+                    mib << 20, true);
             Decoder d = new Decoder(vm);
             long t0 = SystemClock.uptimeMillis();
             Decoder.Request ping = call(d, GuestLink.OP_PING, 0, 0, null, 60000);
