@@ -1,7 +1,8 @@
 #!/bin/bash
 # check-client-copy.sh DIR: a caller that keeps a copy of the decode service's API and checks (MediaProvider before it
 # links de.diamaneos.sanitizer.decode-client) must keep exact copies. Compares every AIDL file and DecodeChecks.java
-# under DIR with this repository's, by content. Exit 0 when all match.
+# under DIR with this repository's, by content. Exit 0 when all match. The build checks MediaProvider's copy itself
+# (decode_api_copies_check in Android.bp). This script is for copies the build does not see yet (frameworks/base).
 set -u
 DIR=${1:?directory with the copy}
 HERE=$(cd "$(dirname "$0")/.." && pwd)

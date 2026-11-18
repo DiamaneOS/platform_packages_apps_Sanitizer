@@ -46,9 +46,37 @@ aidl_interface {
 // The callers' side in one library: the API and the checks every caller applies to what the service returns
 // (DecodeChecks). MediaProvider, SystemUI and the system server link this instead of keeping copies. Where a copy
 // cannot be avoided, tools/check-client-copy.sh compares it with these files.
+// The API's files that callers keep copies of: the AIDL files and the reply checks.
+filegroup {
+    name: "de.diamaneos.sanitizer.decode-api-files",
+    srcs: [
+        "aidl/de/diamaneos/sanitizer/decode/*.aidl",
+        "client/de/diamaneos/sanitizer/decode/DecodeChecks.java",
+    ],
+}
+
+// The callers' copies must be exact (tools/check-api-copies.sh): MediaProvider's now. The frameworks copy joins this
+// list once frameworks/base exports it as a filegroup. The rule's output, an empty class, is compiled into the client
+// library below, so every build of the service fails when a copy drifts.
+genrule {
+    name: "decode_api_copies_check",
+    srcs: [
+        ":de.diamaneos.sanitizer.decode-api-files",
+        ":mediaprovider-vmdecode-aidl",
+        ":mediaprovider-vmdecode-client",
+    ],
+    tool_files: ["tools/check-api-copies.sh"],
+    out: ["ApiCopiesChecked.java"],
+    cmd: "$(location tools/check-api-copies.sh) $(out) $(locations :de.diamaneos.sanitizer.decode-api-files) -- " +
+        "$(locations :mediaprovider-vmdecode-aidl) $(locations :mediaprovider-vmdecode-client)",
+}
+
 java_library {
     name: "de.diamaneos.sanitizer.decode-client",
-    srcs: ["client/**/*.java"],
+    srcs: [
+        "client/**/*.java",
+        ":decode_api_copies_check",
+    ],
     static_libs: ["de.diamaneos.sanitizer.decode-java"],
     sdk_version: "system_current",
     min_sdk_version: "30",
