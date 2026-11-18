@@ -31,8 +31,12 @@ public final class DecoderApp extends Application implements DecoderProvider {
     static final File VM_INITRD = new File("/apex/com.android.virt/etc/decoder_vm_initrd.img");
 
     /**
-     * The VM's memory. The worst case the limits allow: a 32 MiB file in a memory file, a 64 MiB worker arena, the
-     * kernel, the broker and the zygote. 160 MiB until a phone run measures the floor.
+     * The VM's memory. A worker may use what the VM has free when it starts, less a margin (vm/decoder_vm.cpp,
+     * worker_memory), so no size can make a worker run out: a file that needs more is refused. Measured in the arm64
+     * test VM (qemu, the same kernel and program): at 160 MiB the kernel shows 141 MiB, 119 MiB free after the
+     * broker's start, so a worker gets about 103 MiB, about 71 MiB beside a 32 MiB file. A 12 MP single-image HEIC
+     * needs about 296 MiB. A protected VM keeps a little more for itself than qemu, so these are upper bounds until
+     * a phone run measures them. 160 MiB until the VM memory plan decides.
      */
     static final long VM_MEMORY_BYTES = 160L << 20;
 

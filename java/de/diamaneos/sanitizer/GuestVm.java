@@ -48,7 +48,7 @@ import java.util.concurrent.Executors;
  * <p>Raw VMs are configured through the VM framework's hidden custom image API, reached by reflection: this app is
  * platform-signed and holds USE_CUSTOM_VIRTUAL_MACHINE.
  */
-final class GuestVm {
+final class GuestVm implements Decoder.Vm {
     private static final String TAG = "DecoderVm";
     static final String NAME = "decoder";
     // Where an earlier version copied the images, in device-protected storage. Removed at every start.
@@ -63,6 +63,9 @@ final class GuestVm {
     private VirtualMachine mVm;
     private GuestLink mLink;
     private volatile boolean mStopped = true;
+    // Counts starts. Each start's callbacks carry its number, so a late callback of an instance stopped earlier never
+    // marks the current one stopped.
+    private volatile int mGeneration;
     private long mStartedAt;
     private long mReadyAt;
 
@@ -95,7 +98,8 @@ final class GuestVm {
         return mReadyAt > 0 ? mReadyAt - mStartedAt : -1;
     }
 
-    synchronized boolean isRunning() {
+    @Override
+    public synchronized boolean isRunning() {
         return mVm != null && !mStopped;
     }
 
@@ -103,7 +107,8 @@ final class GuestVm {
      * Starts the VM unless it runs, and returns a working link, pinged within the deadline. Throws when the VM does
      * not come up in time: the caller fails closed and the scheduler starts again with backoff.
      */
-    synchronized GuestLink link(long deadline) throws IOException {
+    @Override
+    public synchronized GuestLink link(long deadline) throws IOException {
         mLastReused = mLink != null && !mLink.isBroken() && !mStopped;
         if (mLastReused) return mLink;
         if (mLink != null) mLink.close();
@@ -128,7 +133,8 @@ final class GuestVm {
     }
 
     /** Stops the VM. The next link() starts it again. */
-    synchronized void stop() {
+    @Override
+    public synchronized void stop() {
         if (mLink != null) mLink.close();
         mLink = null;
         if (mVm != null) {
@@ -149,6 +155,8 @@ final class GuestVm {
 
     private void start() throws IOException {
         stop();
+        mLastError = ""; // an error is the last start's, never an older one's
+        final int generation = ++mGeneration;
         deleteTree(new File(mContext.getFilesDir(), OLD_COPY));
         File kernel = mKernel;
         File initrd = mInitrd;
@@ -169,11 +177,13 @@ final class GuestVm {
                 @Override public void onPayloadReady(VirtualMachine v) {}
                 @Override public void onPayloadFinished(VirtualMachine v, int exitCode) {}
                 @Override public void onError(VirtualMachine v, int errorCode, String message) {
-                    mLastError = "VM error " + errorCode + ": " + message;
+                    if (generation != mGeneration) return; // an instance stopped earlier
+                    mLastError = printable("VM error " + errorCode + ": " + message);
                     Log.e(TAG, mLastError);
                     mStopped = true;
                 }
                 @Override public void onStopped(VirtualMachine v, int reason) {
+                    if (generation != mGeneration) return;
                     Log.w(TAG, "VM stopped, reason " + reason);
                     mStopped = true;
                 }
@@ -191,7 +201,7 @@ final class GuestVm {
             mStopped = true;
             // The VM manager's own reason (a refused label, scattered memory, no protected VMs) goes to the log in
             // full, with every cause.
-            mLastError = causes(e);
+            mLastError = printable(causes(e));
             Log.e(TAG, "VM start failed, " + (mMemoryBytes >> 20) + " MiB: " + mLastError, e);
             throw new IOException("VM start: " + causes(e), e);
         }
@@ -226,21 +236,41 @@ final class GuestVm {
                 .build();
     }
 
-    // The VM manager's own rule for a protected VM's kernel files, checked first so a refusal names its cause.
-    /** Why the last start failed, as the VM manager said it, or "". */
-    String lastError() {
+    /** Why the last start failed, as the VM manager said it, or "". Cleared at every start. */
+    @Override
+    public String lastError() {
         return mLastError;
     }
 
+    /** Debuggable builds only: a test holds the VM down (DebugBuild.DOWN_UNTIL). */
+    @Override
+    public boolean heldDown() {
+        if (!DebugBuild.vmHeldDown()) return false;
+        mLastError = "held down for a test (" + DebugBuild.DOWN_UNTIL + ")";
+        return true;
+    }
+
     /** Whether the last link() handed back a connection made earlier (which may have died meanwhile). */
-    synchronized boolean lastLinkReused() {
+    @Override
+    public synchronized boolean lastLinkReused() {
         return mLastReused;
     }
 
     /** Drops the connection but keeps the VM: the next link() connects again. */
-    synchronized void dropLink() {
+    @Override
+    public synchronized void dropLink() {
         if (mLink != null) mLink.close();
         mLink = null;
+    }
+
+    /** Text as it may be printed: control characters become spaces, at most 2000 characters. */
+    static String printable(String s) {
+        StringBuilder b = new StringBuilder(Math.min(s.length(), 2000));
+        for (int i = 0; i < s.length() && b.length() < 2000; i++) {
+            char c = s.charAt(i);
+            b.append(c < 0x20 || c == 0x7f || (c >= 0x80 && c < 0xa0) || c == 0x2028 || c == 0x2029 ? ' ' : c);
+        }
+        return b.toString();
     }
 
     private static String causes(Throwable e) {
@@ -253,6 +283,7 @@ final class GuestVm {
         return b.toString();
     }
 
+    // The VM manager's own rule for a protected VM's kernel files, checked first so a refusal names its cause.
     private static void checkLabel(File f, boolean test) throws IOException {
         String label;
         try {

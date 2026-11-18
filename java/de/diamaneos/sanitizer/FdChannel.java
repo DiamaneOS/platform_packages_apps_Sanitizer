@@ -123,8 +123,22 @@ final class FdChannel implements GuestLink.Channel {
     // What a streamed file holds of the budget while it waits: the piece it is sent in.
     private static final int STREAM_RESERVE = 64 * 1024;
     private static final int HASH_CHUNK = 256 * 1024;
-    // Hash passes over large files run at most two at a time in the whole service, whatever the lanes.
-    private static final java.util.concurrent.Semaphore HASHING = new java.util.concurrent.Semaphore(2);
+    // Hash passes over large files run at most two at a time in the whole service, whatever the lanes, in the order
+    // they asked (fair), so one lane cannot keep both.
+    private static final java.util.concurrent.Semaphore HASHING = new java.util.concurrent.Semaphore(2, true);
+
+    // SHA-256 of large files hashed lately, by device, inode, size, change and modification time: a request for the
+    // same unchanged file (a thumbnail asked again, a cache hit) needs no second full read. Any write changes the
+    // change time. A file written through a mapping may keep it until writeback: then the cached answer is the one of
+    // its content at the last change, for that file only, and what is sent is still checked against the digest.
+    private static final int DIGESTS = 64;
+    private static final java.util.Map<String, byte[]> DIGEST_CACHE =
+            new java.util.LinkedHashMap<String, byte[]>(DIGESTS, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, byte[]> eldest) {
+                    return size() > DIGESTS;
+                }
+            };
 
     /**
      * A large regular JPEG or PNG on a local file system, as a source the decoder sends to the VM in pieces, never
@@ -137,11 +151,14 @@ final class FdChannel implements GuestLink.Channel {
     Input streamInput(long maxBuffered, long maxStreamed, long deadline, Decoder budget, String lane) {
         long size;
         long dev;
+        String id;
         try {
             StructStat st = Os.fstat(mFd);
             if (!OsConstants.S_ISREG(st.st_mode)) return null;
             size = st.st_size;
             dev = st.st_dev;
+            id = st.st_dev + ":" + st.st_ino + ":" + st.st_size + ":" + st.st_ctim.tv_sec + "." + st.st_ctim.tv_nsec
+                    + ":" + st.st_mtim.tv_sec + "." + st.st_mtim.tv_nsec;
         } catch (ErrnoException e) {
             return null;
         }
@@ -155,6 +172,20 @@ final class FdChannel implements GuestLink.Channel {
         boolean hashing = false;
         ParcelFileDescriptor dup = null;
         try {
+            byte[] known;
+            synchronized (DIGEST_CACHE) {
+                known = DIGEST_CACHE.get(id);
+            }
+            if (known != null) {
+                dup = ParcelFileDescriptor.dup(mFd);
+                in.status = Input.OK;
+                in.source = new FileSource(dup, size);
+                in.digest = known.clone();
+                in.len = (int) size;
+                in.reserved = STREAM_RESERVE;
+                done = true;
+                return in;
+            }
             long wait = deadline - SystemClock.uptimeMillis();
             if (wait <= 0 || !HASHING.tryAcquire(wait, java.util.concurrent.TimeUnit.MILLISECONDS)) {
                 in.status = Input.LATER;
@@ -174,6 +205,9 @@ final class FdChannel implements GuestLink.Channel {
             in.status = Input.OK;
             in.source = new FileSource(dup, size);
             in.digest = md.digest();
+            synchronized (DIGEST_CACHE) {
+                DIGEST_CACHE.put(id, in.digest.clone());
+            }
             in.len = (int) size;
             in.reserved = STREAM_RESERVE;
             done = true;
@@ -204,7 +238,7 @@ final class FdChannel implements GuestLink.Channel {
      * A regular file sent from its start, read with pread as it goes, hashing what it sends: the decoder caches the
      * answer only when that hash is the one read beforehand, so a file changed in between never fills the cache.
      */
-    static final class FileSource implements GuestLink.Source, java.io.Closeable {
+    static final class FileSource implements Decoder.StreamedSource {
         private final ParcelFileDescriptor mPfd;
         private final long mSize;
         private long mAt;
@@ -246,7 +280,8 @@ final class FdChannel implements GuestLink.Channel {
         }
 
         /** The SHA-256 of what was sent, once all of it was. Null before. */
-        byte[] sentDigest() {
+        @Override
+        public byte[] sentDigest() {
             return mAt == mSize ? mSent.digest() : null;
         }
 
@@ -322,7 +357,9 @@ final class FdChannel implements GuestLink.Channel {
             for (;;) {
                 if (used == buf.length) {
                     if (buf.length > max) break;
-                    int next = (int) Math.min((long) buf.length * 2, (long) max + 1);
+                    // Doubling, but from a quarter of the cap straight to the cap: the old and the new buffer
+                    // together stay within a lane's share (Decoder.MAX_LANE_BYTES).
+                    int next = buf.length >= max / 4 ? max + 1 : (int) Math.min((long) buf.length * 2, (long) max + 1);
                     if (!budget.reserve(lane, next)) {
                         in.status = Input.NO_MEMORY;
                         return in;
@@ -350,6 +387,10 @@ final class FdChannel implements GuestLink.Channel {
             in.len = used;
             in.reserved = reserved;
             done = true;
+            return in;
+        } catch (InterruptedIOException e) {
+            // The read did not end within its deadline (a slow pipe or FUSE file): no verdict on the file.
+            in.status = Input.LATER;
             return in;
         } catch (IOException e) {
             in.status = Input.TOO_LARGE;

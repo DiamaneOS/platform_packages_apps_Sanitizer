@@ -53,6 +53,9 @@ final class GuestLink implements Closeable {
     static final int UNSUPPORTED = 2;
     static final int INVALID = 3;
     static final int INTERNAL = 4;
+    // The worker was stopped for a reason outside the file (the VM ran out of memory, the worker got too little CPU):
+    // never a verdict on the file, never a strike. Only on the link: callers see "unavailable".
+    static final int BUSY = 5;
 
     // The contract's FORMAT_* values (IDecodeService), all of which the VM reads.
     static final int FORMAT_JPEG = 1;
@@ -81,7 +84,6 @@ final class GuestLink implements Closeable {
     static final int HEADER_BYTES = 32;
     static final int END_BYTES = 8;
 
-    /** A stream with deadlines: a vsock socket on the phone, a socket pair in the tests. */
     /** The file to send: in memory, or read in pieces as it is sent (a regular file, which is never held whole). */
     interface Source {
         long length();
@@ -112,6 +114,7 @@ final class GuestLink implements Closeable {
         };
     }
 
+    /** A stream with deadlines: a vsock socket on the phone, a socket pair in the tests. */
     interface Channel extends Closeable {
         /** Reads 1 to len bytes, 0 at the end of the stream. Throws on a passed deadline. */
         int read(byte[] b, int off, int len, long deadlineMillis) throws IOException;
@@ -148,6 +151,14 @@ final class GuestLink implements Closeable {
         Meta meta; // metadata
         long reserved; // budget taken for the pixels, given back by whoever ran the call
         boolean noBudget; // INTERNAL because the service had no memory for the pixels, not because a worker died
+
+        /** The checked values, for logs and test reports. Never the pixels or the metadata's text. */
+        @Override
+        public String toString() {
+            return "Answer{status " + status + ", format " + format + ", " + width + "x" + height + ", extra " + extra
+                    + (pixels != null ? ", " + pixels.length + " pixel bytes" : "") + (meta != null ? ", metadata" : "")
+                    + (noBudget ? ", no budget" : "") + "}";
+        }
     }
 
     /** The metadata record after its checks. Absent values are -1, NaN or "". */
@@ -183,11 +194,21 @@ final class GuestLink implements Closeable {
     private boolean mReplied; // the last call read at least one byte of a reply
     private Budget mBudget;
     private String mLane = "";
+    private Runnable mOnReply;
 
     /** Pixels are read only within this budget, charged to this lane. Without one, they are read freely (tests). */
     void setBudget(Budget budget, String lane) {
+        setBudget(budget, lane, null);
+    }
+
+    /**
+     * As above, and onReply runs once the reply's header has arrived, before any pixel is reserved: the request's
+     * input is no longer needed then (no second attempt follows a reply), so its memory can go first.
+     */
+    void setBudget(Budget budget, String lane, Runnable onReply) {
         mBudget = budget;
         mLane = lane;
+        mOnReply = onReply;
     }
 
     GuestLink(Channel channel) {
@@ -259,6 +280,7 @@ final class GuestLink implements Closeable {
         mReplied = false;
         long len = src.length();
         if (len < 0 || len > MAX_INPUT_BYTES) throw new IllegalArgumentException("input length");
+        long held = 0; // pixel budget reserved here and not handed over with an answer
         try {
             ByteBuffer rq = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
             rq.putInt(REQUEST_MAGIC).putInt(op).putInt(arg0).putInt(arg1).putInt((int) len);
@@ -287,8 +309,14 @@ final class GuestLink implements Closeable {
             int payload = h.getInt();
             int reserved = h.getInt();
             check(magic == REPLY_MAGIC && reserved == 0, "reply header");
+            if (mOnReply != null) {
+                Runnable r = mOnReply;
+                mOnReply = null;
+                r.run();
+            }
             if (a.status != OK) {
-                check(a.status == UNSUPPORTED || a.status == INVALID || a.status == INTERNAL, "status");
+                check(a.status == UNSUPPORTED || a.status == INVALID || a.status == INTERNAL || a.status == BUSY,
+                        "status");
                 check(a.format == 0 && a.width == 0 && a.height == 0 && a.extra == 0 && payload == 0,
                         "failure with values");
                 readEnd(a.status, deadline);
@@ -329,34 +357,26 @@ final class GuestLink implements Closeable {
                         later.noBudget = true;
                         return later;
                     }
-                    a.reserved = mBudget != null ? payload : 0;
-                    byte[] pixels;
-                    try {
-                        pixels = readExact(payload, deadline).array();
-                    } catch (IOException | RuntimeException | Error t) {
-                        if (mBudget != null) mBudget.release(mLane, a.reserved);
-                        throw t;
-                    }
+                    // From here the reservation is given back on every way out (held), unless the answer with its
+                    // pixels is handed over: then the caller gives it back when done (a.reserved).
+                    held = mBudget != null ? payload : 0;
+                    byte[] pixels = readExact(payload, deadline).array();
                     // A worker that failed after its header: the VM kept the length with zeros and its trailer says
-                    // INVALID (the file) or INTERNAL (the worker died). A clean answer, not a broken link.
+                    // INVALID (the file), INTERNAL (the worker died) or BUSY (not the file). A clean answer, not a
+                    // broken link. Never UNSUPPORTED after pixels.
                     ByteBuffer e = readExact(END_BYTES, deadline);
                     check(e.getInt() == END_MAGIC, "end");
                     int endStatus = e.getInt();
-                    if (endStatus == INVALID || endStatus == INTERNAL) {
-                        if (mBudget != null) mBudget.release(mLane, a.reserved);
+                    if (endStatus == INVALID || endStatus == INTERNAL || endStatus == BUSY) {
                         Answer bad = new Answer();
                         bad.status = endStatus;
                         return bad;
                     }
-                    if (endStatus != OK && mBudget != null) mBudget.release(mLane, a.reserved);
                     check(endStatus == OK, "end status " + endStatus);
-                    try {
-                        checkPremultiplied(pixels);
-                    } catch (ProtocolException notPremultiplied) {
-                        if (mBudget != null) mBudget.release(mLane, a.reserved);
-                        throw notPremultiplied;
-                    }
+                    checkPremultiplied(pixels);
                     a.pixels = pixels;
+                    a.reserved = held;
+                    held = 0;
                     return a;
                 case OP_METADATA:
                     checkFormat(a.format);
@@ -376,6 +396,10 @@ final class GuestLink implements Closeable {
             if (e instanceof ProtocolException) throw (ProtocolException) e;
             if (e instanceof IllegalArgumentException) throw (IllegalArgumentException) e;
             throw new ProtocolException(e.getClass().getSimpleName() + ": " + e.getMessage());
+        } finally {
+            // A link that failed between the pixels and the trailer, a late failure, bad pixels: the reservation goes
+            // back here, so it can never leak.
+            if (held > 0) mBudget.release(mLane, held);
         }
     }
 

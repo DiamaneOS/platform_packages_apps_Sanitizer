@@ -143,6 +143,7 @@ public final class DecodeService extends Service {
             Decoder.Request r = new Decoder.Request(op, a, b, in.data, in.len, in.reserved, lane, waiting, deadline);
             r.source = in.source;
             r.digest = in.digest;
+            in = null; // the request owns the bytes now, and drops them when the VM's reply begins
             return mDecoder.run(r);
         } finally {
             mDecoder.leave(lane);
