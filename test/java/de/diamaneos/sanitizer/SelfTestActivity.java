@@ -400,7 +400,7 @@ public class SelfTestActivity extends Activity {
             return;
         }
         java.util.Arrays.sort(files);
-        for (long mib : new long[] {96, 128, 160}) {
+        for (long mib : new long[] {96, 128, 160, 288}) {
             GuestVm vm = new GuestVm(this, new File(source, "kernel"), new File(source, "initrd.img"),
                     mib << 20, true);
             Decoder d = new Decoder(vm);

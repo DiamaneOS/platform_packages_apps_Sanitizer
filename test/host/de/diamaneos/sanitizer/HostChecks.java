@@ -765,24 +765,39 @@ public final class HostChecks {
 
     /** The VM as Decoder sees it: links from a script, counters of what Decoder asked for. */
     static final class FakeVm implements Decoder.Vm {
-        // Each entry: a FakeChannel, a reply (byte[], a fresh channel each time) or an IOException (no start).
+        // Each entry: a channel, a reply (byte[], a fresh channel each time) or an IOException (no start).
         final java.util.ArrayDeque<Object> script = new java.util.ArrayDeque<>();
+        final java.util.ArrayDeque<Object> smallScript = new java.util.ArrayDeque<>(); // the small lane's
         Object always; // used when the script is empty
+        Object smallAlways;
         boolean nextReused;
+        boolean lanes;
         volatile boolean held;
-        volatile int links, stops, drops;
+        volatile int links, smallLinks, stops, drops;
         private boolean mReused;
         private boolean mRunning;
 
         @Override
-        public synchronized GuestLink link(long deadline) throws IOException {
-            links++;
-            Object next = script.isEmpty() ? always : script.poll();
-            mReused = nextReused;
-            nextReused = false;
-            if (next instanceof IOException) throw (IOException) next;
-            mRunning = true;
-            return new GuestLink(next instanceof byte[] ? new FakeChannel((byte[]) next) : (FakeChannel) next);
+        public GuestLink link(boolean small, long deadline) throws IOException {
+            Object next;
+            synchronized (this) {
+                if (small) {
+                    smallLinks++;
+                    next = smallScript.isEmpty() ? smallAlways : smallScript.poll();
+                } else {
+                    links++;
+                    next = script.isEmpty() ? always : script.poll();
+                }
+                mReused = nextReused;
+                nextReused = false;
+                if (next instanceof IOException) throw (IOException) next;
+                mRunning = true;
+            }
+            return new GuestLink(next instanceof byte[] ? new FakeChannel((byte[]) next) : (GuestLink.Channel) next);
+        }
+
+        @Override public boolean lanes() {
+            return lanes;
         }
 
         @Override public synchronized void stop() {
@@ -794,11 +809,11 @@ public final class HostChecks {
             return mRunning;
         }
 
-        @Override public synchronized boolean lastLinkReused() {
+        @Override public synchronized boolean lastLinkReused(boolean small) {
             return mReused;
         }
 
-        @Override public synchronized void dropLink() {
+        @Override public synchronized void dropLink(boolean small) {
             drops++;
         }
 
@@ -809,6 +824,30 @@ public final class HostChecks {
         @Override public boolean heldDown() {
             return held;
         }
+    }
+
+    /** A big lane that holds its reply until released: a large decode in progress. */
+    static final class HeldChannel implements GuestLink.Channel {
+        final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        private final FakeChannel mReply;
+
+        HeldChannel(byte[] reply) {
+            mReply = new FakeChannel(reply);
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len, long deadline) throws IOException {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                throw new java.io.InterruptedIOException();
+            }
+            return mReply.read(b, off, len, deadline);
+        }
+
+        @Override public void write(byte[] b, int off, int len, long deadline) {}
+
+        @Override public void close() {}
     }
 
     /** A streamed file: fails while sent when asked to, and reports a digest of what was sent. */
@@ -1021,6 +1060,46 @@ public final class HostChecks {
         check("decoder: held down is unavailable, then back at once", hd.status == Decoder.UNAVAILABLE
                 && vm.stops >= 1 && after.status == GuestLink.OK && vm.links == 1, hd.status + " " + after.status
                 + ", links " + vm.links);
+
+        // Two lanes: a small file goes to the small lane, one the VM finds too large there goes on to the big lane,
+        // a file over a MiB goes to the big lane at once.
+        vm = new FakeVm();
+        vm.lanes = true;
+        vm.smallAlways = thumbOk(8, 8);
+        vm.always = thumbOk(8, 8);
+        d = new Decoder(vm, c);
+        Decoder.Request sm = thumb(d, new byte[] {20}, 8, "a");
+        int bigBefore = vm.links;
+        vm.smallAlways = failure(GuestLink.BIG_LANE);
+        Decoder.Request on = thumb(d, new byte[] {21}, 8, "a");
+        Decoder.Request large = thumb(d, new byte[GuestLink.SMALL_INPUT_BYTES + 1], 8, "a");
+        check("decoder: small lane first, BIG_LANE goes on, large inputs straight to the big lane",
+                sm.status == GuestLink.OK && bigBefore == 0 && on.status == GuestLink.OK && large.status == GuestLink.OK
+                        && vm.smallLinks == 2 && vm.links == 2 && vm.stops == 0 && d.held() == 0,
+                sm.status + " " + on.status + " " + large.status + ", small links " + vm.smallLinks + ", big links "
+                        + vm.links + ", held " + d.held());
+
+        // The lanes run side by side: small files are answered while the big lane is held up by a large decode.
+        vm = new FakeVm();
+        vm.lanes = true;
+        HeldChannel slow = new HeldChannel(thumbOk(8, 8));
+        vm.script.add(slow);
+        vm.smallAlways = thumbOk(8, 8);
+        Decoder dl = new Decoder(vm, c);
+        Decoder.Request[] bigOne = new Decoder.Request[1];
+        Thread t = new Thread(() -> bigOne[0] = thumb(dl, new byte[GuestLink.SMALL_INPUT_BYTES + 1], 8, "b"));
+        t.start();
+        long t0 = System.nanoTime();
+        int smallOk = 0;
+        for (int i = 0; i < 20; i++) {
+            if (thumb(dl, new byte[] {(byte) (30 + i)}, 8, "c").status == GuestLink.OK) smallOk++;
+        }
+        long smallMs = (System.nanoTime() - t0) / 1000000;
+        boolean bigWaiting = t.isAlive();
+        slow.release.countDown();
+        t.join(5000);
+        check("decoder: small files pass a held big lane", smallOk == 20 && bigWaiting && bigOne[0] != null
+                && bigOne[0].status == GuestLink.OK, smallOk + " small in " + smallMs + " ms while the big lane waited");
 
         // A VM that does not start: backoff, no link attempt until it ends.
         vm = new FakeVm();
