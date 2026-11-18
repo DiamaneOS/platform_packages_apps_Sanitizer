@@ -66,15 +66,26 @@ final class GuestVm {
     private long mStartedAt;
     private long mReadyAt;
 
+    // The test app's VM (images from /data/local/tmp on a debuggable build). The product's takes system_file only.
+    private final boolean mTest;
+    private boolean mLastReused;
+    private volatile String mLastError = "";
+
     GuestVm(Context context, File kernel, File initrd, long memoryBytes) {
+        this(context, kernel, initrd, memoryBytes, false);
+    }
+
+    GuestVm(Context context, File kernel, File initrd, long memoryBytes, boolean test) {
         mContext = context.createDeviceProtectedStorageContext();
         mKernel = kernel;
         mInitrd = initrd;
         mMemoryBytes = memoryBytes;
+        mTest = test;
     }
 
     /** Test builds only: other image files for the next start (the self-test's fail-closed check). */
     synchronized void setImagesForTest(File kernel, File initrd) {
+        if (!mTest) throw new IllegalStateException("not a test VM");
         mKernel = kernel;
         mInitrd = initrd;
     }
@@ -93,7 +104,8 @@ final class GuestVm {
      * not come up in time: the caller fails closed and the scheduler starts again with backoff.
      */
     synchronized GuestLink link(long deadline) throws IOException {
-        if (mLink != null && !mLink.isBroken() && !mStopped) return mLink;
+        mLastReused = mLink != null && !mLink.isBroken() && !mStopped;
+        if (mLastReused) return mLink;
         if (mLink != null) mLink.close();
         mLink = null;
         if (mVm == null || mStopped) start();
@@ -140,8 +152,8 @@ final class GuestVm {
         deleteTree(new File(mContext.getFilesDir(), OLD_COPY));
         File kernel = mKernel;
         File initrd = mInitrd;
-        checkLabel(kernel);
-        checkLabel(initrd);
+        checkLabel(kernel, mTest);
+        checkLabel(initrd, mTest);
         try {
             VirtualMachineConfig config = rawConfig(kernel, initrd);
             VirtualMachineManager vmm = mContext.getSystemService(VirtualMachineManager.class);
@@ -157,7 +169,8 @@ final class GuestVm {
                 @Override public void onPayloadReady(VirtualMachine v) {}
                 @Override public void onPayloadFinished(VirtualMachine v, int exitCode) {}
                 @Override public void onError(VirtualMachine v, int errorCode, String message) {
-                    Log.w(TAG, "VM error " + errorCode + ": " + message);
+                    mLastError = "VM error " + errorCode + ": " + message;
+                    Log.e(TAG, mLastError);
                     mStopped = true;
                 }
                 @Override public void onStopped(VirtualMachine v, int reason) {
@@ -176,7 +189,11 @@ final class GuestVm {
             throw new IOException("custom VM API", e);
         } catch (Exception e) {
             mStopped = true;
-            throw new IOException("VM start: " + e.getMessage(), e);
+            // The VM manager's own reason (a refused label, scattered memory, no protected VMs) goes to the log in
+            // full, with every cause.
+            mLastError = causes(e);
+            Log.e(TAG, "VM start failed, " + (mMemoryBytes >> 20) + " MiB: " + mLastError, e);
+            throw new IOException("VM start: " + causes(e), e);
         }
     }
 
@@ -210,7 +227,33 @@ final class GuestVm {
     }
 
     // The VM manager's own rule for a protected VM's kernel files, checked first so a refusal names its cause.
-    private static void checkLabel(File f) throws IOException {
+    /** Why the last start failed, as the VM manager said it, or "". */
+    String lastError() {
+        return mLastError;
+    }
+
+    /** Whether the last link() handed back a connection made earlier (which may have died meanwhile). */
+    synchronized boolean lastLinkReused() {
+        return mLastReused;
+    }
+
+    /** Drops the connection but keeps the VM: the next link() connects again. */
+    synchronized void dropLink() {
+        if (mLink != null) mLink.close();
+        mLink = null;
+    }
+
+    private static String causes(Throwable e) {
+        StringBuilder b = new StringBuilder();
+        for (Throwable t = e; t != null && b.length() < 2000; t = t.getCause()) {
+            if (b.length() > 0) b.append(" <- ");
+            b.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage());
+            if (t.getCause() == t) break;
+        }
+        return b.toString();
+    }
+
+    private static void checkLabel(File f, boolean test) throws IOException {
         String label;
         try {
             byte[] v = Os.getxattr(f.getPath(), "security.selinux");
@@ -220,7 +263,7 @@ final class GuestVm {
         } catch (ErrnoException e) {
             throw new IOException("VM image " + f + " not readable: " + e.getMessage());
         }
-        if (!VmImages.labelAllowed(label)) {
+        if (!VmImages.labelAllowed(label, test)) {
             throw new IOException("VM image " + f + " has label " + label + ", which the VM manager refuses");
         }
     }

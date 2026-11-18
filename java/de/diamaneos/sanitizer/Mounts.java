@@ -16,18 +16,37 @@
 
 package de.diamaneos.sanitizer;
 
-/** The mount table, read for one question: is a file on FUSE. As MediaProvider's vmdecode Mounts. */
+/**
+ * The mount table, read for one question: may the decoder thread read this file while it streams it to the VM. Only
+ * a device the table names as a local file system of the internal storage qualifies. A device the table does not
+ * show at all (another mount namespace, an internal mount) never does.
+ */
 final class Mounts {
     private Mounts() {}
 
-    /** The file system of the deepest mount point holding path (the last one mounted there) is FUSE. */
-    static boolean isFuse(String path, String mountinfo) {
-        if (path == null || !path.startsWith("/")) return false;
-        String bestPoint = null;
-        String bestType = null;
+    // Local file systems of the internal storage: a read on them cannot stall without end.
+    private static final String[] LOCAL = {"f2fs", "ext4", "erofs"};
+
+    /** dev_t as the kernel encodes it (new_encode_dev): the major and minor number. */
+    static int major(long dev) {
+        return (int) (((dev >>> 8) & 0xfff) | ((dev >>> 32) & ~0xfffL));
+    }
+
+    static int minor(long dev) {
+        return (int) ((dev & 0xff) | ((dev >>> 12) & ~0xffL));
+    }
+
+    /**
+     * Every mount of device major:minor (field 3 of a mountinfo line) has a local file system type, and there is at
+     * least one. Not found, or any mount of it of another type (FUSE passes a device of its own, never this one):
+     * false.
+     */
+    static boolean localDevice(int major, int minor, String mountinfo) {
+        String want = major + ":" + minor;
+        boolean found = false;
         for (String line : mountinfo.split("\n")) {
             String[] fields = line.split(" ");
-            if (fields.length < 7) continue;
+            if (fields.length < 7 || !fields[2].equals(want)) continue;
             int dash = -1;
             for (int i = 6; i < fields.length; i++) {
                 if (fields[i].equals("-")) {
@@ -35,16 +54,12 @@ final class Mounts {
                     break;
                 }
             }
-            if (dash < 0 || dash + 1 >= fields.length) continue;
-            String point = fields[4].replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n")
-                    .replace("\\134", "\\");
-            boolean holds = point.equals("/") || path.equals(point) || path.startsWith(point + "/");
-            if (!holds) continue;
-            if (bestPoint == null || point.length() >= bestPoint.length()) {
-                bestPoint = point;
-                bestType = fields[dash + 1];
-            }
+            if (dash < 0 || dash + 1 >= fields.length) return false;
+            boolean local = false;
+            for (String t : LOCAL) local |= t.equals(fields[dash + 1]);
+            if (!local) return false;
+            found = true;
         }
-        return bestType != null && bestType.startsWith("fuse");
+        return found;
     }
 }

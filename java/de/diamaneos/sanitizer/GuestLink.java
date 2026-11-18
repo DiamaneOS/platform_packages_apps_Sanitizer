@@ -86,6 +86,9 @@ final class GuestLink implements Closeable {
     interface Source {
         long length();
 
+        /** Back to the start, for a second attempt on a new connection. */
+        default void rewind() {}
+
         /** Fills b[off, off + len) with the next bytes, exactly. Throws if the source ends early or stalls. */
         void readFully(byte[] b, int off, int len, long deadlineMillis) throws IOException;
     }
@@ -96,6 +99,10 @@ final class GuestLink implements Closeable {
 
             @Override public long length() {
                 return len;
+            }
+
+            @Override public void rewind() {
+                mAt = 0;
             }
 
             @Override public void readFully(byte[] b, int off, int n, long deadlineMillis) {
@@ -119,6 +126,17 @@ final class GuestLink implements Closeable {
         }
     }
 
+    /**
+     * The caller's file failed while it was being sent (it shrank, a read failed, its deadline passed). Not the VM's
+     * fault: the connection is closed (the VM is mid-request), but the VM is not restarted and nothing is held
+     * against the file.
+     */
+    static final class SourceFailedException extends IOException {
+        SourceFailedException(String message) {
+            super(message);
+        }
+    }
+
     /** A clean answer: a status, and for OK the checked values. */
     static final class Answer {
         int status;
@@ -129,6 +147,7 @@ final class GuestLink implements Closeable {
         byte[] pixels; // thumbnail
         Meta meta; // metadata
         long reserved; // budget taken for the pixels, given back by whoever ran the call
+        boolean noBudget; // INTERNAL because the service had no memory for the pixels, not because a worker died
     }
 
     /** The metadata record after its checks. Absent values are -1, NaN or "". */
@@ -161,6 +180,7 @@ final class GuestLink implements Closeable {
 
     private final Channel mChannel;
     private boolean mBroken;
+    private boolean mReplied; // the last call read at least one byte of a reply
     private Budget mBudget;
     private String mLane = "";
 
@@ -229,8 +249,14 @@ final class GuestLink implements Closeable {
 
     private static final int PIECE_BYTES = 64 << 10;
 
+    /** Whether the last call got any byte of a reply: when not, a reused connection may simply have been dead. */
+    boolean replied() {
+        return mReplied;
+    }
+
     private Answer call(int op, int arg0, int arg1, Source src, long deadline, boolean unused) throws IOException {
         if (mBroken) throw new ProtocolException("link already broken");
+        mReplied = false;
         long len = src.length();
         if (len < 0 || len > MAX_INPUT_BYTES) throw new IllegalArgumentException("input length");
         try {
@@ -241,7 +267,11 @@ final class GuestLink implements Closeable {
             byte[] piece = new byte[(int) Math.min(len, PIECE_BYTES)];
             for (long sent = 0; sent < len; ) {
                 int n = (int) Math.min(piece.length, len - sent);
-                src.readFully(piece, 0, n, deadline);
+                try {
+                    src.readFully(piece, 0, n, deadline);
+                } catch (IOException | RuntimeException e) {
+                    throw new SourceFailedException(e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
                 mChannel.write(piece, 0, n, deadline);
                 sent += n;
             }
@@ -296,6 +326,7 @@ final class GuestLink implements Closeable {
                         check(skipped.getInt() == END_MAGIC, "end");
                         Answer later = new Answer();
                         later.status = INTERNAL;
+                        later.noBudget = true;
                         return later;
                     }
                     a.reserved = mBudget != null ? payload : 0;
@@ -341,6 +372,7 @@ final class GuestLink implements Closeable {
         } catch (IOException | RuntimeException | Error e) {
             // Anything at all, out of memory included, leaves the link in an unknown state: it is not used again.
             close();
+            if (e instanceof SourceFailedException) throw (SourceFailedException) e;
             if (e instanceof ProtocolException) throw (ProtocolException) e;
             if (e instanceof IllegalArgumentException) throw (IllegalArgumentException) e;
             throw new ProtocolException(e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -371,6 +403,7 @@ final class GuestLink implements Closeable {
             int k = mChannel.read(b, got, n - got, deadline);
             if (k <= 0) throw new ProtocolException("stream ended after " + got + " of " + n);
             got += k;
+            mReplied = true;
         }
         return ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN);
     }

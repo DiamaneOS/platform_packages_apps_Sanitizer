@@ -51,7 +51,8 @@ public final class HealthProvider extends ContentProvider {
         boolean ok = true;
         long t0 = SystemClock.uptimeMillis();
         Decoder.Request ping = call(d, GuestLink.OP_PING, 0, 0, null, 60000);
-        ok &= line(pw, "vm start", ping.status == GuestLink.OK, (SystemClock.uptimeMillis() - t0) + " ms");
+        ok &= line(pw, "vm start", ping.status == GuestLink.OK, (SystemClock.uptimeMillis() - t0) + " ms"
+                + (ping.status == GuestLink.OK || d.vm().lastError().isEmpty() ? "" : ": " + d.vm().lastError()));
         Decoder.Request png = call(d, GuestLink.OP_THUMBNAIL, 5, 3, HealthImages.PNG, 30000);
         ok &= line(pw, "png thumbnail", png.status == GuestLink.OK && png.answer != null
                 && png.answer.width == 3 && png.answer.height == 3, describe(png));

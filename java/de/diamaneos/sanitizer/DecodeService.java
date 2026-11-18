@@ -135,7 +135,9 @@ public final class DecodeService extends Service {
             FdChannel.Input in = read(request, op, lane);
             if (in == null) return failed; // the read did not end in time: unavailable
             if (in.status != FdChannel.Input.OK) {
-                failed.status = in.status == FdChannel.Input.NO_MEMORY ? Decoder.UNAVAILABLE : GuestLink.INVALID;
+                // Only a file too large or unreadable is a verdict. No memory now, a slow read or a turn to wait for
+                // is "try again later".
+                failed.status = in.status == FdChannel.Input.TOO_LARGE ? GuestLink.INVALID : Decoder.UNAVAILABLE;
                 return failed;
             }
             Decoder.Request r = new Decoder.Request(op, a, b, in.data, in.len, in.reserved, lane, waiting, deadline);
@@ -150,8 +152,13 @@ public final class DecodeService extends Service {
     // Reads the caller's file on a reader thread, waiting at most READ_MILLIS. Null when it did not end in time: the
     // thread stays stuck in the read, counted against the lane until it ends, and gives back its memory then.
     private FdChannel.Input read(DecodeRequest request, int op, String lane) {
-        int max = op == GuestLink.OP_PROBE ? IDecodeService.MAX_PROBE_BYTES : IDecodeService.MAX_BUFFERED_BYTES;
-        boolean stream = op == GuestLink.OP_THUMBNAIL || op == GuestLink.OP_METADATA;
+        // A probe reads the head. A thumbnail of a large local JPEG or PNG streams. Metadata of a file too large to
+        // hold reads the head too: a JPEG or PNG keeps its metadata before its image data.
+        boolean head = op == GuestLink.OP_PROBE;
+        int max = head ? IDecodeService.MAX_PROBE_BYTES : IDecodeService.MAX_BUFFERED_BYTES;
+        // Decided on the reader thread from fstat, which can stall on FUSE too.
+        long headAbove = op == GuestLink.OP_METADATA ? IDecodeService.MAX_BUFFERED_BYTES : Long.MAX_VALUE;
+        boolean stream = op == GuestLink.OP_THUMBNAIL;
         long deadline = SystemClock.uptimeMillis() + READ_MILLIS;
         FdChannel channel = new FdChannel(request.file);
         Object lock = new Object();
@@ -160,7 +167,9 @@ public final class DecodeService extends Service {
             // A large regular file (not on FUSE) streams to the VM, anything else is read into memory here.
             FdChannel.Input in = stream ? channel.streamInput(IDecodeService.MAX_BUFFERED_BYTES,
                     IDecodeService.MAX_INPUT_BYTES, deadline, mDecoder, lane) : null;
-            if (in == null) in = channel.readInput(max, op == GuestLink.OP_PROBE, deadline, mDecoder, lane);
+            if (in == null) {
+                in = channel.readInput(max, head, headAbove, IDecodeService.MAX_PROBE_BYTES, deadline, mDecoder, lane);
+            }
             synchronized (lock) {
                 if (abandoned[0]) {
                     // Too late: nobody takes this input any more.

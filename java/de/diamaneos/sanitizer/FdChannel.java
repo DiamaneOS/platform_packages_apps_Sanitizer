@@ -109,6 +109,7 @@ final class FdChannel implements GuestLink.Channel {
         static final int OK = 0;
         static final int TOO_LARGE = 1; // or unreadable in time: a verdict on the caller's file
         static final int NO_MEMORY = 2; // the service holds too much right now: try again later
+        static final int LATER = 3; // the read did not finish in time or had to wait its turn: try again later
 
         int status;
         byte[] data;
@@ -122,31 +123,44 @@ final class FdChannel implements GuestLink.Channel {
     // What a streamed file holds of the budget while it waits: the piece it is sent in.
     private static final int STREAM_RESERVE = 64 * 1024;
     private static final int HASH_CHUNK = 256 * 1024;
+    // Hash passes over large files run at most two at a time in the whole service, whatever the lanes.
+    private static final java.util.concurrent.Semaphore HASHING = new java.util.concurrent.Semaphore(2);
 
     /**
-     * A large regular file not on FUSE, as a source the decoder sends to the VM in pieces, never held whole. Its
-     * SHA-256 is read first (the cache key). Null when the file is not one to stream: not regular, on FUSE (a FUSE
-     * read can stall without end, and the decoder thread must not), within maxBuffered (read into memory as before),
-     * or above maxStreamed (refused as too large by readInput). Runs on a reader thread, like readInput.
+     * A large regular JPEG or PNG on a local file system, as a source the decoder sends to the VM in pieces, never
+     * held whole. Its SHA-256 is read first (the cache key). Null when the file is not one to stream: not regular,
+     * not starting with a JPEG or PNG signature (only those decode as a stream, the rest is refused above maxBuffered
+     * without reading it), within maxBuffered (read into memory as before), above maxStreamed, or not on a device
+     * the mount table names as f2fs, ext4 or erofs (FUSE, removable media and anything unknown can stall a read
+     * without end, and the decoder thread must not). Runs on a reader thread, like readInput.
      */
     Input streamInput(long maxBuffered, long maxStreamed, long deadline, Decoder budget, String lane) {
         long size;
+        long dev;
         try {
             StructStat st = Os.fstat(mFd);
             if (!OsConstants.S_ISREG(st.st_mode)) return null;
             size = st.st_size;
+            dev = st.st_dev;
         } catch (ErrnoException e) {
             return null;
         }
-        if (size <= maxBuffered || size > maxStreamed || onFuse(mPfd.getFd())) return null;
+        if (size <= maxBuffered || size > maxStreamed || !onLocalDevice(dev) || !jpegOrPng()) return null;
         Input in = new Input();
         if (!budget.reserve(lane, STREAM_RESERVE)) {
             in.status = Input.NO_MEMORY;
             return in;
         }
         boolean done = false;
+        boolean hashing = false;
         ParcelFileDescriptor dup = null;
         try {
+            long wait = deadline - SystemClock.uptimeMillis();
+            if (wait <= 0 || !HASHING.tryAcquire(wait, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                in.status = Input.LATER;
+                return in;
+            }
+            hashing = true;
             dup = ParcelFileDescriptor.dup(mFd);
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             byte[] buf = new byte[HASH_CHUNK];
@@ -164,10 +178,15 @@ final class FdChannel implements GuestLink.Channel {
             in.reserved = STREAM_RESERVE;
             done = true;
             return in;
+        } catch (InterruptedIOException | InterruptedException e) {
+            // Slow or busy storage is no verdict on the file.
+            in.status = Input.LATER;
+            return in;
         } catch (IOException | ErrnoException | NoSuchAlgorithmException e) {
             in.status = Input.TOO_LARGE;
             return in;
         } finally {
+            if (hashing) HASHING.release();
             if (!done) {
                 budget.release(lane, STREAM_RESERVE);
                 if (dup != null) {
@@ -203,6 +222,12 @@ final class FdChannel implements GuestLink.Channel {
         }
 
         @Override
+        public void rewind() {
+            mAt = 0;
+            mSent.reset();
+        }
+
+        @Override
         public void readFully(byte[] b, int off, int len, long deadline) throws IOException {
             int got = 0;
             while (got < len) {
@@ -231,18 +256,30 @@ final class FdChannel implements GuestLink.Channel {
         }
     }
 
-    /** Whether the file lies on a FUSE file system, by its path and the mount table. When unsure, yes. */
-    static boolean onFuse(int fd) {
+    /** The file starts with a JPEG or PNG signature (pread, the position stays). */
+    private boolean jpegOrPng() {
+        byte[] b = new byte[8];
         try {
-            String path = Os.readlink("/proc/self/fd/" + fd);
-            String mountinfo = new String(Files.readAllBytes(Paths.get("/proc/self/mountinfo")),
-                    StandardCharsets.UTF_8);
-            return Mounts.isFuse(path, mountinfo);
-        } catch (ErrnoException | IOException | RuntimeException e) {
-            return true;
+            if (Os.pread(mFd, b, 0, 8, 0) != 8) return false;
+        } catch (ErrnoException | java.io.InterruptedIOException e) {
+            return false;
         }
+        boolean jpeg = (b[0] & 0xff) == 0xff && (b[1] & 0xff) == 0xd8 && (b[2] & 0xff) == 0xff;
+        boolean png = (b[0] & 0xff) == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G' && b[4] == '\r'
+                && b[5] == '\n' && b[6] == 0x1a && b[7] == '\n';
+        return jpeg || png;
     }
 
+    /** The file's own device is in the mount table, as a local file system that cannot stall a read. */
+    static boolean onLocalDevice(long dev) {
+        try {
+            String mountinfo = new String(Files.readAllBytes(Paths.get("/proc/self/mountinfo")),
+                    StandardCharsets.UTF_8);
+            return Mounts.localDevice(Mounts.major(dev), Mounts.minor(dev), mountinfo);
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
 
     /**
      * Reads the stream, at most max bytes, taking every buffer from the lane's budget before it is allocated. With
@@ -251,6 +288,11 @@ final class FdChannel implements GuestLink.Channel {
      * reads (FUSE files) are bounded by the caller, which runs this on a reader thread with a deadline.
      */
     Input readInput(int max, boolean prefix, long deadline, Decoder budget, String lane) {
+        return readInput(max, prefix, Long.MAX_VALUE, max, deadline, budget, lane);
+    }
+
+    /** As above, and a regular file longer than headAbove is read only to its first headMax bytes (its head). */
+    Input readInput(int max, boolean prefix, long headAbove, int headMax, long deadline, Decoder budget, String lane) {
         Input in = new Input();
         long size = -1;
         try {
@@ -258,6 +300,10 @@ final class FdChannel implements GuestLink.Channel {
             if (OsConstants.S_ISREG(st.st_mode)) size = st.st_size;
         } catch (ErrnoException ignored) {
             // read as a stream
+        }
+        if (size > headAbove) {
+            max = headMax;
+            prefix = true;
         }
         if (size > max && !prefix) {
             in.status = Input.TOO_LARGE;

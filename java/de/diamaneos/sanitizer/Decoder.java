@@ -53,7 +53,8 @@ final class Decoder implements GuestLink.Budget {
     static final long BACKOFF_MAX = 300000;
     // Everything held for callers at once, and the share one lane may hold.
     static final long MAX_HELD_BYTES = 128L << 20;
-    static final long MAX_LANE_BYTES = MAX_HELD_BYTES / 4;
+    // One lane can hold its largest buffered input and a full-size answer at once (32 + 32 MiB, and room).
+    static final long MAX_LANE_BYTES = (long) GuestLink.MAX_PIXELS * 4 + GuestLink.MAX_BUFFERED_BYTES + (8L << 20);
     // Requests one lane may have in the service at once (reading, queued or with the VM).
     static final int MAX_ACTIVE_PER_LANE = 32;
     // Reads that never ended (a stalled pipe or FUSE file): per lane, and in all.
@@ -228,7 +229,7 @@ final class Decoder implements GuestLink.Budget {
         boolean sameFile = r.source == null || java.util.Arrays.equals(r.digest, r.sentDigest);
         if (key != null && r.answer != null && r.status != UNAVAILABLE && sameFile) {
             mCache.put(key, r.answer);
-        } else if (digest != null && r.died) {
+        } else if (digest != null && r.died && sameFile) {
             strike(digest, key, r);
         }
         return r;
@@ -284,49 +285,71 @@ final class Decoder implements GuestLink.Budget {
         long now = SystemClock.uptimeMillis();
         if (now < mNextStart && !mVm.isRunning()) return; // backing off: UNAVAILABLE
         long budget = now + CALL_BUDGET_MILLIS;
-        GuestLink link;
-        try {
-            link = mVm.link(budget);
-        } catch (IOException e) {
-            Log.w(TAG, "VM not available: " + e.getMessage());
-            mVm.stop();
-            backOff();
-            return;
-        }
-        link.setBudget(this, r.lane);
-        try {
-            GuestLink.Answer a;
-            switch (r.op) {
-                case GuestLink.OP_PING: a = link.ping(budget); break;
-                case GuestLink.OP_PROBE: a = link.probe(r.file, r.len, budget); break;
-                case GuestLink.OP_THUMBNAIL:
-                    a = r.source != null ? link.call(r.op, r.a, r.b, r.source, budget)
-                                         : link.thumbnail(r.file, r.len, r.a, r.b, budget);
-                    break;
-                case GuestLink.OP_METADATA:
-                    a = r.source != null ? link.call(r.op, 0, 0, r.source, budget) : link.metadata(r.file, r.len, budget);
-                    break;
-                case GuestLink.OP_HOOK: a = link.hook(r.a, budget); break;
-                default: throw new IllegalArgumentException("op");
-            }
-            mBackoff = BACKOFF_MIN;
-            if (a.status == GuestLink.INTERNAL) {
-                // A worker died, or the service had no memory for the pixels: no verdict on the file, not cached.
-                r.status = UNAVAILABLE;
-                r.died = true;
+        for (int attempt = 0; ; attempt++) {
+            GuestLink link;
+            try {
+                link = mVm.link(budget);
+            } catch (IOException e) {
+                Log.w(TAG, "VM not available: " + e.getMessage());
+                mVm.stop();
+                backOff();
                 return;
             }
-            r.answer = a;
-            r.status = a.status;
-        } catch (IOException e) {
-            // Silent past the budget, or a reply that broke the protocol: the link and the VM are not trusted any
-            // more. The request is unavailable, never cached as a verdict on the file, unless the same file does it
-            // again. A worker cannot cause this: the broker checks everything a worker sends.
-            Log.w(TAG, "VM link broken: " + e.getMessage());
-            r.status = UNAVAILABLE;
-            r.died = r.op != GuestLink.OP_PING && r.op != GuestLink.OP_HOOK;
-            mVm.stop();
-            backOff();
+            boolean reused = mVm.lastLinkReused();
+            link.setBudget(this, r.lane);
+            try {
+                GuestLink.Answer a = call(link, r, budget);
+                mBackoff = BACKOFF_MIN;
+                if (a.status == GuestLink.INTERNAL) {
+                    // A worker died: no verdict on the file, not cached, counted towards a strike. Or the service had
+                    // no memory for the pixels: just try later.
+                    r.status = UNAVAILABLE;
+                    r.died = !a.noBudget;
+                    return;
+                }
+                r.answer = a;
+                r.status = a.status;
+                return;
+            } catch (GuestLink.SourceFailedException e) {
+                // The caller's file failed while it was sent (it shrank or stalled). The connection is gone, the VM
+                // is fine and the file gets no strike: the next request connects again.
+                Log.w(TAG, "source failed while sending: " + e.getMessage());
+                r.status = UNAVAILABLE;
+                return;
+            } catch (IOException e) {
+                if (attempt == 0 && reused && !link.replied() && SystemClock.uptimeMillis() < budget) {
+                    // A connection kept from earlier that died meanwhile, before it said anything: connect again
+                    // once before calling the VM broken.
+                    Log.i(TAG, "kept VM connection was dead, connecting again: " + e.getMessage());
+                    mVm.dropLink();
+                    if (r.source != null) r.source.rewind();
+                    continue;
+                }
+                // Silent past the budget, or a reply that broke the protocol, on a fresh connection: the link and
+                // the VM are not trusted any more. The request is unavailable, never cached as a verdict on the
+                // file, unless the same file does it again. A worker cannot cause this: the broker checks
+                // everything a worker sends.
+                Log.w(TAG, "VM link broken: " + e.getMessage());
+                r.status = UNAVAILABLE;
+                r.died = r.op != GuestLink.OP_PING && r.op != GuestLink.OP_HOOK;
+                mVm.stop();
+                backOff();
+                return;
+            }
+        }
+    }
+
+    private static GuestLink.Answer call(GuestLink link, Request r, long budget) throws IOException {
+        switch (r.op) {
+            case GuestLink.OP_PING: return link.ping(budget);
+            case GuestLink.OP_PROBE: return link.probe(r.file, r.len, budget);
+            case GuestLink.OP_THUMBNAIL:
+                return r.source != null ? link.call(r.op, r.a, r.b, r.source, budget)
+                                        : link.thumbnail(r.file, r.len, r.a, r.b, budget);
+            case GuestLink.OP_METADATA:
+                return r.source != null ? link.call(r.op, 0, 0, r.source, budget) : link.metadata(r.file, r.len, budget);
+            case GuestLink.OP_HOOK: return link.hook(r.a, budget);
+            default: throw new IllegalArgumentException("op");
         }
     }
 
