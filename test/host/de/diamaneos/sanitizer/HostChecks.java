@@ -32,8 +32,8 @@ import java.util.Random;
 
 /**
  * Host checks of the decode service's Android side, without a phone: GuestLink against a hostile fuzzing server
- * that plays a broken or malicious VM over a local socket, the Scheduler and the ResultCache. Plain Java, no Android
- * classes: run with any JDK. Prints one line per check and "DONE pass=N fail=M", exits 1 on any failure.
+ * that plays a broken or malicious VM over a local socket, the Scheduler, the ResultCache, and Decoder's decisions
+ * (retries, strikes, budget) against a fake VM. Plain Java with two small stubs (test/host/stubs): run with any JDK. Prints one line per check and "DONE pass=N fail=M", exits 1 on any failure.
  *
  * <p>The fuzzing server sends scripted bad replies, random bytes, and mutations of valid replies (bit flips, cut
  * streams, changed length and size fields, slow drips). Every call must end in a ProtocolException or an answer
@@ -205,7 +205,7 @@ public final class HostChecks {
         GuestLink.Answer a = (GuestLink.Answer) r;
         if (a.status != GuestLink.OK) {
             boolean clean = a.status == GuestLink.UNSUPPORTED || a.status == GuestLink.INVALID
-                    || a.status == GuestLink.INTERNAL;
+                    || a.status == GuestLink.INTERNAL || a.status == GuestLink.BUSY;
             return clean && a.pixels == null && a.meta == null ? null : "bad failure answer " + a.status;
         }
         if (a.format < GuestLink.FORMAT_JPEG || a.format > GuestLink.FORMAT_WBMP) return "format";
@@ -730,6 +730,313 @@ public final class HostChecks {
         return "status " + a.status + (a.status == 0 ? " " + a.width + "x" + a.height + " extra " + a.extra : "");
     }
 
+    // --- Decoder's decisions, with a fake VM and a fake clock -------------------------------------------------------
+
+    /** A link's other end: serves a scripted reply and swallows the request. Optionally ends or fails early. */
+    static final class FakeChannel implements GuestLink.Channel {
+        private final byte[] mReply;
+        private final int mServe; // bytes of the reply served before the stream ends
+        private int mAt;
+
+        FakeChannel(byte[] reply) {
+            this(reply, reply.length);
+        }
+
+        FakeChannel(byte[] reply, int serve) {
+            mReply = reply;
+            mServe = serve;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len, long deadline) {
+            int k = Math.min(len, mServe - mAt);
+            if (k <= 0) return 0;
+            System.arraycopy(mReply, mAt, b, off, k);
+            mAt += k;
+            return k;
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len, long deadline) {}
+
+        @Override
+        public void close() {}
+    }
+
+    /** The VM as Decoder sees it: links from a script, counters of what Decoder asked for. */
+    static final class FakeVm implements Decoder.Vm {
+        // Each entry: a FakeChannel, a reply (byte[], a fresh channel each time) or an IOException (no start).
+        final java.util.ArrayDeque<Object> script = new java.util.ArrayDeque<>();
+        Object always; // used when the script is empty
+        boolean nextReused;
+        volatile boolean held;
+        volatile int links, stops, drops;
+        private boolean mReused;
+        private boolean mRunning;
+
+        @Override
+        public synchronized GuestLink link(long deadline) throws IOException {
+            links++;
+            Object next = script.isEmpty() ? always : script.poll();
+            mReused = nextReused;
+            nextReused = false;
+            if (next instanceof IOException) throw (IOException) next;
+            mRunning = true;
+            return new GuestLink(next instanceof byte[] ? new FakeChannel((byte[]) next) : (FakeChannel) next);
+        }
+
+        @Override public synchronized void stop() {
+            stops++;
+            mRunning = false;
+        }
+
+        @Override public synchronized boolean isRunning() {
+            return mRunning;
+        }
+
+        @Override public synchronized boolean lastLinkReused() {
+            return mReused;
+        }
+
+        @Override public synchronized void dropLink() {
+            drops++;
+        }
+
+        @Override public String lastError() {
+            return "";
+        }
+
+        @Override public boolean heldDown() {
+            return held;
+        }
+    }
+
+    /** A streamed file: fails while sent when asked to, and reports a digest of what was sent. */
+    static final class FakeSource implements Decoder.StreamedSource {
+        final int len;
+        final boolean fails;
+        final byte[] sent;
+
+        FakeSource(int len, boolean fails, byte[] sent) {
+            this.len = len;
+            this.fails = fails;
+            this.sent = sent;
+        }
+
+        @Override public long length() {
+            return len;
+        }
+
+        @Override public void readFully(byte[] b, int off, int n, long deadline) throws IOException {
+            if (fails) throw new IOException("file shrank");
+        }
+
+        @Override public byte[] sentDigest() {
+            return sent;
+        }
+
+        @Override public void close() {}
+    }
+
+    static final long FAR = Long.MAX_VALUE / 4;
+
+    static byte[] probeOk() {
+        return cat(reply(GuestLink.REPLY_MAGIC, 0, 1, 5, 5, 0, 0), end(0));
+    }
+
+    static byte[] failure(int status) {
+        return cat(reply(GuestLink.REPLY_MAGIC, status, 0, 0, 0, 0, 0), end(status));
+    }
+
+    static byte[] thumbOk(int w, int h) {
+        return cat(reply(GuestLink.REPLY_MAGIC, 0, 1, w, h, 0, w * h * 4), new byte[w * h * 4], end(0));
+    }
+
+    static Decoder.Request probe(Decoder d, byte[] file, String lane) {
+        if (!d.reserve(lane, file.length)) throw new IllegalStateException("no budget for the test input");
+        return d.run(new Decoder.Request(GuestLink.OP_PROBE, 0, 0, file, file.length, file.length, lane, false, FAR));
+    }
+
+    static Decoder.Request thumb(Decoder d, byte[] file, int box, String lane) {
+        if (!d.reserve(lane, file.length)) throw new IllegalStateException("no budget for the test input");
+        return d.run(new Decoder.Request(GuestLink.OP_THUMBNAIL, box, box, file, file.length, file.length, lane, false,
+                FAR));
+    }
+
+    static Decoder.Request streamed(Decoder d, FakeSource src, byte[] digest, String lane) {
+        Decoder.Request r = new Decoder.Request(GuestLink.OP_THUMBNAIL, 64, 64, null, src.len, 0, lane, false, FAR);
+        r.source = src;
+        r.digest = digest;
+        return d.run(r);
+    }
+
+    static void check(String what, boolean ok, String detail) {
+        if (ok) pass(what, detail); else fail(what, detail);
+    }
+
+    static void decoderChecks() throws Exception {
+        java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong(1000);
+        Scheduler.Clock c = clock::get;
+
+        // A kept connection that died before saying anything: connected again once, no stop, no strike.
+        FakeVm vm = new FakeVm();
+        vm.nextReused = true;
+        vm.script.add(new FakeChannel(new byte[0]));
+        vm.script.add(new FakeChannel(probeOk()));
+        Decoder d = new Decoder(vm, c);
+        Decoder.Request r = probe(d, new byte[] {1, 2, 3}, "a");
+        check("decoder: a dead kept link is tried once more", r.status == GuestLink.OK && vm.links == 2 && vm.drops == 1
+                && vm.stops == 0 && d.held() == 0, "status " + r.status + ", links " + vm.links + ", stops " + vm.stops);
+
+        // A fresh connection that breaks: the VM is stopped and the file gets a strike, twice is INVALID, cached.
+        vm = new FakeVm();
+        vm.always = new byte[0];
+        d = new Decoder(vm, c);
+        byte[] file = {4, 5, 6};
+        Decoder.Request r1 = probe(d, file, "a");
+        clock.addAndGet(Decoder.BACKOFF_MIN + 1);
+        vm.always = new byte[0];
+        Decoder.Request r2 = probe(d, file, "a");
+        int linksBefore = vm.links;
+        Decoder.Request r3 = probe(d, file, "a");
+        check("decoder: a broken fresh link twice is a cached INVALID", r1.status == Decoder.UNAVAILABLE
+                && r2.status == GuestLink.INVALID && r3.status == GuestLink.INVALID && vm.links == linksBefore
+                && vm.stops >= 2 && d.held() == 0, r1.status + " " + r2.status + " " + r3.status + ", stops " + vm.stops);
+
+        // Workers that died (INTERNAL) twice: a strike each, INVALID. BUSY twice: never a strike.
+        vm = new FakeVm();
+        d = new Decoder(vm, c);
+        vm.script.add(new FakeChannel(failure(GuestLink.INTERNAL)));
+        vm.script.add(new FakeChannel(failure(GuestLink.INTERNAL)));
+        Decoder.Request i1 = probe(d, new byte[] {7}, "a");
+        Decoder.Request i2 = probe(d, new byte[] {7}, "a");
+        vm.script.add(new FakeChannel(failure(GuestLink.BUSY)));
+        vm.script.add(new FakeChannel(failure(GuestLink.BUSY)));
+        vm.script.add(new FakeChannel(probeOk()));
+        Decoder.Request b1 = probe(d, new byte[] {8}, "a");
+        Decoder.Request b2 = probe(d, new byte[] {8}, "a");
+        Decoder.Request b3 = probe(d, new byte[] {8}, "a");
+        check("decoder: INTERNAL twice is INVALID, BUSY never a strike", i1.status == Decoder.UNAVAILABLE
+                && i2.status == GuestLink.INVALID && b1.status == Decoder.UNAVAILABLE && b2.status == Decoder.UNAVAILABLE
+                && b3.status == GuestLink.OK && vm.stops == 0 && d.held() == 0,
+                i1.status + " " + i2.status + " / " + b1.status + " " + b2.status + " " + b3.status);
+
+        // A late BUSY after the pixels: also no strike, and the pixel budget goes back.
+        vm = new FakeVm();
+        d = new Decoder(vm, c);
+        byte[] lateBusy = cat(reply(GuestLink.REPLY_MAGIC, 0, 1, 8, 8, 0, 256), new byte[256], end(GuestLink.BUSY));
+        vm.script.add(new FakeChannel(lateBusy));
+        vm.script.add(new FakeChannel(lateBusy));
+        vm.script.add(new FakeChannel(thumbOk(8, 8)));
+        Decoder.Request l1 = thumb(d, new byte[] {9}, 8, "a");
+        Decoder.Request l2 = thumb(d, new byte[] {9}, 8, "a");
+        Decoder.Request l3 = thumb(d, new byte[] {9}, 8, "a");
+        check("decoder: a late BUSY is no strike and frees its pixels", l1.status == Decoder.UNAVAILABLE
+                && l2.status == Decoder.UNAVAILABLE && l3.status == GuestLink.OK && d.held() == 0,
+                l1.status + " " + l2.status + " " + l3.status + ", held " + d.held());
+
+        // The caller's file fails while sent: no stop, no strike, again and again.
+        vm = new FakeVm();
+        vm.always = thumbOk(4, 4);
+        d = new Decoder(vm, c);
+        byte[] digest = new byte[32];
+        Decoder.Request s1 = streamed(d, new FakeSource(1 << 20, true, null), digest, "a");
+        Decoder.Request s2 = streamed(d, new FakeSource(1 << 20, true, null), digest, "a");
+        Decoder.Request s3 = streamed(d, new FakeSource(1 << 20, true, null), digest, "a");
+        check("decoder: a source failure is no stop and no strike", s1.status == Decoder.UNAVAILABLE
+                && s2.status == Decoder.UNAVAILABLE && s3.status == Decoder.UNAVAILABLE && vm.stops == 0,
+                s1.status + " " + s2.status + " " + s3.status + ", stops " + vm.stops);
+
+        // A streamed file that changed between hash and send: answered, but never cached under the old digest.
+        vm = new FakeVm();
+        vm.always = thumbOk(4, 4);
+        d = new Decoder(vm, c);
+        byte[] other = new byte[32];
+        other[0] = 1;
+        Decoder.Request c1 = streamed(d, new FakeSource(1 << 20, false, other), digest, "a");
+        vm.always = thumbOk(4, 4);
+        Decoder.Request c2 = streamed(d, new FakeSource(1 << 20, false, other), digest, "a");
+        check("decoder: a changed file is not cached", c1.status == GuestLink.OK && c2.status == GuestLink.OK
+                && vm.links == 2, "links " + vm.links);
+
+        // N2: a lane's large input and its large answer, one after the other: the input goes when the reply begins.
+        vm = new FakeVm();
+        int w = 4096, h = 2048; // 32 MiB of pixels, as large as an answer gets
+        vm.always = cat(reply(GuestLink.REPLY_MAGIC, 0, 1, w, h, 0, w * h * 4), new byte[w * h * 4], end(0));
+        d = new Decoder(vm, c);
+        Decoder.Request big = thumb(d, new byte[GuestLink.MAX_BUFFERED_BYTES], 4096, "big");
+        check("decoder: 32 MiB in, 32 MiB out on one lane", big.status == GuestLink.OK && d.held() == 0,
+                "status " + big.status + ", held " + d.held());
+
+        // Fairness: busy lanes leave room for the next, and a lane gets at most half of what the others leave.
+        d = new Decoder(new FakeVm(), c);
+        boolean h1 = d.reserve("h1", Decoder.MAX_LANE_BYTES);
+        boolean h2 = d.reserve("h2", Decoder.MAX_LANE_BYTES);
+        boolean h3big = d.reserve("h3", Decoder.MAX_LANE_BYTES);
+        boolean h3 = d.reserve("h3", (Decoder.MAX_HELD_BYTES - 2 * Decoder.MAX_LANE_BYTES) / 2);
+        boolean small = d.reserve("h4", 1 << 20);
+        check("decoder: the lane share is fair", h1 && h2 && !h3big && h3 && small, h1 + " " + h2 + " " + h3big + " "
+                + h3 + " " + small);
+        d.release("h1", Decoder.MAX_LANE_BYTES);
+        d.release("h2", Decoder.MAX_LANE_BYTES);
+        d.release("h3", (Decoder.MAX_HELD_BYTES - 2 * Decoder.MAX_LANE_BYTES) / 2);
+        d.release("h4", 1 << 20);
+
+        // No room for the pixels: drained, "try later", no strike, nothing held.
+        vm = new FakeVm();
+        vm.always = cat(reply(GuestLink.REPLY_MAGIC, 0, 1, 2048, 2048, 0, 2048 * 2048 * 4), new byte[2048 * 2048 * 4],
+                end(0));
+        d = new Decoder(vm, c);
+        long third = (Decoder.MAX_HELD_BYTES - 2 * Decoder.MAX_LANE_BYTES) / 2;
+        d.reserve("h1", Decoder.MAX_LANE_BYTES);
+        d.reserve("h2", Decoder.MAX_LANE_BYTES);
+        d.reserve("h3", third);
+        Decoder.Request nb1 = thumb(d, new byte[] {10}, 2048, "y");
+        Decoder.Request nb2 = thumb(d, new byte[] {10}, 2048, "y");
+        long hogs = 2 * Decoder.MAX_LANE_BYTES + third;
+        check("decoder: no budget for the pixels is no strike", nb1.status == Decoder.UNAVAILABLE
+                && nb2.status == Decoder.UNAVAILABLE && d.held() == hogs && vm.stops == 0, nb1.status + " "
+                + nb2.status + ", held " + d.held());
+        d.release("h1", Decoder.MAX_LANE_BYTES);
+        d.release("h2", Decoder.MAX_LANE_BYTES);
+        d.release("h3", third);
+
+        // N3: the link ends between the pixels and the trailer: the pixel budget goes back.
+        vm = new FakeVm();
+        byte[] cut = thumbOk(64, 64);
+        vm.script.add(new FakeChannel(cut, cut.length - 4));
+        d = new Decoder(vm, c);
+        Decoder.Request leak = thumb(d, new byte[] {11}, 64, "a");
+        check("decoder: a link lost before the trailer leaks no budget", leak.status == Decoder.UNAVAILABLE
+                && d.held() == 0 && vm.stops == 1, "status " + leak.status + ", held " + d.held());
+
+        // A test holds the VM down: stopped, nothing linked, unavailable, and no backoff afterwards.
+        vm = new FakeVm();
+        vm.held = true;
+        vm.always = probeOk();
+        d = new Decoder(vm, c);
+        Decoder.Request hd = probe(d, new byte[] {12}, "a");
+        vm.held = false;
+        Decoder.Request after = probe(d, new byte[] {12}, "a");
+        check("decoder: held down is unavailable, then back at once", hd.status == Decoder.UNAVAILABLE
+                && vm.stops >= 1 && after.status == GuestLink.OK && vm.links == 1, hd.status + " " + after.status
+                + ", links " + vm.links);
+
+        // A VM that does not start: backoff, no link attempt until it ends.
+        vm = new FakeVm();
+        vm.always = new IOException("VM start: refused");
+        d = new Decoder(vm, c);
+        Decoder.Request f1 = probe(d, new byte[] {13}, "a");
+        Decoder.Request f2 = probe(d, new byte[] {13}, "a");
+        int during = vm.links;
+        clock.addAndGet(Decoder.BACKOFF_MIN + 1);
+        vm.always = probeOk();
+        Decoder.Request f3 = probe(d, new byte[] {13}, "a");
+        check("decoder: a failed start backs off", f1.status == Decoder.UNAVAILABLE && f2.status == Decoder.UNAVAILABLE
+                && during == 1 && f3.status == GuestLink.OK && vm.links == 2 && d.held() == 0,
+                f1.status + " " + f2.status + " " + f3.status + ", links " + vm.links);
+    }
+
     static void brokerChecks(String socket, java.io.File images) throws Exception {
         GuestLink link = new GuestLink(new UnixChannel(socket));
         long t;
@@ -892,7 +1199,7 @@ public final class HostChecks {
         long ms = now() - start;
         String why = broken(a, opCode, bw, bh);
         if (t[4].equals("noint")) {
-            if (a.status == GuestLink.INTERNAL) why = "INTERNAL";
+            if (a.status == GuestLink.INTERNAL || a.status == GuestLink.BUSY) why = "status " + a.status;
         } else if (a.status != Integer.parseInt(t[4])) {
             why = "status " + a.status;
         }
@@ -942,6 +1249,7 @@ public final class HostChecks {
         fuzz(rounds);
         schedulerChecks();
         cacheChecks();
+        decoderChecks();
         System.out.println("DONE pass=" + sPass + " fail=" + sFail + " in " + (System.nanoTime() - T0) / 1000000
                 + " ms");
         System.exit(sFail == 0 ? 0 : 1);

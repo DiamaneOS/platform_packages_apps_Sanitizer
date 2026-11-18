@@ -17,7 +17,6 @@
 package de.diamaneos.sanitizer;
 
 import android.app.Application;
-import android.os.SystemProperties;
 
 import java.io.File;
 
@@ -32,7 +31,8 @@ public final class TestApp extends Application implements DecoderProvider {
 
     /** The test VM images, only where adb could have put them: a debuggable build. */
     static File testImages() {
-        if (!SystemProperties.getBoolean("ro.debuggable", false)) {
+        // Not ro.debuggable itself: an ordinary app may not read it, and the read answered false on userdebug.
+        if (!DebugBuild.debuggable()) {
             throw new IllegalStateException("the self-test runs on debuggable builds only");
         }
         return TEST_IMAGES;

@@ -225,7 +225,11 @@ public class SelfTestActivity extends Activity {
         expectRefused("rotation 45", fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 45, 8), px, end(E, 0))),
                 GuestLink.OP_THUMBNAIL);
         expectRefused("no trailer", fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 0, 8), px)), GuestLink.OP_THUMBNAIL);
-        expectRefused("trailer status", fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 0, 8), px, end(E, 3))),
+        // After pixels a trailer may say INVALID, INTERNAL or BUSY (a late failure, accepted below), never
+        // UNSUPPORTED and nothing unknown.
+        expectRefused("trailer status", fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 0, 8), px, end(E, 2))),
+                GuestLink.OP_THUMBNAIL);
+        expectRefused("trailer status unknown", fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 0, 8), px, end(E, 9))),
                 GuestLink.OP_THUMBNAIL);
         expectRefused("cut pixels", fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 0, 8), new byte[5])),
                 GuestLink.OP_THUMBNAIL);
@@ -242,7 +246,9 @@ public class SelfTestActivity extends Activity {
                 GuestLink.OP_PROBE);
         expectRefused("probe payload", fd -> writeAll(fd, cat(reply(R, 0, 1, 5, 5, 0, 4), new byte[4], end(E, 0))),
                 GuestLink.OP_PROBE);
-        expectRefused("format 9", fd -> writeAll(fd, cat(reply(R, 0, 9, 5, 5, 0, 0), end(E, 0))), GuestLink.OP_PROBE);
+        // The contract's formats are 1 to 10 (ICO is 9, WBMP 10): 0 and 11 are not formats.
+        expectRefused("format 0", fd -> writeAll(fd, cat(reply(R, 0, 0, 5, 5, 0, 0), end(E, 0))), GuestLink.OP_PROBE);
+        expectRefused("format 11", fd -> writeAll(fd, cat(reply(R, 0, 11, 5, 5, 0, 0), end(E, 0))), GuestLink.OP_PROBE);
         expectRefused("meta control char", fd -> writeAll(fd, cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(b -> b.put(48, (byte) 0x1b)), end(E, 0))), GuestLink.OP_METADATA);
         expectRefused("meta unterminated id", fd -> writeAll(fd, cat(reply(R, 0, 1, 4, 3, 0, 1024),
@@ -269,6 +275,18 @@ public class SelfTestActivity extends Activity {
             pass("stub late failure is a clean INVALID", "");
         } else {
             fail("stub late failure is a clean INVALID", String.valueOf(late));
+        }
+        // A worker the VM stopped for a reason outside the file, after its header or before: BUSY, never a strike.
+        Object lateBusy = stub(fd -> writeAll(fd, cat(reply(R, 0, 1, 2, 1, 0, 8), px, end(E, GuestLink.BUSY))),
+                GuestLink.OP_THUMBNAIL, 2000);
+        Object busy = stub(fd -> writeAll(fd, cat(reply(R, GuestLink.BUSY, 0, 0, 0, 0, 0), end(E, GuestLink.BUSY))),
+                GuestLink.OP_PROBE, 2000);
+        if (lateBusy instanceof GuestLink.Answer && ((GuestLink.Answer) lateBusy).status == GuestLink.BUSY
+                && ((GuestLink.Answer) lateBusy).pixels == null && busy instanceof GuestLink.Answer
+                && ((GuestLink.Answer) busy).status == GuestLink.BUSY) {
+            pass("stub busy is a clean answer", "");
+        } else {
+            fail("stub busy is a clean answer", lateBusy + " / " + busy);
         }
         // Turned by 90 degrees, a stored 1x2 result fits the 2x1 box as shown, and a stored 2x1 one does not.
         Object turned = stub(fd -> writeAll(fd, cat(reply(R, 0, 1, 1, 2, 90, 8), px, end(E, 0))),
