@@ -175,13 +175,14 @@ final class GuestVm implements Decoder.Vm {
         try {
             VirtualMachineConfig config = rawConfig(kernel, initrd);
             VirtualMachineManager vmm = mContext.getSystemService(VirtualMachineManager.class);
-            VirtualMachine vm = vmm.get(NAME);
-            if (vm != null) {
-                vm.close();
-                vmm.delete(NAME);
-            }
-            // A fresh instance each start: the VM keeps no state, so it never needs its old instance data.
-            vm = vmm.create(NAME, config);
+            // A fresh instance each start: the VM keeps no state, so it never needs its old instance data. A stored
+            // VM that no longer loads (a config of an older build) is deleted and made again (StoredVm).
+            VirtualMachine vm = StoredVm.fresh(new StoredVm.Slot<VirtualMachine>() {
+                @Override public VirtualMachine get() throws Exception { return vmm.get(NAME); }
+                @Override public void close(VirtualMachine v) throws Exception { v.close(); }
+                @Override public void delete() throws Exception { vmm.delete(NAME); }
+                @Override public VirtualMachine create() throws Exception { return vmm.create(NAME, config); }
+            }, (message, cause) -> Log.w(TAG, message + ": " + printable(causes(cause))));
             vm.setCallback(mCallbacks, new VirtualMachineCallback() {
                 @Override public void onPayloadStarted(VirtualMachine v) {}
                 @Override public void onPayloadReady(VirtualMachine v) {}

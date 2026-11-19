@@ -229,6 +229,19 @@ android_app {
     system_ext_specific: true,
 }
 
+// The stored-VM recovery (StoredVm) on the build machine: plain Java, no device needed.
+java_test_host {
+    name: "DiamaneOSSanitizerHostTest",
+    srcs: [
+        "java/de/diamaneos/sanitizer/StoredVm.java",
+        "test/hostjava/**/*.java",
+    ],
+    static_libs: ["junit"],
+    test_options: {
+        unit_test: true,
+    },
+}
+
 // Test builds only, installed by hand as an ordinary app: the service's classes and the self-test activity. In no
 // product's packages: a build only puts it into its output folder (an uninstallable app would leave out its code).
 android_app {
