@@ -305,8 +305,9 @@ final class Decoder implements GuestLink.Budget {
             }
         }
         r.queuedAt = mClock.now();
-        boolean small = mVm.lanes() && r.op != GuestLink.OP_PING && r.op != GuestLink.OP_HOOK && r.source == null
-                && r.len <= GuestLink.SMALL_INPUT_BYTES;
+        // Animations always take the big lane (the small lane answers them BIG_LANE).
+        boolean small = mVm.lanes() && r.op != GuestLink.OP_PING && r.op != GuestLink.OP_HOOK
+                && r.op != GuestLink.OP_FRAMES && r.source == null && r.len <= GuestLink.SMALL_INPUT_BYTES;
         if (!(small ? mSmall : mScheduler).offer(r)) {
             release(r.lane, r.takeInput());
             closeSource(r);
@@ -552,6 +553,7 @@ final class Decoder implements GuestLink.Budget {
                                         : link.thumbnail(r.file, r.len, r.a, r.b, budget);
             case GuestLink.OP_METADATA:
                 return r.source != null ? link.call(r.op, 0, 0, r.source, budget) : link.metadata(r.file, r.len, budget);
+            case GuestLink.OP_FRAMES: return link.frames(r.file, r.len, r.a, r.b, budget);
             case GuestLink.OP_HOOK: return link.hook(r.a, budget);
             default: throw new IllegalArgumentException("op");
         }

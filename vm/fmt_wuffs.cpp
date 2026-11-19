@@ -169,6 +169,81 @@ bool decode_gif(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, 
     return emit(rows, maxW, maxH, sink);
 }
 
+// An animated GIF frame by frame (kOpFrames). Each frame is decoded onto the whole canvas, blended over it unless
+// the frame overwrites, and the frame's disposal is applied before the next one, as Android's players compose them.
+// The canvas starts transparent (the background colour is not used, as on Android). A first pass reads every frame
+// header without decoding, for the frame count and the loop count.
+constexpr uint64_t kAnimMaxCanvas = 8u << 20;
+
+bool frames_gif(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink) {
+    uint32_t count = 0, loops = 0;
+    {
+        Freer<wuffs_gif__decoder> scan = {wuffs_gif__decoder__alloc()};
+        if (scan.p == nullptr) return false;
+        wuffs_base__io_buffer src = wuffs_base__ptr_u8__reader(const_cast<uint8_t*>(data), size, true);
+        wuffs_base__image_config ic = {};
+        if (!ok(wuffs_gif__decoder__decode_image_config(scan.p, &ic, &src))) return false;
+        wuffs_base__frame_config fc = {};
+        while (count < kMaxFrames && ok(wuffs_gif__decoder__decode_frame_config(scan.p, &fc, &src))) count++;
+        loops = wuffs_gif__decoder__num_animation_loops(scan.p);
+    }
+    if (count == 0) return false;
+    Freer<wuffs_gif__decoder> dec = {wuffs_gif__decoder__alloc()};
+    if (dec.p == nullptr) return false;
+    wuffs_base__io_buffer src = wuffs_base__ptr_u8__reader(const_cast<uint8_t*>(data), size, true);
+    wuffs_base__image_config ic = {};
+    if (!ok(wuffs_gif__decoder__decode_image_config(dec.p, &ic, &src))) return false;
+    uint32_t w = wuffs_base__pixel_config__width(&ic.pixcfg), h = wuffs_base__pixel_config__height(&ic.pixcfg);
+    if (w == 0 || h == 0 || w > kMaxDimension || h > kMaxDimension) return false;
+    if (static_cast<uint64_t>(w) * h > kAnimMaxCanvas) return false;
+    wuffs_base__pixel_config__set(&ic.pixcfg, WUFFS_BASE__PIXEL_FORMAT__RGBA_NONPREMUL,
+                                  WUFFS_BASE__PIXEL_SUBSAMPLING__NONE, w, h);
+    size_t stride = static_cast<size_t>(w) * 4, bytes = stride * h;
+    Freer<uint8_t> canvas = {static_cast<uint8_t*>(arena_calloc(bytes, 1))};
+    Freer<uint8_t> previous = {nullptr};  // for RESTORE_PREVIOUS, made when a frame first asks for it
+    if (canvas.p == nullptr) return false;
+    wuffs_base__pixel_buffer pb = {};
+    if (!ok(wuffs_base__pixel_buffer__set_from_slice(&pb, &ic.pixcfg, wuffs_base__make_slice_u8(canvas.p, bytes)))) {
+        return false;
+    }
+    wuffs_base__range_ii_u64 wb = wuffs_gif__decoder__workbuf_len(dec.p);
+    if (wb.max_incl > (16u << 20)) return false;
+    Freer<uint8_t> work = {static_cast<uint8_t*>(arena_alloc(std::max<size_t>(wb.max_incl, 1)))};
+    if (work.p == nullptr) return false;
+    FramesOut out = {};
+    if (!frames_begin(&out, w, h, count, loops, maxW, maxH, sink)) {
+        arena_free(out.row);
+        return false;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        wuffs_base__frame_config fc = {};
+        if (!ok(wuffs_gif__decoder__decode_frame_config(dec.p, &fc, &src))) return false;
+        wuffs_base__rect_ie_u32 r = wuffs_base__frame_config__bounds(&fc);
+        uint32_t x0 = std::min(r.min_incl_x, w), y0 = std::min(r.min_incl_y, h);
+        uint32_t x1 = std::min(r.max_excl_x, w), y1 = std::min(r.max_excl_y, h);
+        wuffs_base__animation_disposal disposal = wuffs_base__frame_config__disposal(&fc);
+        if (disposal == WUFFS_BASE__ANIMATION_DISPOSAL__RESTORE_PREVIOUS) {
+            if (previous.p == nullptr) previous.p = static_cast<uint8_t*>(arena_alloc(bytes));
+            if (previous.p == nullptr) return false;
+            memcpy(previous.p, canvas.p, bytes);
+        }
+        wuffs_base__pixel_blend blend = wuffs_base__frame_config__overwrite_instead_of_blend(&fc)
+                                                ? WUFFS_BASE__PIXEL_BLEND__SRC
+                                                : WUFFS_BASE__PIXEL_BLEND__SRC_OVER;
+        wuffs_base__status st = wuffs_gif__decoder__decode_frame(
+                dec.p, &pb, &src, blend, wuffs_base__make_slice_u8(work.p, wb.max_incl), nullptr);
+        if (!frame_done(st)) return false;
+        uint64_t ms = wuffs_base__frame_config__duration(&fc) / WUFFS_BASE__FLICKS_PER_MILLISECOND;
+        if (!frames_put(&out, canvas.p, stride, frame_millis(ms), false)) return false;
+        if (disposal == WUFFS_BASE__ANIMATION_DISPOSAL__RESTORE_BACKGROUND) {
+            for (uint32_t y = y0; y < y1; y++) memset(canvas.p + stride * y + x0 * 4, 0, (x1 - x0) * 4u);
+        } else if (disposal == WUFFS_BASE__ANIMATION_DISPOSAL__RESTORE_PREVIOUS) {
+            memcpy(canvas.p, previous.p, bytes);
+        }
+    }
+    return frames_done(&out);
+}
+
 bool decode_bmp(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly,
                 uint32_t* outW, uint32_t* outH) {
     Freer<wuffs_bmp__decoder> dec = {wuffs_bmp__decoder__alloc()};

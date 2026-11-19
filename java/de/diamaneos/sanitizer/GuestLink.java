@@ -48,6 +48,10 @@ final class GuestLink implements Closeable {
     static final int META_MAGIC = 0x31304d44; // "DM01"
 
     static final int OP_PING = 1;
+    static final int OP_FRAMES = 6; // an animation: every frame, its duration and the loop count (vm/proto.h)
+    static final int MAX_FRAMES = 1024;
+    static final int MAX_FRAME_MILLIS = 65535;
+    static final int MAX_FRAMES_BYTES = 32 << 20;
     static final int OP_PROBE = 2;
     static final int OP_THUMBNAIL = 3;
     static final int OP_METADATA = 4;
@@ -167,7 +171,9 @@ final class GuestLink implements Closeable {
         int width;
         int height;
         int extra; // probe: animated, thumbnail: rotation
-        int colorSpace; // thumbnail: COLOR_SRGB or COLOR_DISPLAY_P3 (vm/proto.h ColorSpace)
+        int colorSpace; // thumbnail and frames: COLOR_SRGB or COLOR_DISPLAY_P3 (vm/proto.h ColorSpace)
+        int loops; // frames: how often the animation plays, 0 forever
+        int[] durations; // frames: each frame's time in milliseconds, pixels holds the frames one after another
         byte[] pixels; // thumbnail
         Meta meta; // metadata
         long reserved; // budget taken for the pixels, given back by whoever ran the call
@@ -273,6 +279,11 @@ final class GuestLink implements Closeable {
         return call(op, arg0, arg1, src, deadlineMillis, true);
     }
 
+    /** An animation's frames, each fitting maxWidth x maxHeight (GIF and WebP). */
+    Answer frames(byte[] file, int len, int maxWidth, int maxHeight, long deadlineMillis) throws IOException {
+        return call(OP_FRAMES, maxWidth, maxHeight, file, len, 0, deadlineMillis);
+    }
+
     /** Test builds only: the VM's test image answers with a 1x1 or 2x1 thumbnail or fails, see vm/decoder_vm.cpp. */
     Answer hook(int hook, long deadlineMillis) throws IOException {
         return call(OP_HOOK, hook, 0, null, 0, 0, deadlineMillis);
@@ -340,7 +351,7 @@ final class GuestLink implements Closeable {
             check(magic == REPLY_MAGIC, "reply header");
             // Only a thumbnail's pixels have a colour space other than sRGB.
             check(a.colorSpace == COLOR_SRGB || (a.colorSpace == COLOR_DISPLAY_P3 && a.status == OK
-                    && (op == OP_THUMBNAIL || op == OP_HOOK)), "colour space");
+                    && (op == OP_THUMBNAIL || op == OP_HOOK || op == OP_FRAMES)), "colour space");
             if (mOnReply != null) {
                 Runnable r = mOnReply;
                 mOnReply = null;
@@ -412,6 +423,51 @@ final class GuestLink implements Closeable {
                     a.reserved = held;
                     held = 0;
                     return a;
+                case OP_FRAMES: {
+                    check(a.format == FORMAT_GIF || a.format == FORMAT_WEBP, "frames format");
+                    checkSize(a.width, a.height, arg0, arg1);
+                    int count = a.extra;
+                    long frame = (long) a.width * a.height * 4;
+                    long total = 4 + count * (4 + frame);
+                    check(count >= 1 && count <= MAX_FRAMES && total <= MAX_FRAMES_BYTES && payload == total,
+                            "frames length");
+                    if (mBudget != null && !mBudget.reserve(mLane, payload)) {
+                        drain(payload, deadline);
+                        ByteBuffer frameSkipped = readExact(END_BYTES, deadline);
+                        check(frameSkipped.getInt() == END_MAGIC, "end");
+                        Answer noRoom = new Answer();
+                        noRoom.status = INTERNAL;
+                        noRoom.noBudget = true;
+                        return noRoom;
+                    }
+                    held = mBudget != null ? payload : 0;
+                    // Straight into the frames: the pixels are held once, never twice.
+                    int loops = readExact(4, deadline).getInt();
+                    int[] durations = new int[count];
+                    byte[] framePixels = new byte[(int) (count * frame)];
+                    for (int i = 0; i < count; i++) {
+                        durations[i] = readExact(4, deadline).getInt();
+                        readInto(framePixels, (int) (i * frame), (int) frame, deadline);
+                    }
+                    ByteBuffer fe = readExact(END_BYTES, deadline);
+                    check(fe.getInt() == END_MAGIC, "end");
+                    int frameEnd = fe.getInt();
+                    if (frameEnd == INVALID || frameEnd == INTERNAL || frameEnd == BUSY || frameEnd == BIG_LANE) {
+                        Answer failed = new Answer();
+                        failed.status = frameEnd;
+                        return failed;
+                    }
+                    check(frameEnd == OK, "end status " + frameEnd);
+                    check(loops >= 0 && loops <= 65535, "loops");
+                    for (int d : durations) check(d >= 0 && d <= MAX_FRAME_MILLIS, "frame duration");
+                    checkPremultiplied(framePixels);
+                    a.loops = loops;
+                    a.durations = durations;
+                    a.pixels = framePixels;
+                    a.reserved = held;
+                    held = 0;
+                    return a;
+                }
                 case OP_METADATA:
                     checkFormat(a.format);
                     checkSize(a.width, a.height, MAX_DIMENSION, MAX_DIMENSION);
@@ -454,6 +510,16 @@ final class GuestLink implements Closeable {
         int endStatus = e.getInt();
         check(magic == END_MAGIC, "end");
         check(endStatus == status, "end status " + endStatus);
+    }
+
+    private void readInto(byte[] b, int off, int n, long deadline) throws IOException {
+        int got = 0;
+        while (got < n) {
+            int k = mChannel.read(b, off + got, n - got, deadline);
+            if (k <= 0) throw new ProtocolException("stream ended after " + got + " of " + n);
+            got += k;
+            mReplied = true;
+        }
     }
 
     private ByteBuffer readExact(int n, long deadline) throws IOException {

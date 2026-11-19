@@ -45,6 +45,7 @@ import java.util.concurrent.TimeUnit;
 
 import de.diamaneos.sanitizer.decode.DecodeChecks;
 import de.diamaneos.sanitizer.decode.DecodeRequest;
+import de.diamaneos.sanitizer.decode.Frames;
 import de.diamaneos.sanitizer.decode.IDecodeService;
 import de.diamaneos.sanitizer.decode.ImageInfo;
 import de.diamaneos.sanitizer.decode.MetadataRecord;
@@ -535,6 +536,7 @@ public class SelfTestActivity extends Activity {
                     + m.exposureTime + "' doc '" + m.documentId + "'");
         }
         colourCheck(s, new File(images, "p3-chart.jpg"));
+        framesCheck(s, new File(images, "anim.gif"));
         Thumbnail bad = s.decodeThumbnail(request(photo), 0, 10);
         if (bad.status == IDecodeService.STATUS_INVALID) {
             pass("binder refuses a zero box", "");
@@ -605,6 +607,36 @@ public class SelfTestActivity extends Activity {
                     + String.format(java.util.Locale.ROOT, "%.2f", worst) + " levels");
         } else {
             fail("binder colour", "largest patch difference " + worst + " levels");
+        }
+    }
+
+    /** An animated GIF frame by frame through the service: five checked frames with their times. */
+    private void framesCheck(IDecodeService s, File gif) throws Exception {
+        if (!gif.exists()) {
+            pass("binder frames", "skipped, no " + gif);
+            return;
+        }
+        Frames f = s.decodeFrames(request(gif), 512, 512);
+        String broken = DecodeChecks.check(f, 512, 512);
+        if (broken != null || f.status != IDecodeService.STATUS_OK || f.frameCount != 5) {
+            fail("binder frames", "frames " + broken + " status " + f.status + " count " + f.frameCount);
+            return;
+        }
+        int rows = f.frameCount * f.height;
+        long total = 0;
+        for (int i = 0; i * f.stripeRows < rows; i++) {
+            byte[] stripe = s.readStripe(f.handle, i);
+            if (DecodeChecks.check(f, i, stripe) != null) {
+                fail("binder frames", "stripe " + i);
+                return;
+            }
+            total += stripe.length;
+        }
+        s.release(f.handle);
+        if (total == (long) rows * f.width * 4) {
+            pass("binder frames", f.frameCount + " frames of " + f.width + "x" + f.height + ", loops " + f.loopCount);
+        } else {
+            fail("binder frames", "total " + total);
         }
     }
 

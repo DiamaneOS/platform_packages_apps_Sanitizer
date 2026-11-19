@@ -151,6 +151,7 @@ public final class HostChecks {
                     case GuestLink.OP_THUMBNAIL: result = link.thumbnail(file, file.length, maxW, maxH, deadline);
                         break;
                     case GuestLink.OP_METADATA: result = link.metadata(file, file.length, deadline); break;
+                    case GuestLink.OP_FRAMES: result = link.frames(file, file.length, maxW, maxH, deadline); break;
                     default: result = link.probe(file, file.length, deadline); break;
                 }
             } catch (IOException e) {
@@ -213,6 +214,21 @@ public final class HostChecks {
             return clean && a.pixels == null && a.meta == null ? null : "bad failure answer " + a.status;
         }
         if (a.format < GuestLink.FORMAT_JPEG || a.format > GuestLink.FORMAT_WBMP) return "format";
+        if (op == GuestLink.OP_FRAMES) {
+            if (a.format != GuestLink.FORMAT_GIF && a.format != GuestLink.FORMAT_WEBP) return "frames format";
+            if (a.width < 1 || a.height < 1 || a.width > maxW || a.height > maxH) return "size";
+            if (a.extra < 1 || a.extra > GuestLink.MAX_FRAMES || a.durations == null || a.durations.length != a.extra) {
+                return "frame count";
+            }
+            if (a.pixels == null || a.pixels.length != (long) a.extra * a.width * a.height * 4) return "pixel length";
+            if (a.pixels.length > GuestLink.MAX_FRAMES_BYTES) return "too many bytes";
+            for (int d : a.durations) if (d < 0 || d > GuestLink.MAX_FRAME_MILLIS) return "duration";
+            for (int i = 0; i < a.pixels.length; i += 4) {
+                int al = a.pixels[i + 3] & 0xff;
+                for (int c = 0; c < 3; c++) if ((a.pixels[i + c] & 0xff) > al) return "colour above alpha";
+            }
+            return null;
+        }
         if (op == GuestLink.OP_THUMBNAIL) {
             boolean turned = a.extra == 90 || a.extra == 270;
             if (a.extra != 0 && a.extra != 180 && !turned) return "rotation";
@@ -275,6 +291,30 @@ public final class HostChecks {
                 GuestLink.OP_THUMBNAIL);
         expectRefused("colour space on a failure", (in, out) -> out.write(cat(reply(R, 3, 0, 0, 0, 0, 0, 1),
                 end(3))), GuestLink.OP_THUMBNAIL);
+        // Frames: two 1x1 frames with their times and a loop count, checked like a thumbnail's pixels.
+        byte[] two = ByteBuffer.allocate(4 + 2 * 8).order(ByteOrder.LITTLE_ENDIAN).putInt(3).putInt(100)
+                .put(new byte[] {1, 2, 3, 4}).putInt(40).put(new byte[] {5, 6, 7, 8}).array();
+        Object fr = stub((in, out) -> out.write(cat(reply(R, 0, GuestLink.FORMAT_GIF, 1, 1, 2, two.length), two,
+                end(0))), GuestLink.OP_FRAMES, 2, 1, 2000);
+        if (fr instanceof GuestLink.Answer && ((GuestLink.Answer) fr).loops == 3
+                && java.util.Arrays.equals(((GuestLink.Answer) fr).durations, new int[] {100, 40})
+                && broken(fr, GuestLink.OP_FRAMES, 2, 1) == null) {
+            pass("stub frames", "");
+        } else {
+            fail("stub frames", String.valueOf(fr));
+        }
+        byte[] slow = two.clone();
+        ByteBuffer.wrap(slow).order(ByteOrder.LITTLE_ENDIAN).putInt(4, 70000);
+        expectRefused("frame longer than the limit", (in, out) -> out.write(cat(reply(R, 0, GuestLink.FORMAT_GIF, 1, 1,
+                2, slow.length), slow, end(0))), GuestLink.OP_FRAMES);
+        expectRefused("frames of the wrong length", (in, out) -> out.write(cat(reply(R, 0, GuestLink.FORMAT_GIF, 1, 1,
+                3, two.length), two, end(0))), GuestLink.OP_FRAMES);
+        expectRefused("frames of a JPEG", (in, out) -> out.write(cat(reply(R, 0, GuestLink.FORMAT_JPEG, 1, 1, 2,
+                two.length), two, end(0))), GuestLink.OP_FRAMES);
+        byte[] above = two.clone();
+        above[8] = 9; // red 9 over alpha 4
+        expectRefused("frame colour above alpha", (in, out) -> out.write(cat(reply(R, 0, GuestLink.FORMAT_GIF, 1, 1,
+                2, above.length), above, end(0))), GuestLink.OP_FRAMES);
         long date = System.currentTimeMillis() - 86400000L;
         Object okm = stub((in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(3, 4, 3, 90, date, "A camera", "xmp.did:1"), end(0))), GuestLink.OP_METADATA, 0, 0, 2000);
@@ -1443,6 +1483,11 @@ public final class HostChecks {
         long ms = now() - t;
         if (a.status == GuestLink.BIG_LANE && ms < 4500) pass("small lane: a slow worker goes to the big lane", ms + " ms");
         else fail("small lane: a slow worker goes to the big lane", show(a) + ", " + ms + " ms");
+        // Animations always take the big lane.
+        byte[] gif = file(images, "r5/anim.gif");
+        a = small.frames(gif, gif.length, 64, 64, now() + 10000);
+        if (a.status == GuestLink.BIG_LANE) pass("small lane: frames go to the big lane", "");
+        else fail("small lane: frames go to the big lane", show(a));
         // seccomp's kill stays a kill there too (no detour through the big lane).
         a = small.hook(1, now() + 15000);
         if (a.status == GuestLink.INTERNAL) pass("small lane lockdown kills open", "");
@@ -1488,6 +1533,9 @@ public final class HostChecks {
         if (op.equals("probe")) {
             a = link.probe(f, Math.min(f.length, 1 << 20), now() + 45000);
             opCode = GuestLink.OP_PROBE;
+        } else if (op.equals("frames")) {
+            a = link.frames(f, f.length, bw, bh, now() + 45000);
+            opCode = GuestLink.OP_FRAMES;
         } else if (op.equals("meta")) {
             // As the service sends it: a file above the buffered cap goes as its head only.
             int len = f.length > GuestLink.MAX_BUFFERED_BYTES ? 1 << 20 : f.length;
@@ -1511,6 +1559,16 @@ public final class HostChecks {
                 case "s": if (!(a.width + "x" + a.height).equals(kv[1])) why = "size " + a.width + "x" + a.height; break;
                 case "x": if (a.extra != Integer.parseInt(kv[1])) why = "extra " + a.extra; break;
                 case "cs": if (a.colorSpace != Integer.parseInt(kv[1])) why = "colour space " + a.colorSpace; break;
+                case "n": if (a.extra != Integer.parseInt(kv[1])) why = "frames " + a.extra; break;
+                case "l": if (a.loops != Integer.parseInt(kv[1])) why = "loops " + a.loops; break;
+                case "d": {
+                    StringBuilder ds = new StringBuilder();
+                    for (int k = 0; a.durations != null && k < a.durations.length; k++) {
+                        ds.append(k == 0 ? "" : ",").append(a.durations[k]);
+                    }
+                    if (!ds.toString().equals(kv[1])) why = "durations " + ds;
+                    break;
+                }
                 case "sp": if (a.meta == null || a.meta.specialFormat != Integer.parseInt(kv[1])) why = "special"; break;
                 case "o": if (a.meta == null || a.meta.orientation != Integer.parseInt(kv[1])) {
                         why = "orientation " + (a.meta == null ? "none" : a.meta.orientation);
@@ -1520,7 +1578,26 @@ public final class HostChecks {
             }
         }
         String dump = System.getenv("FORMAT_DUMP");
-        if (dump != null && a.status == 0 && a.pixels != null) {
+        if (dump != null && a.status == 0 && a.pixels != null && opCode == GuestLink.OP_FRAMES) {
+            // Test runs only: every frame as a PNG (straight alpha), for compare-frames.py.
+            int frameBytes = a.width * a.height * 4;
+            for (int fi = 0; fi < a.extra; fi++) {
+                java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(a.width, a.height,
+                        java.awt.image.BufferedImage.TYPE_INT_ARGB);
+                for (int i = 0; i < a.width * a.height; i++) {
+                    int o = fi * frameBytes + i * 4;
+                    int al = a.pixels[o + 3] & 0xff;
+                    int[] c = new int[3];
+                    for (int k = 0; k < 3; k++) {
+                        int v = a.pixels[o + k] & 0xff;
+                        c[k] = al == 0 ? 0 : Math.min(255, (v * 255 + al / 2) / al);
+                    }
+                    img.setRGB(i % a.width, i / a.width, al << 24 | c[0] << 16 | c[1] << 8 | c[2]);
+                }
+                javax.imageio.ImageIO.write(img, "png", new java.io.File(dump,
+                        name.replace('/', '_') + "-" + bw + "x" + bh + "-f" + fi + ".png"));
+            }
+        } else if (dump != null && a.status == 0 && a.pixels != null) {
             // Test runs only: the thumbnail as a PNG (straight alpha) for comparison with a reference decoder.
             java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(a.width, a.height,
                     java.awt.image.BufferedImage.TYPE_INT_ARGB);

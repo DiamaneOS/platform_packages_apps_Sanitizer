@@ -113,6 +113,26 @@ void scaler_free(Scaler* s);
 bool scaler_push(Scaler* s, uint8_t* row);
 bool scaler_done(const Scaler* s);
 
+// Animations (kOpFrames): a decoder calls frames_begin once with its canvas size, frame count and loop count, then
+// frames_put once per frame with the whole composed canvas as it is shown (straight RGBA unless premultiplied), which
+// is left unchanged. Every frame goes out at the same size, fitted into the box and scaled down further until all
+// frames fit kMaxFramesBytes.
+struct FramesOut {
+    uint32_t cw, ch, ow, oh, count, sent;
+    uint8_t* row;
+    Sink* sink;
+};
+bool frames_begin(FramesOut* f, uint32_t cw, uint32_t ch, uint32_t count, uint32_t loops, uint32_t maxW,
+                  uint32_t maxH, Sink* sink);
+bool frames_put(FramesOut* f, const uint8_t* canvas, size_t stride, uint32_t durationMs, bool premultiplied);
+bool frames_done(FramesOut* f);  // every frame sent, the output flushed, the row freed
+// A frame's duration as Android's players show it: a delay under 20 ms (often 0) plays as 100 ms.
+uint32_t frame_millis(uint64_t ms);
+
+using FramesFn = bool (*)(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink);
+bool frames_gif(const uint8_t*, size_t, uint32_t, uint32_t, Sink*);   // fmt_wuffs.cpp
+bool frames_webp(const uint8_t*, size_t, uint32_t, uint32_t, Sink*);  // fmt_webp.cpp
+
 // Fits the image into the box, sends the header and sets up the scaler: the common start of every decoder's pixels.
 bool start_output(Scaler* s, uint32_t iw, uint32_t ih, uint32_t maxW, uint32_t maxH, Sink* sink);
 

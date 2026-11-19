@@ -27,6 +27,7 @@ import android.util.Log;
 
 import de.diamaneos.sanitizer.decode.DecodeChecks;
 import de.diamaneos.sanitizer.decode.DecodeRequest;
+import de.diamaneos.sanitizer.decode.Frames;
 import de.diamaneos.sanitizer.decode.IDecodeService;
 import de.diamaneos.sanitizer.decode.ImageInfo;
 import de.diamaneos.sanitizer.decode.MetadataRecord;
@@ -288,6 +289,19 @@ public final class DecodeService extends Service {
         }
 
         @Override
+        public Frames decodeFrames(DecodeRequest request, int maxWidth, int maxHeight) {
+            checkCaller();
+            try {
+                return frames(request, maxWidth, maxHeight, Binder.getCallingUid());
+            } catch (Throwable t) {
+                Log.e(TAG, "decodeFrames", t);
+                Frames f = new Frames();
+                f.status = IDecodeService.STATUS_UNAVAILABLE;
+                return f;
+            }
+        }
+
+        @Override
         public byte[] readStripe(long handle, int index) {
             checkCaller();
             try {
@@ -373,6 +387,52 @@ public final class DecodeService extends Service {
             }
         }
         return t;
+    }
+
+    // An animation's frames, held as one tall image (frame after frame) behind a handle, read in stripes like a
+    // thumbnail.
+    private Frames frames(DecodeRequest request, int maxWidth, int maxHeight, int uid) {
+        Frames f = new Frames();
+        if (maxWidth < 1 || maxHeight < 1 || maxWidth > GuestLink.MAX_DIMENSION
+                || maxHeight > GuestLink.MAX_DIMENSION) {
+            f.status = IDecodeService.STATUS_INVALID;
+            return f;
+        }
+        Decoder.Request r = run(request, GuestLink.OP_FRAMES, maxWidth, maxHeight);
+        f.status = status(r.status);
+        if (f.status != IDecodeService.STATUS_OK) return f;
+        GuestLink.Answer a = r.answer;
+        synchronized (mHandles) {
+            expire();
+            int held = 0;
+            for (Held h : mHandles.values()) if (h.uid == uid) held++;
+            if (held >= MAX_HANDLES_PER_UID || !mDecoder.reserve("uid:" + uid, a.pixels.length)) {
+                f.status = IDecodeService.STATUS_UNAVAILABLE;
+                return f;
+            }
+            f.width = a.width;
+            f.height = a.height;
+            f.frameCount = a.extra;
+            f.loopCount = a.loops;
+            f.durations = a.durations.clone();
+            f.colorSpace = a.colorSpace;
+            f.stripeRows = Math.min(a.height * a.extra, Math.max(1, IDecodeService.MAX_STRIPE_BYTES / (a.width * 4)));
+            long handle;
+            do {
+                handle = mRandom.nextLong();
+            } while (handle == 0 || mHandles.containsKey(handle));
+            mHandles.put(handle, new Held(uid, a.pixels, a.width, a.height * a.extra, f.stripeRows,
+                    SystemClock.uptimeMillis() + IDecodeService.HANDLE_TIMEOUT_MILLIS));
+            mExpiry.postDelayed(mExpireTask, IDecodeService.HANDLE_TIMEOUT_MILLIS + 100);
+            f.handle = handle;
+            if (DecodeChecks.check(f, maxWidth, maxHeight) != null) {
+                drop(handle, mHandles.get(handle));
+                Frames bad = new Frames();
+                bad.status = IDecodeService.STATUS_INVALID;
+                return bad;
+            }
+        }
+        return f;
     }
 
     // With mHandles held.

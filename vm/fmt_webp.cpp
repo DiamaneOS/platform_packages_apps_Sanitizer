@@ -196,6 +196,53 @@ bool decode_webp(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
                            : decode_still(data, size, f, maxW, maxH, sink);
 }
 
+// An animated WebP frame by frame (kOpFrames): libwebp's animation decoder composes each frame onto the canvas
+// (blending, disposal) as Android's players show it, and gives its end time.
+bool frames_webp(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink) {
+    webp_colour(data, size);
+    WebPData wd = {data, size};
+    WebPAnimDecoderOptions opt;
+    if (!WebPAnimDecoderOptionsInit(&opt)) return false;
+    opt.color_mode = MODE_rgbA;
+    opt.use_threads = 0;
+    // The canvas size is checked before the decoder allocates it (two canvases of 4 bytes a pixel).
+    WebPDemuxer* dmx = WebPDemux(&wd);
+    if (dmx == nullptr) return false;
+    uint64_t cw = WebPDemuxGetI(dmx, WEBP_FF_CANVAS_WIDTH), ch = WebPDemuxGetI(dmx, WEBP_FF_CANVAS_HEIGHT);
+    WebPDemuxDelete(dmx);
+    if (cw == 0 || ch == 0 || cw > kMaxDimension || ch > kMaxDimension || cw * ch > kWebpFrameMaxPixels ||
+        !fits(cw * ch * 8)) {
+        return false;
+    }
+    struct Closer {
+        WebPAnimDecoder* d;
+        ~Closer() { WebPAnimDecoderDelete(d); }
+    } dec = {WebPAnimDecoderNew(&wd, &opt)};
+    if (dec.d == nullptr) return false;
+    WebPAnimInfo info;
+    if (!WebPAnimDecoderGetInfo(dec.d, &info) || info.canvas_width != cw || info.canvas_height != ch ||
+        info.frame_count == 0) {
+        return false;
+    }
+    uint32_t count = std::min<uint32_t>(info.frame_count, kMaxFrames);
+    FramesOut out = {};
+    if (!frames_begin(&out, static_cast<uint32_t>(cw), static_cast<uint32_t>(ch), count, info.loop_count, maxW,
+                      maxH, sink)) {
+        arena_free(out.row);
+        return false;
+    }
+    int previous = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t* canvas = nullptr;
+        int timestamp = 0;
+        if (!WebPAnimDecoderHasMoreFrames(dec.d) || !WebPAnimDecoderGetNext(dec.d, &canvas, &timestamp)) return false;
+        uint64_t ms = timestamp > previous ? static_cast<uint64_t>(timestamp - previous) : 0;
+        previous = timestamp;
+        if (!frames_put(&out, canvas, static_cast<size_t>(cw) * 4, frame_millis(ms), true)) return false;
+    }
+    return frames_done(&out);
+}
+
 bool warm_up_webp() {
     uint8_t out[16 * 16 * 4];
     bool ok = true;

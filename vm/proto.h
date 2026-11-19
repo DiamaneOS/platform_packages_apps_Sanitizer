@@ -43,6 +43,7 @@ enum Op : uint32_t {
     kOpThumbnail = 3,  // pixels fitting arg0 x arg1, payload width * height * 4 premultiplied RGBA
     kOpMetadata = 4,   // payload: one Meta record
     kOpHook = 5,       // test builds only: arg0 selects a lockdown hook
+    kOpFrames = 6,     // an animation (GIF, WebP): every frame fitting arg0 x arg1, see kMaxFrames
 };
 
 enum Status : int32_t {
@@ -84,6 +85,14 @@ constexpr uint32_t kMaxInputBytes = 256u << 20;
 constexpr uint32_t kMaxBufferedBytes = 32u << 20;
 constexpr uint32_t kMaxDimension = 65535;
 constexpr uint32_t kMaxPixels = 8u << 20;
+
+// An animation's frames (kOpFrames): Reply.width x height is every frame's size, Reply.extra the number of frames, at
+// most kMaxFrames, and the payload is the loop count (4 bytes, 0: forever), then per frame its duration in
+// milliseconds (4 bytes, at most kMaxFrameMillis) and its premultiplied RGBA pixels, each frame composed onto the whole
+// canvas as it is shown. The payload is at most kMaxFramesBytes: the worker scales the frames down until they fit.
+constexpr uint32_t kMaxFrames = 1024;
+constexpr uint32_t kMaxFrameMillis = 65535;
+constexpr uint32_t kMaxFramesBytes = 32u << 20;
 
 struct Request {
     uint32_t magic;

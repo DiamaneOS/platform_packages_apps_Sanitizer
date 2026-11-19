@@ -405,6 +405,66 @@ bool scaler_done(const Scaler* s) {
     return s->y == s->ih && s->p == s->oh;
 }
 
+uint32_t frame_millis(uint64_t ms) {
+    return ms < 20 ? 100 : static_cast<uint32_t>(std::min<uint64_t>(ms, kMaxFrameMillis));
+}
+
+bool frames_begin(FramesOut* f, uint32_t cw, uint32_t ch, uint32_t count, uint32_t loops, uint32_t maxW,
+                  uint32_t maxH, Sink* sink) {
+    *f = {cw, ch, 0, 0, count, 0, nullptr, sink};
+    if (cw == 0 || ch == 0 || count == 0 || count > kMaxFrames) return false;
+    fit_box(cw, ch, maxW, maxH, &f->ow, &f->oh);
+    // All frames within kMaxFramesBytes: the loop count, then per frame its duration and its pixels.
+    uint64_t perFrame = (kMaxFramesBytes - 4) / count - 4;
+    while (static_cast<uint64_t>(f->ow) * f->oh * 4 > perFrame && (f->ow > 1 || f->oh > 1)) {
+        double s = std::sqrt(static_cast<double>(perFrame) / (static_cast<double>(f->ow) * f->oh * 4));
+        uint32_t w = std::max<uint32_t>(1, static_cast<uint32_t>(f->ow * s));
+        uint32_t h = std::max<uint32_t>(1, static_cast<uint32_t>(f->oh * s));
+        if (w == f->ow && h == f->oh) {
+            w = std::max<uint32_t>(1, w - 1);
+            h = std::max<uint32_t>(1, h - 1);
+        }
+        f->ow = w;
+        f->oh = h;
+    }
+    if (static_cast<uint64_t>(f->ow) * f->oh * 4 > perFrame) return false;
+    f->row = static_cast<uint8_t*>(arena_alloc(static_cast<size_t>(cw) * 4));
+    if (f->row == nullptr) return false;
+    uint8_t hdr[24] = {'D', 'S', 'F', '1'};
+    put_le32(hdr + 4, f->ow);
+    put_le32(hdr + 8, f->oh);
+    put_le32(hdr + 12, count);
+    put_le32(hdr + 16, std::min<uint32_t>(loops, 65535));
+    put_le32(hdr + 20, gColorSpace);
+    return sink_put(sink, hdr, sizeof(hdr)) && sink_flush(sink);
+}
+
+bool frames_put(FramesOut* f, const uint8_t* canvas, size_t stride, uint32_t durationMs, bool premultiplied) {
+    if (f->sent >= f->count) return false;
+    uint8_t d[4];
+    put_le32(d, std::min(durationMs, kMaxFrameMillis));
+    if (!sink_put(f->sink, d, sizeof(d))) return false;
+    Scaler s = {};
+    if (!scaler_init(&s, f->cw, f->ch, f->ow, f->oh, f->sink)) return false;
+    s.premultiplied = premultiplied;
+    bool ok = true;
+    for (uint32_t y = 0; y < f->ch && ok; y++) {
+        // The scaler changes its rows (colour, premultiplication), and the canvas carries on to the next frame.
+        memcpy(f->row, canvas + stride * y, static_cast<size_t>(f->cw) * 4);
+        ok = scaler_push(&s, f->row);
+    }
+    ok = ok && scaler_done(&s);
+    scaler_free(&s);
+    f->sent++;
+    return ok;
+}
+
+bool frames_done(FramesOut* f) {
+    arena_free(f->row);
+    f->row = nullptr;
+    return f->sent == f->count && sink_flush(f->sink);
+}
+
 bool start_output(Scaler* s, uint32_t iw, uint32_t ih, uint32_t maxW, uint32_t maxH, Sink* sink) {
     uint32_t ow, oh;
     fit_box(iw, ih, maxW, maxH, &ow, &oh);
@@ -1318,6 +1378,15 @@ constexpr size_t kPrefixBytes = 1u << 20;
         if (!decode(0, 0, true, &m->width, &m->height)) worker_exit(failed());
         worker_exit(write_all(0, m, sizeof(*m)) ? kExitOk : kExitDecodeFailed);
     }
+    if (rq.op == kOpFrames) {
+        // An animation, frame by frame: GIF and WebP, as Android's pickers play them. Never turned or mirrored.
+        FramesFn fn = format == kFormatGif ? frames_gif : format == kFormatWebp ? frames_webp : nullptr;
+        if (fn == nullptr) {
+            gOutcome.unsupported = true;
+            worker_exit(failed());
+        }
+        worker_exit(fn(data, size, rq.arg0, rq.arg1, &sink) ? kExitOk : failed());
+    }
     // Thumbnail: the rotation and the mirror come from the file's orientation (EXIF, or HEIF's irot and imir), read
     // first.
     bool mirror = false;
@@ -1794,6 +1863,80 @@ bool retry_busy(Ended e, const Request& rq, uint32_t format, Worker* w) {
     return start_worker(rq, format, gRetryInput, rq.inputLen, false, w);
 }
 
+// An animation's frames (kOpFrames): the worker's header, checked, then the loop count, and per frame its duration
+// and its pixels, every one checked as it passes. A worker that fails or breaks a rule part way gets the rest of the
+// promised length as zeros and the trailer's verdict, as for a thumbnail.
+bool serve_frames(int c, const Request& rq, uint32_t format, Worker* w) {
+    uint8_t hdr[24];
+    ssize_t n = worker_read(w, hdr, sizeof(hdr), w->deadline, kIdleMs);
+    if (n != static_cast<ssize_t>(sizeof(hdr))) {
+        Ended e = end_worker(w, true);
+        if (retry_busy(e, rq, format, w)) return serve_worker(c, rq, format, false, w);
+        return send_failure(c, status_of(e));
+    }
+    uint32_t fw = le32(hdr + 4), fh = le32(hdr + 8), count = le32(hdr + 12), loops = le32(hdr + 16);
+    uint32_t cs = le32(hdr + 20);
+    uint64_t frame = static_cast<uint64_t>(fw) * fh * 4;
+    uint64_t total = 4 + static_cast<uint64_t>(count) * (4 + frame);
+    if (memcmp(hdr, "DSF1", 4) != 0 || fw == 0 || fh == 0 || fw > rq.arg0 || fh > rq.arg1 || count == 0 ||
+        count > kMaxFrames || loops > 65535 || (cs != kColorSrgb && cs != kColorDisplayP3) ||
+        total > kMaxFramesBytes) {
+        end_worker(w, true);
+        return send_failure(c, kInvalid);
+    }
+    uint8_t loopBytes[4];
+    put_le32(loopBytes, loops);
+    if (!send_reply(c, kOk, format, fw, fh, count, static_cast<uint32_t>(total), cs) ||
+        !write_all(c, loopBytes, sizeof(loopBytes))) {
+        end_worker(w, true);
+        return false;
+    }
+    uint64_t left = total - 4;
+    auto fail = [&](int32_t verdict) {
+        wipe(gStripe, sizeof(gStripe));
+        while (left > 0) {
+            size_t k = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), left));
+            if (!write_all(c, gStripe, k)) return false;
+            left -= k;
+        }
+        return send_end(c, verdict);
+    };
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t d[4];
+        ssize_t got = worker_read(w, d, sizeof(d), w->deadline, kIdleMs);
+        if (got != static_cast<ssize_t>(sizeof(d)) || le32(d) > kMaxFrameMillis) {
+            bool bad = got == static_cast<ssize_t>(sizeof(d));
+            Ended e = end_worker(w, true);
+            return fail(bad ? kInvalid : late_status(e));
+        }
+        if (!write_all(c, d, sizeof(d))) {
+            end_worker(w, true);
+            return false;
+        }
+        left -= sizeof(d);
+        uint64_t px = frame;
+        while (px > 0) {
+            size_t want = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), px));
+            got = worker_read(w, gStripe, want, w->deadline, kIdleMs);
+            if (got != static_cast<ssize_t>(want) || !premultiplied(gStripe, want)) {
+                bool bad = got == static_cast<ssize_t>(want);
+                Ended e = end_worker(w, true);
+                return fail(bad ? kInvalid : late_status(e));
+            }
+            if (!write_all(c, gStripe, want)) {
+                end_worker(w, true);
+                return false;
+            }
+            px -= want;
+            left -= want;
+        }
+    }
+    uint8_t extra;
+    ssize_t more = worker_read(w, &extra, 1, w->deadline, kIdleMs);
+    Ended e = end_worker(w, more != 0);
+    return send_end(c, more != 0 ? kInvalid : e == Ended::kClean ? kOk : late_status(e));
+}
+
 // The worker's answer to the host. Returns false when the connection must end.
 bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* w) {
     if (rq.op == kOpProbe) {
@@ -1829,6 +1972,8 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
         wipe(&m, sizeof(m));
         return sent;
     }
+
+    if (rq.op == kOpFrames) return serve_frames(c, rq, format, w);
 
     // Thumbnail (and the test hooks, which answer as a 1x1 or 2x1 thumbnail): header, exact pixels, trailer.
     uint8_t hdr[20];
@@ -1918,7 +2063,10 @@ bool serve_one(int c) {
 #else
     bool hook = false;
 #endif
-    if (rq.op != kOpPing && rq.op != kOpProbe && rq.op != kOpThumbnail && rq.op != kOpMetadata && !hook) return false;
+    if (rq.op != kOpPing && rq.op != kOpProbe && rq.op != kOpThumbnail && rq.op != kOpMetadata &&
+        rq.op != kOpFrames && !hook) {
+        return false;
+    }
     // A JPEG or PNG thumbnail of a file larger than kMaxBufferedBytes streams: the file goes to the worker as it
     // arrives and is never held whole. Everything else is read into a memory file first, at most kMaxBufferedBytes,
     // so its metadata is read from the whole file.
@@ -1927,13 +2075,13 @@ bool serve_one(int c) {
     int32_t refuse = -1;
     if (rq.op == kOpPing) {
         refuse = kOk;
-    } else if (gSmallLane && (streamed || rq.inputLen > kSmallInputBytes)) {
+    } else if (gSmallLane && (streamed || rq.inputLen > kSmallInputBytes || rq.op == kOpFrames)) {
         refuse = kBigLane;
     } else if (!hook && format == kFormatUnknown) {
         refuse = kUnsupported;
     } else if (!streamed && rq.inputLen > kMaxBufferedBytes) {
         refuse = kInvalid;
-    } else if (rq.op == kOpThumbnail &&
+    } else if ((rq.op == kOpThumbnail || rq.op == kOpFrames) &&
                (rq.arg0 == 0 || rq.arg1 == 0 || rq.arg0 > kMaxDimension || rq.arg1 > kMaxDimension)) {
         refuse = kInvalid;
     }
