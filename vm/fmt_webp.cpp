@@ -231,13 +231,23 @@ bool frames_webp(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
         arena_free(out.row);
         return false;
     }
+    // A damaged later frame: the frames from there stay on the last good picture (a damaged first one fails).
     int previous = 0;
+    uint8_t* last = nullptr;
+    bool broken = false;
     for (uint32_t i = 0; i < count; i++) {
         uint8_t* canvas = nullptr;
         int timestamp = 0;
-        if (!WebPAnimDecoderHasMoreFrames(dec.d) || !WebPAnimDecoderGetNext(dec.d, &canvas, &timestamp)) return false;
-        uint64_t ms = timestamp > previous ? static_cast<uint64_t>(timestamp - previous) : 0;
-        previous = timestamp;
+        uint64_t ms = 0;
+        if (!broken && WebPAnimDecoderHasMoreFrames(dec.d) && WebPAnimDecoderGetNext(dec.d, &canvas, &timestamp)) {
+            ms = timestamp > previous ? static_cast<uint64_t>(timestamp - previous) : 0;
+            previous = timestamp;
+            last = canvas;
+        } else {
+            if (last == nullptr) return false;
+            broken = true;
+            canvas = last;
+        }
         if (!frames_put(&out, canvas, static_cast<size_t>(cw) * 4, frame_millis(ms), true)) return false;
     }
     return frames_done(&out);

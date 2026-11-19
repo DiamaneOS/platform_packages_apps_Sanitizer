@@ -172,7 +172,9 @@ bool decode_gif(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, 
 // An animated GIF frame by frame (kOpFrames). Each frame is decoded onto the whole canvas, blended over it unless
 // the frame overwrites, and the frame's disposal is applied before the next one, as Android's players compose them.
 // The canvas starts transparent (the background colour is not used, as on Android). A first pass reads every frame
-// header without decoding, for the frame count and the loop count.
+// header without decoding, for the frame count and the loop count. A later frame that is cut off or damaged shows
+// what was decoded of it, and the frames after it stay on that picture, as Android plays a GIF that was cut short. A
+// damaged first frame fails the animation.
 constexpr uint64_t kAnimMaxCanvas = 8u << 20;
 
 bool frames_gif(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink) {
@@ -215,9 +217,19 @@ bool frames_gif(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, 
         arena_free(out.row);
         return false;
     }
+    bool broken = false;
     for (uint32_t i = 0; i < count; i++) {
+        if (broken) {
+            if (!frames_put(&out, canvas.p, stride, frame_millis(0), false)) return false;
+            continue;
+        }
         wuffs_base__frame_config fc = {};
-        if (!ok(wuffs_gif__decoder__decode_frame_config(dec.p, &fc, &src))) return false;
+        if (!ok(wuffs_gif__decoder__decode_frame_config(dec.p, &fc, &src))) {
+            if (i == 0) return false;
+            broken = true;
+            if (!frames_put(&out, canvas.p, stride, frame_millis(0), false)) return false;
+            continue;
+        }
         wuffs_base__rect_ie_u32 r = wuffs_base__frame_config__bounds(&fc);
         uint32_t x0 = std::min(r.min_incl_x, w), y0 = std::min(r.min_incl_y, h);
         uint32_t x1 = std::min(r.max_excl_x, w), y1 = std::min(r.max_excl_y, h);
@@ -232,9 +244,13 @@ bool frames_gif(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, 
                                                 : WUFFS_BASE__PIXEL_BLEND__SRC_OVER;
         wuffs_base__status st = wuffs_gif__decoder__decode_frame(
                 dec.p, &pb, &src, blend, wuffs_base__make_slice_u8(work.p, wb.max_incl), nullptr);
-        if (!frame_done(st)) return false;
+        if (!frame_done(st)) {
+            if (i == 0) return false;
+            broken = true;  // the rows decoded so far are on the canvas
+        }
         uint64_t ms = wuffs_base__frame_config__duration(&fc) / WUFFS_BASE__FLICKS_PER_MILLISECOND;
         if (!frames_put(&out, canvas.p, stride, frame_millis(ms), false)) return false;
+        if (broken) continue;
         if (disposal == WUFFS_BASE__ANIMATION_DISPOSAL__RESTORE_BACKGROUND) {
             for (uint32_t y = y0; y < y1; y++) memset(canvas.p + stride * y + x0 * 4, 0, (x1 - x0) * 4u);
         } else if (disposal == WUFFS_BASE__ANIMATION_DISPOSAL__RESTORE_PREVIOUS) {
