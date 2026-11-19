@@ -21,6 +21,8 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.ImageDecoder;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
@@ -41,6 +43,7 @@ import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import de.diamaneos.sanitizer.decode.DecodeChecks;
 import de.diamaneos.sanitizer.decode.DecodeRequest;
 import de.diamaneos.sanitizer.decode.IDecodeService;
 import de.diamaneos.sanitizer.decode.ImageInfo;
@@ -531,6 +534,7 @@ public class SelfTestActivity extends Activity {
             fail("binder metadata", "status " + m.status + " orientation " + m.orientation + " exposure '"
                     + m.exposureTime + "' doc '" + m.documentId + "'");
         }
+        colourCheck(s, new File(images, "p3-chart.jpg"));
         Thumbnail bad = s.decodeThumbnail(request(photo), 0, 10);
         if (bad.status == IDecodeService.STATUS_INVALID) {
             pass("binder refuses a zero box", "");
@@ -538,6 +542,70 @@ public class SelfTestActivity extends Activity {
             fail("binder refuses a zero box", "status " + bad.status);
         }
         unbindService(mConnection);
+    }
+
+    /**
+     * The Display P3 chart through the service against Android's own decode in this app (test builds only): the same
+     * colour space, and every patch of a 10 x 8 grid within 3 levels. Skipped when the chart was not pushed.
+     */
+    private void colourCheck(IDecodeService s, File chart) throws Exception {
+        if (!chart.exists()) {
+            pass("binder colour", "skipped, no " + chart);
+            return;
+        }
+        Thumbnail t = s.decodeThumbnail(request(chart), 4096, 4096);
+        String broken = DecodeChecks.check(t, 4096, 4096);
+        if (broken != null || t.status != IDecodeService.STATUS_OK || t.rotation != 0) {
+            fail("binder colour", "thumbnail " + broken + " status " + t.status);
+            return;
+        }
+        byte[] frame = new byte[t.width * t.height * 4];
+        for (int i = 0; i * t.stripeRows < t.height; i++) {
+            byte[] stripe = s.readStripe(t.handle, i);
+            if (DecodeChecks.check(t, i, stripe) != null) {
+                fail("binder colour", "stripe " + i);
+                return;
+            }
+            System.arraycopy(stripe, 0, frame, i * t.stripeRows * t.width * 4, stripe.length);
+        }
+        s.release(t.handle);
+        Bitmap vm = Bitmap.createBitmap(t.width, t.height, Bitmap.Config.ARGB_8888, true, DecodeChecks.colorSpaceOf(t));
+        vm.copyPixelsFromBuffer(ByteBuffer.wrap(frame));
+        Bitmap ref = ImageDecoder.decodeBitmap(ImageDecoder.createSource(chart),
+                (d, info, src) -> d.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE));
+        if (ref.getWidth() != vm.getWidth() || ref.getHeight() != vm.getHeight()
+                || !ref.getColorSpace().equals(vm.getColorSpace())) {
+            fail("binder colour", "Android " + ref.getWidth() + "x" + ref.getHeight() + " " + ref.getColorSpace()
+                    + ", VM " + vm.getWidth() + "x" + vm.getHeight() + " " + vm.getColorSpace());
+            return;
+        }
+        ByteBuffer a = ByteBuffer.allocate(vm.getByteCount()), b = ByteBuffer.allocate(ref.getByteCount());
+        vm.copyPixelsToBuffer(a);
+        ref.copyPixelsToBuffer(b);
+        double worst = 0;
+        int w = vm.getWidth(), h = vm.getHeight();
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 10; c++) {
+                double[] sa = new double[3], sb = new double[3];
+                int n = 0;
+                for (int y = r * h / 8 + 4; y < (r + 1) * h / 8 - 4; y++) {
+                    for (int x = c * w / 10 + 4; x < (c + 1) * w / 10 - 4; x++, n++) {
+                        int i = (y * w + x) * 4;
+                        for (int k = 0; k < 3; k++) {
+                            sa[k] += a.get(i + k) & 0xff;
+                            sb[k] += b.get(i + k) & 0xff;
+                        }
+                    }
+                }
+                for (int k = 0; k < 3 && n > 0; k++) worst = Math.max(worst, Math.abs(sa[k] - sb[k]) / n);
+            }
+        }
+        if (worst <= 3) {
+            pass("binder colour", vm.getColorSpace().getName() + ", largest patch difference "
+                    + String.format(java.util.Locale.ROOT, "%.2f", worst) + " levels");
+        } else {
+            fail("binder colour", "largest patch difference " + worst + " levels");
+        }
     }
 
     private void checkThumbnail(IDecodeService s, String what, Thumbnail t, int w, int h, int rotation)
