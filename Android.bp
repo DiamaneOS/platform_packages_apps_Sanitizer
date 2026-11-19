@@ -101,6 +101,7 @@ cc_defaults {
         "vm/fmt_ico.cpp",
         "vm/fmt_webp.cpp",
         "vm/fmt_wuffs.cpp",
+        "vm/gainmap.cpp",
         "vm/meta.cpp",
     ],
     cflags: [

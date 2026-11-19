@@ -176,6 +176,29 @@ public final class HostChecks {
                 .putInt(w).putInt(h).putInt(extra).putInt(payload).putInt(colorSpace).array();
     }
 
+    // A gain block as the VM sends it (vm/proto.h kGainBlockBytes).
+    static byte[] gainBlock(int w, int h, float[] params) {
+        ByteBuffer b = ByteBuffer.allocate(GuestLink.GAIN_BLOCK_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        b.putInt(GuestLink.GAIN_MAGIC).putInt(w).putInt(h);
+        for (float v : params) b.putFloat(v);
+        return b.array();
+    }
+
+    // Sound parameters: ratios 1 to 4, gamma 1, epsilons 1/64, display ratios 1 and 4.
+    static float[] gainParams() {
+        float[] p = new float[GuestLink.GAIN_PARAMS];
+        for (int c = 0; c < 3; c++) {
+            p[c] = 1f;
+            p[3 + c] = 4f;
+            p[6 + c] = 1f;
+            p[9 + c] = 1f / 64;
+            p[12 + c] = 1f / 64;
+        }
+        p[15] = 1f;
+        p[16] = 4f;
+        return p;
+    }
+
     static byte[] end(int status) {
         return ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putInt(GuestLink.END_MAGIC).putInt(status)
                 .array();
@@ -291,6 +314,38 @@ public final class HostChecks {
                 GuestLink.OP_THUMBNAIL);
         expectRefused("colour space on a failure", (in, out) -> out.write(cat(reply(R, 3, 0, 0, 0, 0, 0, 1),
                 end(3))), GuestLink.OP_THUMBNAIL);
+        // Ultra HDR: a 2x1 thumbnail with a 1x1 gain map, its block checked before its pixels.
+        Object gm = stub((in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0, 8 + GuestLink.GAIN_BLOCK_BYTES + 4), px,
+                gainBlock(1, 1, gainParams()), new byte[] {9, 9, 9, (byte) 255}, end(0))), GuestLink.OP_THUMBNAIL, 2, 1,
+                2000);
+        if (gm instanceof GuestLink.Answer && ((GuestLink.Answer) gm).gainWidth == 1
+                && ((GuestLink.Answer) gm).gainPixels.length == 4 && ((GuestLink.Answer) gm).gainParams[3] == 4f) {
+            pass("stub thumbnail with a gain map", "");
+        } else {
+            fail("stub thumbnail with a gain map", String.valueOf(gm));
+        }
+        byte[] opaqueGain = {9, 9, 9, (byte) 255};
+        int gainPayload = 8 + GuestLink.GAIN_BLOCK_BYTES + 4;
+        byte[] badMagic = gainBlock(1, 1, gainParams());
+        badMagic[0] = 'X';
+        expectRefused("gain block without its magic", (in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0, gainPayload),
+                px, badMagic, opaqueGain, end(0))), GuestLink.OP_THUMBNAIL);
+        expectRefused("gain map taller than the image", (in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0,
+                8 + GuestLink.GAIN_BLOCK_BYTES + 8), px, gainBlock(1, 2, gainParams()), opaqueGain, opaqueGain,
+                end(0))), GuestLink.OP_THUMBNAIL);
+        expectRefused("gain map of the wrong length", (in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0,
+                8 + GuestLink.GAIN_BLOCK_BYTES + 8), px, gainBlock(1, 1, gainParams()), opaqueGain, opaqueGain,
+                end(0))), GuestLink.OP_THUMBNAIL);
+        float[] upside = gainParams();
+        upside[0] = 8f; // ratio min above ratio max
+        expectRefused("gain map parameters out of range", (in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0,
+                gainPayload), px, gainBlock(1, 1, upside), opaqueGain, end(0))), GuestLink.OP_THUMBNAIL);
+        float[] nan = gainParams();
+        nan[7] = Float.NaN;
+        expectRefused("gain map parameter not a number", (in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0,
+                gainPayload), px, gainBlock(1, 1, nan), opaqueGain, end(0))), GuestLink.OP_THUMBNAIL);
+        expectRefused("gain map not opaque", (in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0, gainPayload), px,
+                gainBlock(1, 1, gainParams()), new byte[] {9, 9, 9, 8}, end(0))), GuestLink.OP_THUMBNAIL);
         // Frames: two 1x1 frames with their times and a loop count, checked like a thumbnail's pixels.
         byte[] two = ByteBuffer.allocate(4 + 2 * 8).order(ByteOrder.LITTLE_ENDIAN).putInt(3).putInt(100)
                 .put(new byte[] {1, 2, 3, 4}).putInt(40).put(new byte[] {5, 6, 7, 8}).array();
@@ -1425,7 +1480,7 @@ public final class HostChecks {
                 && java.util.Arrays.equals(px.pixels, rgba);
         GuestLink.Answer scanMeta = link.hook(6, marker.getBytes(), marker.length(), now() + 30000);
         GuestLink.Answer scanPixels = link.hook(6, rgba, rgba.length, now() + 30000);
-        byte[] dsr = "DSR3".getBytes();
+        byte[] dsr = "DSR4".getBytes();
         GuestLink.Answer control = link.hook(6, dsr, dsr.length, now() + 30000);
         if (sent && scanMeta.status == 0 && scanMeta.pixels[0] == 0 && scanPixels.status == 0
                 && scanPixels.pixels[0] == 0 && control.status == 0 && control.pixels[0] == 1) {
@@ -1559,6 +1614,10 @@ public final class HostChecks {
                 case "s": if (!(a.width + "x" + a.height).equals(kv[1])) why = "size " + a.width + "x" + a.height; break;
                 case "x": if (a.extra != Integer.parseInt(kv[1])) why = "extra " + a.extra; break;
                 case "cs": if (a.colorSpace != Integer.parseInt(kv[1])) why = "colour space " + a.colorSpace; break;
+                case "g": if (!(a.gainWidth + "x" + a.gainHeight).equals(kv[1])) {
+                        why = "gain map " + a.gainWidth + "x" + a.gainHeight;
+                    }
+                    break;
                 case "n": if (a.extra != Integer.parseInt(kv[1])) why = "frames " + a.extra; break;
                 case "l": if (a.loops != Integer.parseInt(kv[1])) why = "loops " + a.loops; break;
                 case "d": {
@@ -1612,6 +1671,16 @@ public final class HostChecks {
             }
             java.io.File out = new java.io.File(dump, name.replace('/', '_') + "-" + bw + "x" + bh + ".png");
             javax.imageio.ImageIO.write(img, "png", out);
+            if (a.gainPixels != null) {
+                java.awt.image.BufferedImage gain = new java.awt.image.BufferedImage(a.gainWidth, a.gainHeight,
+                        java.awt.image.BufferedImage.TYPE_INT_RGB);
+                for (int i = 0; i < a.gainWidth * a.gainHeight; i++) {
+                    gain.setRGB(i % a.gainWidth, i / a.gainWidth, (a.gainPixels[i * 4] & 0xff) << 16
+                            | (a.gainPixels[i * 4 + 1] & 0xff) << 8 | (a.gainPixels[i * 4 + 2] & 0xff));
+                }
+                javax.imageio.ImageIO.write(gain, "png", new java.io.File(dump,
+                        name.replace('/', '_') + "-" + bw + "x" + bh + "-gain.png"));
+            }
         }
         String what = "format " + op + " " + name + (opCode == GuestLink.OP_THUMBNAIL ? " in " + bw + "x" + bh : "");
         if (why == null) pass(what, show(a) + ", " + ms + " ms"); else fail(what, why + ": " + show(a) + ", " + ms + " ms");

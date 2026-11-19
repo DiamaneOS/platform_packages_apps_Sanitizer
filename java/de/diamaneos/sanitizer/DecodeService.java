@@ -80,6 +80,9 @@ public final class DecodeService extends Service {
         final byte[] pixels;
         final int width, height, stripeRows;
         final long expires;
+        // Ultra HDR: the gain map, if any, read through readGainmapStripe.
+        byte[] gain;
+        int gainWidth, gainHeight, gainStripeRows;
 
         Held(int uid, byte[] pixels, int width, int height, int stripeRows, long expires) {
             this.uid = uid;
@@ -88,6 +91,10 @@ public final class DecodeService extends Service {
             this.height = height;
             this.stripeRows = stripeRows;
             this.expires = expires;
+        }
+
+        long bytes() {
+            return pixels.length + (gain != null ? gain.length : 0);
         }
     }
 
@@ -325,6 +332,29 @@ public final class DecodeService extends Service {
         }
 
         @Override
+        public byte[] readGainmapStripe(long handle, int index) {
+            checkCaller();
+            try {
+                Held h;
+                synchronized (mHandles) {
+                    expire();
+                    h = mHandles.get(handle);
+                }
+                if (h == null || h.uid != Binder.getCallingUid() || h.gain == null) return new byte[0];
+                long first = (long) index * h.gainStripeRows;
+                if (index < 0 || first >= h.gainHeight) return new byte[0];
+                int rows = (int) Math.min(h.gainStripeRows, h.gainHeight - first);
+                int stride = h.gainWidth * 4;
+                byte[] out = new byte[rows * stride];
+                System.arraycopy(h.gain, (int) (first * stride), out, 0, out.length);
+                return out;
+            } catch (Throwable t) {
+                Log.e(TAG, "readGainmapStripe", t);
+                return new byte[0];
+            }
+        }
+
+        @Override
         public void release(long handle) {
             checkCaller();
             synchronized (mHandles) {
@@ -362,7 +392,8 @@ public final class DecodeService extends Service {
             expire();
             int held = 0;
             for (Held h : mHandles.values()) if (h.uid == uid) held++;
-            if (held >= MAX_HANDLES_PER_UID || !mDecoder.reserve("uid:" + uid, a.pixels.length)) {
+            long bytes = a.pixels.length + (a.gainPixels != null ? a.gainPixels.length : 0);
+            if (held >= MAX_HANDLES_PER_UID || !mDecoder.reserve("uid:" + uid, bytes)) {
                 t.status = IDecodeService.STATUS_UNAVAILABLE;
                 return t;
             }
@@ -375,8 +406,18 @@ public final class DecodeService extends Service {
             do {
                 handle = mRandom.nextLong();
             } while (handle == 0 || mHandles.containsKey(handle));
-            mHandles.put(handle, new Held(uid, a.pixels, a.width, a.height, t.stripeRows,
-                    SystemClock.uptimeMillis() + IDecodeService.HANDLE_TIMEOUT_MILLIS));
+            Held kept = new Held(uid, a.pixels, a.width, a.height, t.stripeRows,
+                    SystemClock.uptimeMillis() + IDecodeService.HANDLE_TIMEOUT_MILLIS);
+            t.gainmapParams = new float[0];
+            if (a.gainPixels != null) {
+                kept.gain = a.gainPixels;
+                kept.gainWidth = t.gainmapWidth = a.gainWidth;
+                kept.gainHeight = t.gainmapHeight = a.gainHeight;
+                kept.gainStripeRows = t.gainmapStripeRows = Math.min(a.gainHeight,
+                        Math.max(1, IDecodeService.MAX_STRIPE_BYTES / (a.gainWidth * 4)));
+                t.gainmapParams = a.gainParams.clone();
+            }
+            mHandles.put(handle, kept);
             mExpiry.postDelayed(mExpireTask, IDecodeService.HANDLE_TIMEOUT_MILLIS + 100);
             t.handle = handle;
             if (DecodeChecks.check(t, maxWidth, maxHeight) != null) {
@@ -438,7 +479,7 @@ public final class DecodeService extends Service {
     // With mHandles held.
     private void drop(long handle, Held h) {
         mHandles.remove(handle);
-        mDecoder.release("uid:" + h.uid, h.pixels.length);
+        mDecoder.release("uid:" + h.uid, h.bytes());
     }
 
     static MetadataRecord metadata(Decoder.Request r) {
@@ -495,7 +536,7 @@ public final class DecodeService extends Service {
             Held h = it.next().getValue();
             if (h.expires <= now) {
                 it.remove();
-                mDecoder.release("uid:" + h.uid, h.pixels.length);
+                mDecoder.release("uid:" + h.uid, h.bytes());
             }
         }
     }

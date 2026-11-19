@@ -123,6 +123,13 @@ enum ColorSpace : uint32_t {
     kColorDisplayP3 = 1,
 };
 
+// Ultra HDR: a thumbnail of a JPEG with a gain map carries it after the base pixels: the gain block ("DSG1", width,
+// height, kGainParams floats as Android's Gainmap takes them: ratio min and max, gamma, epsilon SDR and HDR, three
+// channels each, then the display ratios for SDR and HDR), then width * height * 4 bytes of RGBA, alpha always 255.
+// The gain map is at most the base image's size. Reply.payloadLen covers both.
+constexpr int kGainParams = 17;
+constexpr uint32_t kGainBlockBytes = 12 + kGainParams * 4;
+
 struct End {
     uint32_t magic;
     int32_t status;  // 0: the worker ended cleanly

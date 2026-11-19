@@ -22,6 +22,7 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
+import android.graphics.Gainmap;
 import android.graphics.ImageDecoder;
 import android.os.Bundle;
 import android.os.IBinder;
@@ -537,6 +538,7 @@ public class SelfTestActivity extends Activity {
         }
         colourCheck(s, new File(images, "p3-chart.jpg"));
         framesCheck(s, new File(images, "anim.gif"));
+        gainmapCheck(s, new File(images, "ultrahdr.jpg"));
         Thumbnail bad = s.decodeThumbnail(request(photo), 0, 10);
         if (bad.status == IDecodeService.STATUS_INVALID) {
             pass("binder refuses a zero box", "");
@@ -637,6 +639,74 @@ public class SelfTestActivity extends Activity {
             pass("binder frames", f.frameCount + " frames of " + f.width + "x" + f.height + ", loops " + f.loopCount);
         } else {
             fail("binder frames", "total " + total);
+        }
+    }
+
+    /**
+     * An Ultra HDR photo through the service against Android's own decode in this app: a gain map of the same size,
+     * the same parameters, every pixel within 2 levels. Skipped when the photo was not pushed.
+     */
+    private void gainmapCheck(IDecodeService s, File photo) throws Exception {
+        if (!photo.exists()) {
+            pass("binder gain map", "skipped, no " + photo);
+            return;
+        }
+        Thumbnail t = s.decodeThumbnail(request(photo), 4096, 4096);
+        String broken = DecodeChecks.check(t, 4096, 4096);
+        if (broken != null || t.status != IDecodeService.STATUS_OK || t.gainmapWidth == 0) {
+            fail("binder gain map", "thumbnail " + broken + " status " + t.status + " gain " + t.gainmapWidth);
+            return;
+        }
+        byte[] gain = new byte[t.gainmapWidth * t.gainmapHeight * 4];
+        for (int i = 0; i * t.gainmapStripeRows < t.gainmapHeight; i++) {
+            byte[] stripe = s.readGainmapStripe(t.handle, i);
+            if (DecodeChecks.checkGainmap(t, i, stripe) != null) {
+                fail("binder gain map", "stripe " + i);
+                return;
+            }
+            System.arraycopy(stripe, 0, gain, i * t.gainmapStripeRows * t.gainmapWidth * 4, stripe.length);
+        }
+        s.release(t.handle);
+        Gainmap vm = DecodeChecks.gainmapOf(t, gain);
+        Bitmap ref = ImageDecoder.decodeBitmap(ImageDecoder.createSource(photo),
+                (d, info, src) -> d.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE));
+        Gainmap g = ref.getGainmap();
+        Bitmap rc = g == null ? null : g.getGainmapContents();
+        Bitmap vc = vm.getGainmapContents();
+        if (rc == null || rc.getWidth() != vc.getWidth() || rc.getHeight() != vc.getHeight()) {
+            fail("binder gain map", "Android " + (rc == null ? "none" : rc.getWidth() + "x" + rc.getHeight())
+                    + ", VM " + vc.getWidth() + "x" + vc.getHeight());
+            return;
+        }
+        float[][] mine = {vm.getRatioMin(), vm.getRatioMax(), vm.getGamma(), vm.getEpsilonSdr(), vm.getEpsilonHdr(),
+                {vm.getMinDisplayRatioForHdrTransition(), vm.getDisplayRatioForFullHdr()}};
+        float[][] theirs = {g.getRatioMin(), g.getRatioMax(), g.getGamma(), g.getEpsilonSdr(), g.getEpsilonHdr(),
+                {g.getMinDisplayRatioForHdrTransition(), g.getDisplayRatioForFullHdr()}};
+        for (int i = 0; i < mine.length; i++) {
+            for (int k = 0; k < mine[i].length; k++) {
+                if (Math.abs(mine[i][k] - theirs[i][k]) > 1e-3f * Math.max(1f, Math.abs(theirs[i][k]))) {
+                    fail("binder gain map", "parameter " + i + "." + k + ": Android " + theirs[i][k] + ", VM "
+                            + mine[i][k]);
+                    return;
+                }
+            }
+        }
+        // Android keeps a grey gain map as ALPHA_8, the service sends it as RGBA with equal channels.
+        boolean alphaOnly = rc.getConfig() == Bitmap.Config.ALPHA_8;
+        int worst = 0;
+        for (int y = 0; y < vc.getHeight(); y++) {
+            for (int x = 0; x < vc.getWidth(); x++) {
+                int a = vc.getPixel(x, y), b = rc.getPixel(x, y);
+                int va = android.graphics.Color.red(a);
+                int vb = alphaOnly ? android.graphics.Color.alpha(b) : android.graphics.Color.red(b);
+                worst = Math.max(worst, Math.abs(va - vb));
+            }
+        }
+        if (worst <= 2) {
+            pass("binder gain map", vc.getWidth() + "x" + vc.getHeight() + ", largest difference " + worst
+                    + " levels");
+        } else {
+            fail("binder gain map", "largest difference " + worst + " levels");
         }
     }
 

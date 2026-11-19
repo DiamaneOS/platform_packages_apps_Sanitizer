@@ -76,8 +76,22 @@ struct Sink {
 
 bool sink_flush(Sink* s);
 bool sink_put(Sink* s, const uint8_t* p, size_t n);
-// The worker's thumbnail header to the broker: "DSR3", width, height, gRotation, gColorSpace.
+// The worker's thumbnail header to the broker: "DSR4", width, height, gRotation, gColorSpace, gGainW, gGainH. With a
+// gain map, the base image's pixels are followed by the gain block (proto.h kGainBlockBytes) and its pixels.
 bool sink_header(Sink* s, uint32_t w, uint32_t h);
+extern uint32_t gGainW, gGainH;
+extern bool gGainPass;  // decoding the gain map itself: no header of its own
+
+// Ultra HDR (gainmap.cpp): a JPEG's gain map, its place in the file, its size and Android's Gainmap parameters
+// (ratio min and max, gamma, epsilon SDR and HDR, three channels each, then the display ratios for SDR and HDR).
+struct Gainmap {
+    const uint8_t* data;
+    size_t size;
+    uint32_t w, h;
+    float params[kGainParams];
+};
+bool gainmap_find(const uint8_t* file, size_t size, Gainmap* g);
+bool gainmap_params_ok(const float* params);
 extern uint32_t gRotation;
 
 // Colour (color.cpp): a decoder hands over the file's profile before its first pixel row, scaler_push converts each

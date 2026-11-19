@@ -98,6 +98,6 @@ final class ResultCache {
     }
 
     private static long sizeOf(GuestLink.Answer a) {
-        return 1024 + (a.pixels != null ? a.pixels.length : 0);
+        return 1024 + (a.pixels != null ? a.pixels.length : 0) + (a.gainPixels != null ? a.gainPixels.length : 0);
     }
 }

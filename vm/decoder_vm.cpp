@@ -285,12 +285,18 @@ uint32_t le32(const uint8_t* b) {
 uint32_t gRotation = 0;
 bool gFlip = false;
 
+uint32_t gGainW = 0, gGainH = 0;
+bool gGainPass = false;
+
 bool sink_header(Sink* s, uint32_t w, uint32_t h) {
-    uint8_t hdr[20] = {'D', 'S', 'R', '3'};
+    if (gGainPass) return true;  // the gain block, sent before the gain map, is its header
+    uint8_t hdr[28] = {'D', 'S', 'R', '4'};
     put_le32(hdr + 4, w);
     put_le32(hdr + 8, h);
     put_le32(hdr + 12, gRotation);
     put_le32(hdr + 16, gColorSpace);
+    put_le32(hdr + 20, gGainW);
+    put_le32(hdr + 24, gGainH);
     return sink_put(s, hdr, sizeof(hdr)) && sink_flush(s);
 }
 
@@ -716,6 +722,60 @@ void jstream_term(j_decompress_ptr) {}
 constexpr size_t kJpegSlack = 4u << 20;
 
 bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly, uint32_t* outW,
+                     uint32_t* outH);
+
+// The gain block, then the gain map itself through the same JPEG path at its box, never colour-converted (it holds
+// ratios, not colours) and with no header of its own.
+bool emit_gain(const Gainmap& g, uint32_t boxW, uint32_t boxH, Sink* sink) {
+    uint8_t blk[kGainBlockBytes] = {'D', 'S', 'G', '1'};
+    put_le32(blk + 4, gGainW);
+    put_le32(blk + 8, gGainH);
+    memcpy(blk + 12, g.params, sizeof(g.params));  // little-endian floats, as the host reads them
+    if (!sink_put(sink, blk, sizeof(blk))) return false;
+    color_reset();
+    gGainPass = true;
+    Src gs = {g.data, g.size, 0, -1, 0};
+    uint32_t w = 0, h = 0;
+    bool ok = decode_jpeg_src(&gs, boxW, boxH, sink, false, &w, &h);
+    gGainPass = false;
+    return ok;
+}
+
+// Whether libjpeg takes the gain map, asked before the base image's header promises it: its header (the size the MPF
+// search read, 8 bits, grey or colour, no CMYK) and the start of its decode (tables, every scan of a progressive one
+// within room bytes). The gain pass then meets no error that ends a decode, so a gain map libjpeg refuses leaves the
+// photo SDR, as on Android, instead of failing it.
+bool gain_ready(const Gainmap& g, size_t room) {
+    jpeg_decompress_struct cinfo;
+    JpegError err;
+    jpeg_progress_mgr progress = {};
+    cinfo.err = jpeg_std_error(&err.mgr);
+    err.mgr.error_exit = jpeg_fail;
+    err.mgr.emit_message = jpeg_quiet;
+    err.mgr.output_message = jpeg_quiet_output;
+    if (_setjmp(err.jump)) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    jpeg_create_decompress(&cinfo);
+    progress.progress_monitor = jpeg_progress;
+    cinfo.progress = &progress;
+    jpeg_mem_src(&cinfo, g.data, g.size);
+    bool ok = jpeg_read_header(&cinfo, TRUE) == JPEG_HEADER_OK && cinfo.image_width == g.w &&
+              cinfo.image_height == g.h && cinfo.data_precision == 8 &&
+              (cinfo.jpeg_color_space == JCS_GRAYSCALE || cinfo.jpeg_color_space == JCS_YCbCr ||
+               cinfo.jpeg_color_space == JCS_RGB);
+    if (ok) {
+        cinfo.scale_num = 1;
+        cinfo.scale_denom = 8;
+        cinfo.mem->max_memory_to_use = static_cast<long>(room);
+        ok = jpeg_start_decompress(&cinfo);
+    }
+    jpeg_destroy_decompress(&cinfo);
+    return ok;
+}
+
+bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly, uint32_t* outW,
                      uint32_t* outH) {
     jpeg_decompress_struct cinfo;
     JpegError err;
@@ -764,7 +824,7 @@ bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool hea
         jpeg_destroy_decompress(&cinfo);
         return false;
     }
-    if (cinfo.jpeg_color_space != JCS_CMYK && cinfo.jpeg_color_space != JCS_YCCK) {
+    if (!gGainPass && cinfo.jpeg_color_space != JCS_CMYK && cinfo.jpeg_color_space != JCS_YCCK) {
         JOCTET* icc = nullptr;
         unsigned int iccLen = 0;
         if (jpeg_read_icc_profile(&cinfo, &icc, &iccLen)) {
@@ -824,6 +884,17 @@ bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool hea
         room = arena_left();
     }
     cinfo.mem->max_memory_to_use = static_cast<long>(room);
+    // Ultra HDR: a gain map in a JPEG held whole, decoded after the base image at the same scale.
+    Gainmap gain = {};
+    uint32_t gainBoxW = 0, gainBoxH = 0;
+    if (!gGainPass) gGainW = gGainH = 0;
+    if (!gGainPass && in->fd < 0 && !cmyk && gainmap_find(in->pre, in->preLen, &gain) && gain_ready(gain, room)) {
+        double sx = static_cast<double>(ow) / cinfo.image_width, sy = static_cast<double>(oh) / cinfo.image_height;
+        gainBoxW = std::max<uint32_t>(1, static_cast<uint32_t>(gain.w * sx + 0.5));
+        gainBoxH = std::max<uint32_t>(1, static_cast<uint32_t>(gain.h * sy + 0.5));
+        fit_box(gain.w, gain.h, gainBoxW, gainBoxH, &gGainW, &gGainH);
+        if (gGainW > ow || gGainH > oh) gGainW = gGainH = 0;
+    }
     jpeg_start_decompress(&cinfo);
     if (!scaler_init(&scaler, cinfo.output_width, cinfo.output_height, ow, oh, sink) || !sink_header(sink, ow, oh)) {
         jpeg_destroy_decompress(&cinfo);
@@ -862,6 +933,7 @@ bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool hea
     bool done = scaler_done(&scaler);
     scaler_free(&scaler);
     jpeg_destroy_decompress(&cinfo);
+    if (done && !gGainPass && gGainW != 0) done = emit_gain(gain, gainBoxW, gainBoxH, sink);
     return done && sink_flush(sink);
 }
 
@@ -1825,6 +1897,13 @@ bool send_failure(int c, int32_t status) {
     return send_reply(c, status, kFormatUnknown, 0, 0, 0, 0) && send_end(c, status);
 }
 
+bool opaque(const uint8_t* p, size_t n) {
+    for (size_t i = 3; i < n; i += 4) {
+        if (p[i] != 255) return false;
+    }
+    return true;
+}
+
 bool premultiplied(const uint8_t* p, size_t n) {
     for (size_t i = 0; i + 3 < n; i += 4) {
         if (p[i] > p[i + 3] || p[i + 1] > p[i + 3] || p[i + 2] > p[i + 3]) return false;
@@ -1976,9 +2055,10 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
     if (rq.op == kOpFrames) return serve_frames(c, rq, format, w);
 
     // Thumbnail (and the test hooks, which answer as a 1x1 or 2x1 thumbnail): header, exact pixels, trailer.
-    uint8_t hdr[20];
+    uint8_t hdr[28];
     ssize_t n = worker_read(w, hdr, sizeof(hdr), w->deadline, kIdleMs);
     uint32_t tw = le32(hdr + 4), th = le32(hdr + 8), rot = le32(hdr + 12), cs = le32(hdr + 16);
+    uint32_t gw = le32(hdr + 20), gh = le32(hdr + 24);
     bool turned = rot == 90 || rot == 270;
     bool box = hook || (turned ? (tw <= rq.arg1 && th <= rq.arg0) : (tw <= rq.arg0 && th <= rq.arg1));
     if (n != static_cast<ssize_t>(sizeof(hdr))) {
@@ -1986,24 +2066,59 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
         if (retry_busy(e, rq, format, w)) return serve_worker(c, rq, format, hook, w);
         return send_failure(c, status_of(e));
     }
-    if (memcmp(hdr, "DSR3", 4) != 0 || tw == 0 || th == 0 || static_cast<uint64_t>(tw) * th > kMaxPixels || !box ||
-        (rot != 0 && rot != 180 && !turned) || (cs != kColorSrgb && cs != kColorDisplayP3)) {
+    if (memcmp(hdr, "DSR4", 4) != 0 || tw == 0 || th == 0 || static_cast<uint64_t>(tw) * th > kMaxPixels || !box ||
+        (rot != 0 && rot != 180 && !turned) || (cs != kColorSrgb && cs != kColorDisplayP3) ||
+        (gw == 0) != (gh == 0) || gw > tw || gh > th || (hook && gw != 0)) {
         end_worker(w, true);
         return send_failure(c, kInvalid);
     }
-    uint64_t left = static_cast<uint64_t>(tw) * th * 4;
+    uint64_t base = static_cast<uint64_t>(tw) * th * 4;
+    uint64_t gainPixels = static_cast<uint64_t>(gw) * gh * 4;
+    uint64_t left = base + (gw != 0 ? kGainBlockBytes + gainPixels : 0);
     if (!send_reply(c, kOk, format, tw, th, rot, static_cast<uint32_t>(left), cs)) {
         end_worker(w, true);
         return false;
     }
     int32_t verdict = kOk;
+    // The base image's pixels, then (Ultra HDR) the gain block and the gain map, each checked as it passes: the base
+    // premultiplied, the block's size and parameters, the gain map opaque.
+    uint64_t sent = 0;
     while (left > 0) {
-        size_t want = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), left));
+        bool inGain = sent >= base;
+        if (inGain && sent == base) {
+            uint8_t blk[kGainBlockBytes];
+            ssize_t got = worker_read(w, blk, sizeof(blk), w->deadline, kIdleMs);
+            float params[kGainParams];
+            memcpy(params, blk + 12, sizeof(params));
+            bool good = got == static_cast<ssize_t>(sizeof(blk)) && memcmp(blk, "DSG1", 4) == 0 &&
+                        le32(blk + 4) == gw && le32(blk + 8) == gh && decoder::gainmap_params_ok(params);
+            if (!good) {
+                bool bad = got == static_cast<ssize_t>(sizeof(blk));
+                Ended e = end_worker(w, true);
+                verdict = bad ? kInvalid : late_status(e);
+                wipe(gStripe, sizeof(gStripe));
+                while (left > 0) {
+                    size_t k = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), left));
+                    if (!write_all(c, gStripe, k)) return false;
+                    left -= k;
+                }
+                return send_end(c, verdict);
+            }
+            if (!write_all(c, blk, sizeof(blk))) {
+                end_worker(w, true);
+                return false;
+            }
+            left -= sizeof(blk);
+            sent += sizeof(blk);
+            continue;
+        }
+        uint64_t phaseLeft = inGain ? left : base - sent;
+        size_t want = static_cast<size_t>(std::min<uint64_t>(sizeof(gStripe), phaseLeft));
         ssize_t got = worker_read(w, gStripe, want, w->deadline, kIdleMs);
         // A worker that stops early, or sends a colour above alpha (only a compromised one does), ends here. The
         // promised length is kept with zeros and the trailer carries the verdict, so Android tells a bad file or a
         // failed worker from a broken link.
-        if (got != static_cast<ssize_t>(want) || !premultiplied(gStripe, want)) {
+        if (got != static_cast<ssize_t>(want) || !(inGain ? opaque(gStripe, want) : premultiplied(gStripe, want))) {
             bool bad = got == static_cast<ssize_t>(want);
             Ended e = end_worker(w, true);
             verdict = bad ? kInvalid : late_status(e);
@@ -2020,6 +2135,7 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
             return false;
         }
         left -= want;
+        sent += want;
     }
     // All pixels are here. The worker must now end, cleanly and with nothing more to say.
     uint8_t extra;

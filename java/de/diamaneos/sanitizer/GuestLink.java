@@ -52,6 +52,10 @@ final class GuestLink implements Closeable {
     static final int MAX_FRAMES = 1024;
     static final int MAX_FRAME_MILLIS = 65535;
     static final int MAX_FRAMES_BYTES = 32 << 20;
+    // Ultra HDR (vm/proto.h kGainBlockBytes): "DSG1", width, height, then GAIN_PARAMS little-endian floats.
+    static final int GAIN_PARAMS = 17;
+    static final int GAIN_BLOCK_BYTES = 12 + GAIN_PARAMS * 4;
+    static final int GAIN_MAGIC = 0x31475344; // "DSG1"
     static final int OP_PROBE = 2;
     static final int OP_THUMBNAIL = 3;
     static final int OP_METADATA = 4;
@@ -173,6 +177,9 @@ final class GuestLink implements Closeable {
         int extra; // probe: animated, thumbnail: rotation
         int colorSpace; // thumbnail and frames: COLOR_SRGB or COLOR_DISPLAY_P3 (vm/proto.h ColorSpace)
         int loops; // frames: how often the animation plays, 0 forever
+        int gainWidth, gainHeight; // thumbnail: an Ultra HDR gain map's size, 0 when there is none
+        float[] gainParams; // its GAIN_PARAMS values (Android's Gainmap: ratios, gamma, epsilons, display ratios)
+        byte[] gainPixels; // its RGBA pixels, alpha 255
         int[] durations; // frames: each frame's time in milliseconds, pixels holds the frames one after another
         byte[] pixels; // thumbnail
         Meta meta; // metadata
@@ -391,7 +398,11 @@ final class GuestLink implements Closeable {
                         check(a.width >= 1 && a.width <= 2 && a.height == 1, "hook size");
                     }
                     check((long) a.width * a.height <= MAX_PIXELS, "pixels");
-                    check((long) payload == (long) a.width * a.height * 4, "pixel length");
+                    int baseBytes = a.width * a.height * 4;
+                    // The base pixels, or (Ultra HDR, thumbnails only) the base pixels, the gain block and the gain
+                    // map, whose length the block gives and is checked below.
+                    check(payload == baseBytes || (op == OP_THUMBNAIL && payload > baseBytes + GAIN_BLOCK_BYTES),
+                            "pixel length");
                     if (mBudget != null && !mBudget.reserve(mLane, payload)) {
                         // No memory for these pixels now: read past them, keep the link, answer "try later".
                         drain(payload, deadline);
@@ -405,7 +416,21 @@ final class GuestLink implements Closeable {
                     // From here the reservation is given back on every way out (held), unless the answer with its
                     // pixels is handed over: then the caller gives it back when done (a.reserved).
                     held = mBudget != null ? payload : 0;
-                    byte[] pixels = readExact(payload, deadline).array();
+                    byte[] pixels = readExact(baseBytes, deadline).array();
+                    if (payload != baseBytes) {
+                        ByteBuffer g = readExact(GAIN_BLOCK_BYTES, deadline);
+                        check(g.getInt() == GAIN_MAGIC, "gain block");
+                        a.gainWidth = g.getInt();
+                        a.gainHeight = g.getInt();
+                        check(a.gainWidth >= 1 && a.gainHeight >= 1 && a.gainWidth <= a.width
+                                && a.gainHeight <= a.height, "gain map size");
+                        check((long) payload == (long) baseBytes + GAIN_BLOCK_BYTES
+                                + (long) a.gainWidth * a.gainHeight * 4, "gain map length");
+                        a.gainParams = new float[GAIN_PARAMS];
+                        for (int i = 0; i < GAIN_PARAMS; i++) a.gainParams[i] = g.getFloat();
+                        check(gainParamsOk(a.gainParams), "gain map parameters");
+                        a.gainPixels = readExact(a.gainWidth * a.gainHeight * 4, deadline).array();
+                    }
                     // A worker that failed after its header: the VM kept the length with zeros and its trailer says
                     // INVALID (the file), INTERNAL (the worker died), BUSY (not the file) or, from the small lane,
                     // BIG_LANE. A clean answer, not a broken link. Never UNSUPPORTED after pixels.
@@ -419,6 +444,11 @@ final class GuestLink implements Closeable {
                     }
                     check(endStatus == OK, "end status " + endStatus);
                     checkPremultiplied(pixels);
+                    if (a.gainPixels != null) {
+                        for (int i = 3; i < a.gainPixels.length; i += 4) {
+                            check(a.gainPixels[i] == (byte) 255, "gain alpha");
+                        }
+                    }
                     a.pixels = pixels;
                     a.reserved = held;
                     held = 0;
@@ -532,6 +562,19 @@ final class GuestLink implements Closeable {
             mReplied = true;
         }
         return ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN);
+    }
+
+    /** As the VM's gainmap_params_ok: finite, ratios within 2^-16 to 2^16, gamma above 0 up to 16, epsilons 0 to 1. */
+    static boolean gainParamsOk(float[] p) {
+        if (p == null || p.length != GAIN_PARAMS) return false;
+        for (float v : p) if (!Float.isFinite(v)) return false;
+        for (int c = 0; c < 3; c++) {
+            float lo = p[c], hi = p[3 + c], gamma = p[6 + c], es = p[9 + c], eh = p[12 + c];
+            if (!(lo >= 1f / 65536 && lo <= hi && hi <= 65536)) return false;
+            if (!(gamma > 0 && gamma <= 16)) return false;
+            if (!(es >= 0 && es <= 1 && eh >= 0 && eh <= 1)) return false;
+        }
+        return p[15] >= 1 && p[15] <= p[16] && p[16] <= 65536;
     }
 
     private static void check(boolean ok, String what) throws ProtocolException {
