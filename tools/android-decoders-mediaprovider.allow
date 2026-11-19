@@ -3,7 +3,6 @@
 # None of them runs in the MediaProvider process.
 apex/framework/java/android/provider/CmpApiVerifier.java: BitmapFactory.decodeFileDescriptor(assetFileDescriptor.getFileDescriptor(), null, # in the cloud media app's process, checking its own provider
 apex/framework/java/android/provider/MediaStore.java: Bitmap bitmap = BitmapFactory.decodeStream(input); # deprecated MediaStore.Images.Media.getBitmap, in the calling app's process
-photopicker/src/com/android/photopicker/util/UtilityMethods.kt: BitmapFactory.decodeStream(inputStream)?.asImageBitmap() # getBitmapFromUri, no caller, photopicker process
 signature/src/com/android/signature/ui/common/SignatureCommonComposables.kt: BitmapFactory.decodeByteArray(imageData, 0, imageData.size) # a stored drawn or uploaded signature, in the signature app's process
 signature/src/com/android/signature/ui/create/UploadTab.kt: BitmapFactory.decodeStream(stream) # an image the user picked, in the signature app's process
 signature/src/com/android/signature/ui/create/UploadTab.kt: ImageDecoder.decodeBitmap(source) # an image the user picked, in the signature app's process
