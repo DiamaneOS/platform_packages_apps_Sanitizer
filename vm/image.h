@@ -76,9 +76,18 @@ struct Sink {
 
 bool sink_flush(Sink* s);
 bool sink_put(Sink* s, const uint8_t* p, size_t n);
-// The worker's thumbnail header to the broker: "DSR2", width, height, gRotation.
+// The worker's thumbnail header to the broker: "DSR3", width, height, gRotation, gColorSpace.
 bool sink_header(Sink* s, uint32_t w, uint32_t h);
 extern uint32_t gRotation;
+
+// Colour (color.cpp): a decoder hands over the file's profile before its first pixel row, scaler_push converts each
+// row, and the header carries the result's colour space (kColorSrgb or kColorDisplayP3).
+extern uint32_t gColorSpace;
+void color_reset();                                       // sRGB, nothing converted: each worker starts here
+void color_from_icc(const uint8_t* icc, size_t len);      // an ICC profile from the file (copied)
+void color_from_cicp(uint32_t primaries, uint32_t transfer);  // HEIF and AVIF colr nclx values
+void color_apply(uint8_t* row, uint32_t w, bool premultiplied);
+void color_warm_up();                                     // in the broker, before any fork
 // The image is mirrored left to right before its turn (EXIF 2, 4, 5, 7, HEIF imir): scaler_push reverses each row.
 extern bool gFlip;
 

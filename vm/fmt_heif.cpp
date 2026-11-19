@@ -706,17 +706,19 @@ struct Nclx {
     uint16_t matrix;
     bool full;
     bool known;
+    uint16_t primaries;
+    uint16_t transfer;
 };
 
 Nclx parse_nclx(Span body) {
     Reader r = {body, 0, false};
     if (r.u32() != fourcc("nclx")) return {};
-    r.u16();  // primaries
-    r.u16();  // transfer
+    uint16_t primaries = r.u16();
+    uint16_t transfer = r.u16();
     uint16_t m = r.u16();
     uint8_t full = r.u8();
     if (r.bad) return {};
-    return {m, (full & 0x80) != 0, true};
+    return {m, (full & 0x80) != 0, true, primaries, transfer};
 }
 
 struct Coeffs {
@@ -1173,6 +1175,7 @@ struct Layer {
     Span config;
     Hvcc hvcc;
     Nclx nclx;
+    Span icc;  // the colr ICC profile, if any
     // Where each tile's bytes are: items, or the one sample of a track.
     Item** tiles;
     Span sample;
@@ -1192,14 +1195,27 @@ bool codec_config(const File* f, const Item* it, Layer* l) {
 
 // The layer of image item it: a coded image or a grid of them. False for anything this reader does not decode
 // (with gOutcome.unsupported for a valid file of a kind it does not read).
+// The item's colr boxes: an item may carry an nclx colr and an ICC (prof or rICC) colr side by side. Fills only
+// what l does not have yet, so a grid's own boxes win over its first tile's.
+void item_colour(const File* f, const Item* it, Layer* l) {
+    for (uint32_t i = 0; i < it->nAssoc; i++) {
+        const Prop& p = f->props[it->assoc[i] - 1];
+        if (p.type != fourcc("colr") || p.body.n < 4) continue;
+        if (memcmp(p.body.p, "nclx", 4) == 0) {
+            if (!l->nclx.known) l->nclx = parse_nclx(p.body);
+        } else if ((memcmp(p.body.p, "prof", 4) == 0 || memcmp(p.body.p, "rICC", 4) == 0) && l->icc.p == nullptr) {
+            l->icc = {p.body.p + 4, p.body.n - 4};
+        }
+    }
+}
+
 bool layer_from_item(File* f, Item* it, Layer* l) {
     memset(l, 0, sizeof(*l));
     if (!all_understood(f, it)) {
         gOutcome.unsupported = true;
         return false;
     }
-    const Prop* colr = item_prop(f, it, fourcc("colr"));
-    if (colr != nullptr) l->nclx = parse_nclx(colr->body);
+    item_colour(f, it, l);
     if (it->type == kHevc || it->type == kAv1) {
         l->codec = it->type;
         l->rows = l->cols = 1;
@@ -1260,10 +1276,7 @@ bool layer_from_item(File* f, Item* it, Layer* l) {
             static_cast<uint64_t>(l->tileH) * (l->rows - 1) >= l->outH) {
             return false;
         }
-        if (l->nclx.matrix == 0 && !l->nclx.known) {
-            const Prop* tc = item_prop(f, l->tiles[0], fourcc("colr"));
-            if (tc != nullptr) l->nclx = parse_nclx(tc->body);
-        }
+        item_colour(f, l->tiles[0], l);
     } else {
         gOutcome.unsupported = it->type != 0;  // iden, iovl, another codec
         return false;
@@ -1514,6 +1527,12 @@ bool decode_plan(const File* f, Plan* plan, uint32_t maxW, uint32_t maxH, Sink* 
     if (row == nullptr || pics == nullptr) return false;
     Scaler scaler = {};
     const Crop& cr = plan->crop;
+    // The colour space, as Android reads it: the ICC profile, else the nclx primaries.
+    if (c.icc.p != nullptr) {
+        color_from_icc(c.icc.p, static_cast<size_t>(std::min<uint64_t>(c.icc.n, SIZE_MAX)));
+    } else if (c.nclx.known) {
+        color_from_cicp(c.nclx.primaries, c.nclx.transfer);
+    }
     if (!start_output(&scaler, cr.w, cr.h, maxW, maxH, sink)) return false;
     scaler.premultiplied = plan->premultiplied;
     Coeffs k = {};

@@ -94,6 +94,7 @@ cc_defaults {
     name: "decoder_vm_common",
     srcs: [
         "vm/arena.cpp",
+        "vm/color.cpp",
         "vm/decoder_vm.cpp",
         "vm/fmt_dng.cpp",
         "vm/fmt_heif.cpp",
@@ -120,6 +121,8 @@ cc_defaults {
         "libbinary_parse",
         "libimage_type_recognition",
         "libtiff_directory",
+        // Colour profiles, as Android's own decode reads them (vm/color.cpp).
+        "libskia_skcms",
         // For its header only: vm/fmt_wuffs.cpp compiles the file itself, with every function static.
         "libwuffs_mirror_release_c",
     ],

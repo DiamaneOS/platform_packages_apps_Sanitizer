@@ -355,6 +355,7 @@ public final class DecodeService extends Service {
             t.width = a.width;
             t.height = a.height;
             t.rotation = a.extra;
+            t.colorSpace = a.colorSpace;
             t.stripeRows = Math.min(a.height, Math.max(1, IDecodeService.MAX_STRIPE_BYTES / (a.width * 4)));
             long handle;
             do {

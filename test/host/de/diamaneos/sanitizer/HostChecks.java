@@ -167,8 +167,12 @@ public final class HostChecks {
     }
 
     static byte[] reply(int magic, int status, int format, int w, int h, int extra, int payload) {
+        return reply(magic, status, format, w, h, extra, payload, 0);
+    }
+
+    static byte[] reply(int magic, int status, int format, int w, int h, int extra, int payload, int colorSpace) {
         return ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN).putInt(magic).putInt(status).putInt(format)
-                .putInt(w).putInt(h).putInt(extra).putInt(payload).putInt(0).array();
+                .putInt(w).putInt(h).putInt(extra).putInt(payload).putInt(colorSpace).array();
     }
 
     static byte[] end(int status) {
@@ -259,6 +263,18 @@ public final class HostChecks {
         } else {
             fail("control thumbnail", String.valueOf(ok));
         }
+        // The colour space: Display P3 on a thumbnail is fine, anything else, or on another answer, breaks the link.
+        Object p3 = stub((in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0, 8, GuestLink.COLOR_DISPLAY_P3), px,
+                end(0))), GuestLink.OP_THUMBNAIL, 2, 1, 2000);
+        if (p3 instanceof GuestLink.Answer && ((GuestLink.Answer) p3).colorSpace == GuestLink.COLOR_DISPLAY_P3) {
+            pass("stub thumbnail in Display P3", "");
+        } else {
+            fail("stub thumbnail in Display P3", String.valueOf(p3));
+        }
+        expectRefused("unknown colour space", (in, out) -> out.write(cat(reply(R, 0, 1, 2, 1, 0, 8, 2), px, end(0))),
+                GuestLink.OP_THUMBNAIL);
+        expectRefused("colour space on a failure", (in, out) -> out.write(cat(reply(R, 3, 0, 0, 0, 0, 0, 1),
+                end(3))), GuestLink.OP_THUMBNAIL);
         long date = System.currentTimeMillis() - 86400000L;
         Object okm = stub((in, out) -> out.write(cat(reply(R, 0, 1, 4, 3, 0, 1024),
                 meta(3, 4, 3, 90, date, "A camera", "xmp.did:1"), end(0))), GuestLink.OP_METADATA, 0, 0, 2000);
@@ -1369,7 +1385,7 @@ public final class HostChecks {
                 && java.util.Arrays.equals(px.pixels, rgba);
         GuestLink.Answer scanMeta = link.hook(6, marker.getBytes(), marker.length(), now() + 30000);
         GuestLink.Answer scanPixels = link.hook(6, rgba, rgba.length, now() + 30000);
-        byte[] dsr = "DSR2".getBytes();
+        byte[] dsr = "DSR3".getBytes();
         GuestLink.Answer control = link.hook(6, dsr, dsr.length, now() + 30000);
         if (sent && scanMeta.status == 0 && scanMeta.pixels[0] == 0 && scanPixels.status == 0
                 && scanPixels.pixels[0] == 0 && control.status == 0 && control.pixels[0] == 1) {
@@ -1494,6 +1510,7 @@ public final class HostChecks {
                 case "f": if (a.format != Integer.parseInt(kv[1])) why = "format " + a.format; break;
                 case "s": if (!(a.width + "x" + a.height).equals(kv[1])) why = "size " + a.width + "x" + a.height; break;
                 case "x": if (a.extra != Integer.parseInt(kv[1])) why = "extra " + a.extra; break;
+                case "cs": if (a.colorSpace != Integer.parseInt(kv[1])) why = "colour space " + a.colorSpace; break;
                 case "sp": if (a.meta == null || a.meta.specialFormat != Integer.parseInt(kv[1])) why = "special"; break;
                 case "o": if (a.meta == null || a.meta.orientation != Integer.parseInt(kv[1])) {
                         why = "orientation " + (a.meta == null ? "none" : a.meta.orientation);

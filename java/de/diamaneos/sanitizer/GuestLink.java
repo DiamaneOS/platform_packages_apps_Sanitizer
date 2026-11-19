@@ -63,6 +63,9 @@ final class GuestLink implements Closeable {
     // Small lane only: the file is too large for that lane. Not a verdict: the request goes to the big lane.
     static final int BIG_LANE = 6;
     static final int MAX_VM_CPUS = 1024; // a ping's CPU count above this breaks the contract
+    // A thumbnail's colour space (vm/proto.h ColorSpace, IDecodeService.COLOR_SPACE_*).
+    static final int COLOR_SRGB = 0;
+    static final int COLOR_DISPLAY_P3 = 1;
 
     // The contract's FORMAT_* values (IDecodeService), all of which the VM reads.
     static final int FORMAT_JPEG = 1;
@@ -164,6 +167,7 @@ final class GuestLink implements Closeable {
         int width;
         int height;
         int extra; // probe: animated, thumbnail: rotation
+        int colorSpace; // thumbnail: COLOR_SRGB or COLOR_DISPLAY_P3 (vm/proto.h ColorSpace)
         byte[] pixels; // thumbnail
         Meta meta; // metadata
         long reserved; // budget taken for the pixels, given back by whoever ran the call
@@ -173,6 +177,7 @@ final class GuestLink implements Closeable {
         @Override
         public String toString() {
             return "Answer{status " + status + ", format " + format + ", " + width + "x" + height + ", extra " + extra
+                    + (colorSpace != COLOR_SRGB ? ", colour space " + colorSpace : "")
                     + (pixels != null ? ", " + pixels.length + " pixel bytes" : "") + (meta != null ? ", metadata" : "")
                     + (noBudget ? ", no budget" : "") + "}";
         }
@@ -331,8 +336,11 @@ final class GuestLink implements Closeable {
             a.height = h.getInt();
             a.extra = h.getInt();
             int payload = h.getInt();
-            int reserved = h.getInt();
-            check(magic == REPLY_MAGIC && reserved == 0, "reply header");
+            a.colorSpace = h.getInt();
+            check(magic == REPLY_MAGIC, "reply header");
+            // Only a thumbnail's pixels have a colour space other than sRGB.
+            check(a.colorSpace == COLOR_SRGB || (a.colorSpace == COLOR_DISPLAY_P3 && a.status == OK
+                    && (op == OP_THUMBNAIL || op == OP_HOOK)), "colour space");
             if (mOnReply != null) {
                 Runnable r = mOnReply;
                 mOnReply = null;

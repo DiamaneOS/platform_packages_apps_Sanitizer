@@ -286,10 +286,11 @@ uint32_t gRotation = 0;
 bool gFlip = false;
 
 bool sink_header(Sink* s, uint32_t w, uint32_t h) {
-    uint8_t hdr[16] = {'D', 'S', 'R', '2'};
+    uint8_t hdr[20] = {'D', 'S', 'R', '3'};
     put_le32(hdr + 4, w);
     put_le32(hdr + 8, h);
     put_le32(hdr + 12, gRotation);
+    put_le32(hdr + 16, gColorSpace);
     return sink_put(s, hdr, sizeof(hdr)) && sink_flush(s);
 }
 
@@ -362,6 +363,7 @@ bool scaler_emit(Scaler* s) {
 
 bool scaler_push(Scaler* s, uint8_t* row) {
     if (s->y >= s->ih) return false;
+    color_apply(row, s->iw, s->premultiplied);
     if (gFlip) {
         uint32_t* px = reinterpret_cast<uint32_t*>(row);
         std::reverse(px, px + s->iw);
@@ -546,6 +548,11 @@ bool decode_png_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool head
     if (!(color & PNG_COLOR_MASK_ALPHA) && !png_get_valid(png, info, PNG_INFO_tRNS)) {
         png_set_filler(png, 0xff, PNG_FILLER_AFTER);
     }
+    png_charp iccName = nullptr;
+    png_bytep icc = nullptr;
+    png_uint_32 iccLen = 0;
+    int iccType = 0;
+    if (png_get_iCCP(png, info, &iccName, &iccType, &icc, &iccLen) == PNG_INFO_iCCP) color_from_icc(icc, iccLen);
     int passes = png_set_interlace_handling(png);
     png_read_update_info(png, info);
     if (png_get_rowbytes(png, info) != static_cast<size_t>(w) * 4) png_error(png, "format");
@@ -680,6 +687,7 @@ bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool hea
         stream.pub.term_source = jstream_term;
         cinfo.src = &stream.pub;
     }
+    jpeg_save_markers(&cinfo, JPEG_APP0 + 2, 0xFFFF);  // the ICC profile's markers
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK || cinfo.image_width == 0 || cinfo.image_height == 0 ||
         cinfo.image_width > kMaxDimension || cinfo.image_height > kMaxDimension) {
         jpeg_destroy_decompress(&cinfo);
@@ -695,6 +703,14 @@ bool decode_jpeg_src(Src* in, uint32_t maxW, uint32_t maxH, Sink* sink, bool hea
         gOutcome.unsupported = true;
         jpeg_destroy_decompress(&cinfo);
         return false;
+    }
+    if (cinfo.jpeg_color_space != JCS_CMYK && cinfo.jpeg_color_space != JCS_YCCK) {
+        JOCTET* icc = nullptr;
+        unsigned int iccLen = 0;
+        if (jpeg_read_icc_profile(&cinfo, &icc, &iccLen)) {
+            color_from_icc(icc, iccLen);
+            free(icc);
+        }
     }
     uint32_t ow, oh;
     fit_box(cinfo.image_width, cinfo.image_height, maxW, maxH, &ow, &oh);
@@ -999,6 +1015,7 @@ bool warm_up() {
     bool ok = decode_png(kWarmupPng, sizeof(kWarmupPng), 5, 3, &sink, false, &w, &h);
     ok &= decode_jpeg(kWarmupJpeg, sizeof(kWarmupJpeg), 5, 3, &sink, false, &w, &h);
     free(sink.buf);
+    color_warm_up();
     return ok && warm_up_webp() && warm_up_heif();
 }
 
@@ -1205,6 +1222,7 @@ constexpr size_t kPrefixBytes = 1u << 20;
 
 [[noreturn]] void worker_main(const Request& rq, uint32_t format, const uint8_t* data, size_t size, int out,
                               int in) {
+    color_reset();  // nothing of the warm-up's colour set-up carries over
 #ifdef DECODER_TEST_HOOKS
     if (rq.op == kOpHook && rq.arg0 == kHookScan) {
         if (out != 0 && dup2(out, 0) != 0) worker_exit(kExitLockdown);
@@ -1722,8 +1740,9 @@ bool start_worker(const Request& rq, uint32_t format, int input, uint32_t len, b
     return true;
 }
 
-bool send_reply(int c, int32_t status, uint32_t format, uint32_t w, uint32_t h, uint32_t extra, uint32_t len) {
-    Reply r = {kReplyMagic, status, format, w, h, extra, len, 0};
+bool send_reply(int c, int32_t status, uint32_t format, uint32_t w, uint32_t h, uint32_t extra, uint32_t len,
+                uint32_t colorSpace = kColorSrgb) {
+    Reply r = {kReplyMagic, status, format, w, h, extra, len, colorSpace};
     return write_all(c, &r, sizeof(r));
 }
 
@@ -1812,9 +1831,9 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
     }
 
     // Thumbnail (and the test hooks, which answer as a 1x1 or 2x1 thumbnail): header, exact pixels, trailer.
-    uint8_t hdr[16];
+    uint8_t hdr[20];
     ssize_t n = worker_read(w, hdr, sizeof(hdr), w->deadline, kIdleMs);
-    uint32_t tw = le32(hdr + 4), th = le32(hdr + 8), rot = le32(hdr + 12);
+    uint32_t tw = le32(hdr + 4), th = le32(hdr + 8), rot = le32(hdr + 12), cs = le32(hdr + 16);
     bool turned = rot == 90 || rot == 270;
     bool box = hook || (turned ? (tw <= rq.arg1 && th <= rq.arg0) : (tw <= rq.arg0 && th <= rq.arg1));
     if (n != static_cast<ssize_t>(sizeof(hdr))) {
@@ -1822,13 +1841,13 @@ bool serve_worker(int c, const Request& rq, uint32_t format, bool hook, Worker* 
         if (retry_busy(e, rq, format, w)) return serve_worker(c, rq, format, hook, w);
         return send_failure(c, status_of(e));
     }
-    if (memcmp(hdr, "DSR2", 4) != 0 || tw == 0 || th == 0 || static_cast<uint64_t>(tw) * th > kMaxPixels || !box ||
-        (rot != 0 && rot != 180 && !turned)) {
+    if (memcmp(hdr, "DSR3", 4) != 0 || tw == 0 || th == 0 || static_cast<uint64_t>(tw) * th > kMaxPixels || !box ||
+        (rot != 0 && rot != 180 && !turned) || (cs != kColorSrgb && cs != kColorDisplayP3)) {
         end_worker(w, true);
         return send_failure(c, kInvalid);
     }
     uint64_t left = static_cast<uint64_t>(tw) * th * 4;
-    if (!send_reply(c, kOk, format, tw, th, rot, static_cast<uint32_t>(left))) {
+    if (!send_reply(c, kOk, format, tw, th, rot, static_cast<uint32_t>(left), cs)) {
         end_worker(w, true);
         return false;
     }

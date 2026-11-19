@@ -103,9 +103,16 @@ struct Reply {
     uint32_t height;
     uint32_t extra;  // probe: 1 when animated, thumbnail: rotation in degrees
     uint32_t payloadLen;
-    uint32_t reserved;
+    uint32_t colorSpace;  // thumbnail: the pixels' ColorSpace, 0 otherwise
 };
 static_assert(sizeof(Reply) == 32);
+
+// The colour space of a thumbnail's pixels (IDecodeService.COLOR_SPACE_*): the file's, as Android's decode keeps it,
+// or the nearest of the two when the file uses another (vm/color.cpp).
+enum ColorSpace : uint32_t {
+    kColorSrgb = 0,
+    kColorDisplayP3 = 1,
+};
 
 struct End {
     uint32_t magic;

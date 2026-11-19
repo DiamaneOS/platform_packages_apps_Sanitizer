@@ -162,6 +162,19 @@ bool decode_first_frame(const uint8_t* data, size_t size, uint32_t maxW, uint32_
     return done && sink_flush(sink);
 }
 
+// The file's ICC profile (an extended file's ICCP chunk), for the colour conversion.
+void webp_colour(const uint8_t* data, size_t size) {
+    WebPData wd = {data, size};
+    WebPDemuxer* dmx = WebPDemux(&wd);
+    if (dmx == nullptr) return;
+    WebPChunkIterator ci;
+    if ((WebPDemuxGetI(dmx, WEBP_FF_FORMAT_FLAGS) & ICCP_FLAG) && WebPDemuxGetChunk(dmx, "ICCP", 1, &ci)) {
+        color_from_icc(ci.chunk.bytes, ci.chunk.size);
+        WebPDemuxReleaseChunkIterator(&ci);
+    }
+    WebPDemuxDelete(dmx);
+}
+
 }  // namespace
 
 bool decode_webp(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH, Sink* sink, bool headerOnly,
@@ -178,6 +191,7 @@ bool decode_webp(const uint8_t* data, size_t size, uint32_t maxW, uint32_t maxH,
         gOutcome.animated = f.has_animation != 0;
         return true;
     }
+    webp_colour(data, size);
     return f.has_animation ? decode_first_frame(data, size, maxW, maxH, sink)
                            : decode_still(data, size, f, maxW, maxH, sink);
 }
